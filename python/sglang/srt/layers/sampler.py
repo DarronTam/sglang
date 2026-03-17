@@ -14,7 +14,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda, is_npu
+from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda, is_npu, is_zeus
 
 if is_cuda():
     from sgl_kernel import (
@@ -27,10 +27,20 @@ if is_cuda():
 if is_npu():
     import torch_npu
 
+if is_zeus():
+    from sgl_kernel_zeus import (
+        min_p_sampling_from_probs as zeus_min_p_sampling_from_probs,
+        top_k_renorm_prob as zeus_top_k_renorm_prob,
+        top_k_top_p_sampling_from_probs as zeus_top_k_top_p_sampling_from_probs,
+        top_p_renorm_prob as zeus_top_p_renorm_prob,
+        sampling_from_logits as zeus_sampling_from_logits,
+    )
+
 logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
+_is_zeus = is_zeus()
 
 
 class Sampler(nn.Module):
@@ -91,7 +101,10 @@ class Sampler(nn.Module):
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
-            batch_next_token_ids = torch.argmax(logits, -1)
+            if _is_zeus:
+                batch_next_token_ids = torch.argmax(logits.cpu(), -1).to(logits.device)
+            else:
+                batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
         else:
@@ -113,62 +126,74 @@ class Sampler(nn.Module):
                     logits_div_temperature, dim=-1
                 )
 
-            # Post process logits
-            logits.div_(sampling_info.temperatures)
-            # For ascend backend, softmax is not needed before sampling
-            if not get_global_server_args().sampling_backend == "ascend" or (
-                return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB
-            ):
-                logits[:] = torch.softmax(logits, dim=-1)
-            probs = logits
-            del logits
-
-            if can_sample_directly_from_probs:
-                # when we don't need top-k, top-p, or min-p sampling, we can directly sample from the probs
-                batch_next_token_ids = sampling_from_probs_torch(
-                    probs,
-                    sampling_seed=sampling_info.sampling_seed,
-                    positions=positions,
+            if get_global_server_args().sampling_backend == "zeus":
+                # Fused: div(temp) + softmax + top-k/top-p/min-p + sample
+                # logits is modified in-place to contain probs after the call
+                batch_next_token_ids = zeus_sampling_from_logits(
+                    logits,
+                    sampling_info.temperatures,
+                    top_k=sampling_info.top_ks,
+                    top_p=sampling_info.top_ps,
+                    min_p=sampling_info.min_ps,
+                    need_min_p=sampling_info.need_min_p_sampling,
                 )
+                probs = logits
+                del logits
             else:
-                if get_global_server_args().sampling_backend == "flashinfer":
-                    if sampling_info.need_min_p_sampling:
-                        probs = top_k_renorm_prob(probs, sampling_info.top_ks)
-                        probs = top_p_renorm_prob(probs, sampling_info.top_ps)
-                        batch_next_token_ids = min_p_sampling_from_probs(
-                            probs, sampling_info.min_ps
-                        )
-                    else:
-                        batch_next_token_ids = top_k_top_p_sampling_from_probs(
-                            probs.contiguous(),
-                            sampling_info.top_ks,
-                            sampling_info.top_ps,
-                            filter_apply_order="joint",
-                            check_nan=self.use_nan_detection,
-                        )
-                elif get_global_server_args().sampling_backend == "pytorch":
-                    # A slower fallback implementation with torch native operations.
-                    batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
+                # Post process logits
+                logits.div_(sampling_info.temperatures)
+                # For ascend backend, softmax is not needed before sampling
+                if not get_global_server_args().sampling_backend == "ascend" or (
+                    return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB
+                ):
+                    logits[:] = torch.softmax(logits, dim=-1)
+                probs = logits
+                del logits
+
+                if can_sample_directly_from_probs:
+                    batch_next_token_ids = sampling_from_probs_torch(
                         probs,
-                        sampling_info.top_ks,
-                        sampling_info.top_ps,
-                        sampling_info.min_ps,
-                        sampling_info.need_min_p_sampling,
-                        sampling_info.sampling_seed,
-                        positions,
-                    )
-                elif get_global_server_args().sampling_backend == "ascend":
-                    batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_ascend(
-                        probs,
-                        sampling_info.top_ks,
-                        sampling_info.top_ps,
-                        sampling_info.min_ps,
-                        sampling_info.need_min_p_sampling,
+                        sampling_seed=sampling_info.sampling_seed,
+                        positions=positions,
                     )
                 else:
-                    raise ValueError(
-                        f"Invalid sampling backend: {get_global_server_args().sampling_backend}"
-                    )
+                    if get_global_server_args().sampling_backend == "flashinfer":
+                        if sampling_info.need_min_p_sampling:
+                            probs = top_k_renorm_prob(probs, sampling_info.top_ks)
+                            probs = top_p_renorm_prob(probs, sampling_info.top_ps)
+                            batch_next_token_ids = min_p_sampling_from_probs(
+                                probs, sampling_info.min_ps
+                            )
+                        else:
+                            batch_next_token_ids = top_k_top_p_sampling_from_probs(
+                                probs.contiguous(),
+                                sampling_info.top_ks,
+                                sampling_info.top_ps,
+                                filter_apply_order="joint",
+                                check_nan=self.use_nan_detection,
+                            )
+                    elif get_global_server_args().sampling_backend == "pytorch":
+                        batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
+                            probs,
+                            sampling_info.top_ks,
+                            sampling_info.top_ps,
+                            sampling_info.min_ps,
+                            sampling_info.need_min_p_sampling,
+                            sampling_info.sampling_seed,
+                            positions,
+                        )
+                    elif get_global_server_args().sampling_backend == "ascend":
+                        batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_ascend(
+                            probs,
+                            sampling_info.top_ks,
+                            sampling_info.top_ps,
+                            sampling_info.min_ps,
+                            sampling_info.need_min_p_sampling,
+                        )
+                    else:
+                        raise ValueError(
+                            f"Invalid sampling backend: {get_global_server_args().sampling_backend}"
+                        )
 
             if return_logprob:
                 if get_global_server_args().rl_on_policy_target is not None:

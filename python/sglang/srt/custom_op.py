@@ -7,6 +7,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_xpu,
+    is_zeus,
 )
 
 _is_cuda = is_cuda()
@@ -15,6 +16,7 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
+_is_zeus = is_zeus()
 
 
 class CustomOp(nn.Module):
@@ -78,6 +80,9 @@ class CustomOp(nn.Module):
     def forward_hip(self, *args, **kwargs):
         return self.forward_cuda(*args, **kwargs)
 
+    def forward_zeus(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
     def forward_xpu(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
 
@@ -88,7 +93,9 @@ class CustomOp(nn.Module):
         return self.forward_native(*args, **kwargs)
 
     def dispatch_forward(self):
-        if _is_cuda:
+        if _is_zeus:
+            return self.forward_zeus
+        elif _is_cuda:
             return self.forward_cuda
         elif _is_hip:
             return self.forward_hip

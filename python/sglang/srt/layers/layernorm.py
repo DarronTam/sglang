@@ -222,6 +222,18 @@ class RMSNorm(CustomOp):
         else:
             return x, residual
 
+    def forward_zeus(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        from sgl_kernel_zeus import rmsnorm, fused_add_rmsnorm
+        if residual is not None:
+            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+            return x, residual
+        out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+        return out
+
     def forward_cpu(
         self,
         x: torch.Tensor,
@@ -344,6 +356,7 @@ class LayerNorm(CustomOp):
         x: torch.Tensor,
     ) -> torch.Tensor:
         return self.forward_native(x)
+
 
     def forward_cpu(
         self,

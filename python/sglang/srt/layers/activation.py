@@ -76,6 +76,11 @@ class SiluAndMul(CustomOp):
         silu_and_mul(x, out)
         return out
 
+    def forward_zeus(self, x: torch.Tensor) -> torch.Tensor:
+        from sgl_kernel_zeus import silu_and_mul as zeus_silu_and_mul
+
+        return zeus_silu_and_mul(x)
+
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         if _is_cpu_amx_available:
             out = torch.ops.sgl_kernel.silu_and_mul_cpu(x)

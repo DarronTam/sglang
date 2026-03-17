@@ -52,7 +52,9 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
+from sglang.srt.utils import get_compiler_backend, is_npu, is_zeus, support_triton
+
+_is_zeus = is_zeus()
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -757,6 +759,16 @@ class ForwardBatch:
             self.prefix_chunk_kv_indices.append(chunk_kv_indices)
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
+        if _is_zeus:
+            # Compute padding on CPU to avoid Zeus ATen fallback for cat/zeros.
+            device = tensor.device
+            t = tensor.cpu()
+            pad_shape = (size - t.shape[0], *t.shape[1:])
+            if value == 0:
+                padded = torch.cat([t, t.new_zeros(pad_shape)], dim=0)
+            else:
+                padded = torch.cat([t, t.new_full(pad_shape, value)], dim=0)
+            return padded.to(device)
         if value == 0:
             return torch.cat(
                 [tensor, tensor.new_zeros(size - tensor.shape[0], *tensor.shape[1:])],
@@ -826,10 +838,17 @@ class ForwardBatch:
                 self.forward_mode = ForwardMode.EXTEND
                 self.extend_num_tokens = bs
                 self.extend_seq_lens = torch.full_like(self.seq_lens, 1)
-                self.extend_prefix_lens = self.seq_lens - 1
-                self.extend_start_loc = torch.arange(
-                    bs, dtype=torch.int32, device=self.seq_lens.device
-                )
+                if _is_zeus:
+                    device = self.seq_lens.device
+                    self.extend_prefix_lens = (self.seq_lens.cpu() - 1).to(device)
+                    self.extend_start_loc = torch.arange(
+                        bs, dtype=torch.int32
+                    ).to(device)
+                else:
+                    self.extend_prefix_lens = self.seq_lens - 1
+                    self.extend_start_loc = torch.arange(
+                        bs, dtype=torch.int32, device=self.seq_lens.device
+                    )
                 self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu()
                 self.extend_seq_lens_cpu = self.extend_seq_lens.cpu()
                 self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
@@ -1058,9 +1077,14 @@ class ForwardBatch:
             device=device,
             dtype=torch.int32,
         )
-        self.prefix_chunk_cu_seq_lens[:, 1:] = prefix_chunk_seq_lens_cuda.cumsum(
-            dim=1
-        ).to(torch.int32)
+        if _is_zeus:
+            self.prefix_chunk_cu_seq_lens[:, 1:] = prefix_chunk_seq_lens_cuda.cpu().cumsum(
+                dim=1
+            ).to(torch.int32).to(device)
+        else:
+            self.prefix_chunk_cu_seq_lens[:, 1:] = prefix_chunk_seq_lens_cuda.cumsum(
+                dim=1
+            ).to(torch.int32)
         self.prefix_chunk_max_seq_lens = prefix_chunk_seq_lens_cpu.max(
             dim=1
         ).values.tolist()
@@ -1090,7 +1114,10 @@ class ForwardBatch:
             dtype=torch.int32,
             device=self.req_pool_indices.device,
         )
-        kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
+        if _is_zeus:
+            kv_indptr[1:] = torch.cumsum(self.seq_lens.cpu(), dim=0).to(kv_indptr.device)
+        else:
+            kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
         create_flashinfer_kv_indices_triton[(self.batch_size,)](
             self.req_to_token_pool.req_to_token,
             self.req_pool_indices,
@@ -1216,6 +1243,20 @@ def compute_position_kernel(
 def compute_position_torch(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
 ):
+    if _is_zeus:
+        device = extend_prefix_lens.device
+        p_cpu = extend_prefix_lens.cpu()
+        s_cpu = extend_seq_lens.cpu()
+        positions = torch.cat(
+            [
+                torch.arange(p, p + s)
+                for p, s in zip(p_cpu, s_cpu)
+            ],
+            axis=0,
+        )
+        extend_start_loc = torch.zeros_like(s_cpu)
+        extend_start_loc[1:] = torch.cumsum(s_cpu[:-1], dim=0)
+        return positions.to(torch.int64).to(device), extend_start_loc.to(device)
     positions = torch.cat(
         [
             torch.arange(
@@ -1232,6 +1273,9 @@ def compute_position_torch(
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def clamp_position(seq_lens):
+    if _is_zeus:
+        device = seq_lens.device
+        return torch.clamp((seq_lens.cpu() - 1), min=0).to(torch.int64).to(device)
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 
 

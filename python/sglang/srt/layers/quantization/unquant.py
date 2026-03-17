@@ -25,6 +25,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_hip,
+    is_zeus,
     next_power_of_2,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
+_is_zeus = is_zeus()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
@@ -139,6 +141,20 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
+
+        if _is_zeus:
+            from torch_zeus.zeus.local_memory import is_local_mem
+            if is_local_mem(layer.weight):
+                # Weight is (K, N) in LocalMem — use mm/addmm directly, no .T
+                x_shape = x.shape
+                x_2d = x.reshape(-1, x_shape[-1]) if x.dim() > 2 else x
+                if bias is not None:
+                    out = torch.addmm(bias, x_2d, layer.weight)
+                else:
+                    out = torch.mm(x_2d, layer.weight)
+                if x.dim() > 2:
+                    out = out.reshape(*x_shape[:-1], layer.weight.shape[1])
+                return out
 
         return F.linear(x, layer.weight, bias)
 

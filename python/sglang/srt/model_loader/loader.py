@@ -106,6 +106,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
     is_npu,
+    is_zeus,
     is_pin_memory_available,
     rank0_log,
     set_weight_attrs,
@@ -117,6 +118,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 _is_npu = is_npu()
+_is_zeus = is_zeus()
 # ModelOpt: QUANT_CFG_CHOICES is imported from modelopt_utils.py
 # which contains the complete mapping of quantization config choices
 
@@ -184,6 +186,64 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
 
 
 logger = logging.getLogger(__name__)
+
+
+def _zeus_init_lm_head_from_embed(model, lm_head_cls, embed_cls):
+    """Copy embed_tokens weight to lm_head when the checkpoint has no lm_head.
+
+    When a checkpoint was trained with tie_word_embeddings=True but Zeus
+    overrides it to False, the checkpoint has no ``lm_head.weight`` entry.
+    After ``load_weights``, lm_head keeps its random-init values.  This
+    function detects that case and copies embed_tokens.weight → lm_head.weight
+    so the model produces correct logits.
+
+    If the checkpoint already contains a separate lm_head.weight (i.e. was
+    trained with tie=False), lm_head is already loaded correctly — no-op.
+
+    Detection: check the safetensors/checkpoint index for ``lm_head.weight``.
+    If not present, the checkpoint was tied and we need to copy.
+    """
+    lm_head = embed = None
+    for _, module in model.named_modules():
+        if isinstance(module, lm_head_cls):
+            lm_head = module
+        elif isinstance(module, embed_cls) and not isinstance(module, lm_head_cls):
+            embed = module
+
+    if lm_head is None or embed is None:
+        return
+    if not hasattr(lm_head, 'weight') or not hasattr(embed, 'weight'):
+        return
+
+    lm_w = lm_head.weight.data
+    em_w = embed.weight.data
+
+    if lm_w.shape != em_w.shape:
+        logger.warning(
+            f"Zeus: lm_head.weight shape {list(lm_w.shape)} != "
+            f"embed_tokens.weight shape {list(em_w.shape)}; "
+            f"skipping weight copy."
+        )
+        return
+
+    # Already identical (same storage or same values).
+    if lm_w.data_ptr() == em_w.data_ptr() or torch.equal(lm_w, em_w):
+        return
+
+    # Check if lm_head.weight was actually loaded from checkpoint.
+    # Use _zeus_lm_head_loaded flag set by the weights iterator wrapper,
+    # or fall back to a heuristic: random-init weights (torch.empty on Zeus)
+    # tend to have near-zero or garbage values with very different statistics
+    # from pretrained embeddings.
+    if getattr(model, '_zeus_lm_head_loaded', False):
+        logger.info("Zeus: lm_head.weight loaded from checkpoint; keeping as-is.")
+        return
+
+    logger.info(
+        "Zeus: lm_head.weight not in checkpoint (tie_word_embeddings "
+        "override); copying from embed_tokens.weight."
+    )
+    lm_w.copy_(em_w)
 
 
 def _get_quantization_config(
@@ -614,6 +674,16 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
+        if _is_zeus:
+            # Track whether lm_head.weight is present in the checkpoint so
+            # _zeus_init_lm_head_from_embed knows whether to copy from embed.
+            def _tracking_iter(it):
+                for name, tensor in it:
+                    if 'lm_head.weight' in name:
+                        model._zeus_lm_head_loaded = True
+                    yield name, tensor
+            model._zeus_lm_head_loaded = False
+            weights = _tracking_iter(weights)
         model.load_weights(weights)
 
         for _, module in model.named_modules():
@@ -628,6 +698,43 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_method.process_weights_after_loading(module)
                 if _is_npu:
                     torch.npu.empty_cache()
+
+        # Zeus: convert all linear weights to LocalMem for ZENL GEMM dispatch.
+        # SGLang's linear layers (ColumnParallelLinear, RowParallelLinear, etc.)
+        # inherit from LinearBase, not nn.Linear.
+        if _is_zeus:
+            from torch_zeus.zeus.pack_weights import pack_weights, _GEMM_TRANSPOSE_PARAMS
+            from sglang.srt.layers.linear import LinearBase
+            from sglang.srt.layers.vocab_parallel_embedding import (
+                VocabParallelEmbedding, ParallelLMHead,
+            )
+
+            _GEMM_TRANSPOSE_PARAMS.add((LinearBase, 'weight'))
+            targets = {LinearBase}
+
+            # lm_head weight needs LocalMem for GEMM (torch.mm in logits).
+            # When tie_word_embeddings=True, lm_head IS embed_tokens (same
+            # VocabParallelEmbedding object) — must pack VPE so GEMM works,
+            # at the cost of to_gdg conversion on each embedding lookup.
+            # When tie_word_embeddings=False, lm_head is a separate
+            # ParallelLMHead — only pack that; leave embed_tokens unpacked
+            # so embedding lookup runs directly on GDG memory (no to_gdg).
+            tie = getattr(getattr(model, 'config', None),
+                          'tie_word_embeddings', False)
+            if tie:
+                _GEMM_TRANSPOSE_PARAMS.add((VocabParallelEmbedding, 'weight'))
+                targets.add(VocabParallelEmbedding)
+            else:
+                # tie_word_embeddings=False: if the checkpoint was originally
+                # tied (no separate lm_head.weight), lm_head stays at init
+                # values after load_weights. Copy embed_tokens weight to it.
+                _zeus_init_lm_head_from_embed(model, ParallelLMHead,
+                                              VocabParallelEmbedding)
+            _GEMM_TRANSPOSE_PARAMS.add((ParallelLMHead, 'weight'))
+            targets.add(ParallelLMHead)
+
+            pack_weights(model, target_modules=targets)
+            logger.info("Zeus: packed model weights into LocalMem.")
 
 
 class LayeredModelLoader(DefaultModelLoader):

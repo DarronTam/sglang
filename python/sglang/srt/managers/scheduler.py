@@ -179,6 +179,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
     get_zmq_socket,
+    is_zeus,
     kill_itself_when_parent_died,
     numa_bind_to_node,
     point_to_point_pyobj,
@@ -196,6 +197,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
+_is_zeus = is_zeus()
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -2056,7 +2058,12 @@ class Scheduler(
                         batch_result.future_indices = future_indices
 
                 # FIXME(lsyin): move this assignment elsewhere
-                future_indices_or_next_token_ids = -future_indices.indices
+                if _is_zeus:
+                    future_indices_or_next_token_ids = (
+                        (-future_indices.indices.cpu()).to(future_indices.indices.device)
+                    )
+                else:
+                    future_indices_or_next_token_ids = -future_indices.indices
 
                 if batch.is_v2_eagle:
                     # FIXME(lsyin): tmp code for eagle v2

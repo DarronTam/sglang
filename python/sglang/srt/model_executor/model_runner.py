@@ -165,6 +165,7 @@ from sglang.srt.utils import (
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
+    is_zeus,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
     require_attn_tp_gather,
@@ -675,6 +676,8 @@ class ModelRunner:
             backend = "gloo"
         elif self.device == "npu":
             backend = "hccl"
+        elif self.device == "zeus":
+            backend = "zecl"
 
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if not self.server_args.enable_p2p_check:
@@ -1857,7 +1860,24 @@ class ModelRunner:
 
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
-        if self.server_args.attention_backend == "ascend":
+        if self.server_args.attention_backend == "zeus":
+            from sglang.srt.mem_cache.zeus_memory_pool import ZeusTokenToKVPool
+
+            self.token_to_kv_pool = ZeusTokenToKVPool(
+                self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(
+                    get_attention_tp_size()
+                ),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.num_effective_layers,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+            )
+        elif self.server_args.attention_backend == "ascend":
             if self.use_mla_backend:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMLATokenToKVPool,
@@ -2035,7 +2055,20 @@ class ModelRunner:
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if self.token_to_kv_pool_allocator is None:
-            if _is_npu and (
+            if self.server_args.attention_backend == "zeus":
+                from sglang.srt.mem_cache.zeus_allocator import (
+                    ZeusPagedTokenToKVPoolAllocator,
+                )
+
+                self.token_to_kv_pool_allocator = ZeusPagedTokenToKVPoolAllocator(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    device=self.device,
+                    kvcache=self.token_to_kv_pool,
+                    need_sort=need_sort,
+                )
+            elif _is_npu and (
                 self.server_args.attention_backend == "ascend"
                 or self.hybrid_gdn_config is not None
             ):
@@ -2832,7 +2865,11 @@ class ModelRunner:
             (
                 forward_batch.positions
                 if forward_batch.forward_mode.is_decode()
-                else forward_batch.seq_lens - 1
+                else (
+                    (forward_batch.seq_lens.cpu() - 1).to(forward_batch.seq_lens.device)
+                    if is_zeus()
+                    else forward_batch.seq_lens - 1
+                )
             ),
         )
         return next_token_ids

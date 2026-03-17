@@ -165,6 +165,16 @@ def is_npu() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_zeus() -> bool:
+    try:
+        import torch_zeus  # noqa: F401
+
+        return hasattr(torch, "zeus") and torch.zeus.is_available()
+    except ImportError:
+        return False
+
+
+@lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
     return (
@@ -302,7 +312,7 @@ def get_float_env_var(name: str, default: float = 0.0) -> float:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    return backend not in ["torch_native", "intel_amx", "zeus"]
 
 
 try:
@@ -562,6 +572,19 @@ def get_available_gpu_memory(
             torch.npu.empty_cache()
         free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
 
+    elif device == "zeus":
+        num_gpus = torch.zeus.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.zeus.current_device() != gpu_id:
+            print(
+                f"WARNING: current device is not {gpu_id}, but {torch.zeus.current_device()}, ",
+                "which may cause useless memory allocation for torch Zeus context.",
+            )
+        if empty_cache:
+            torch.zeus.empty_cache()
+        free_gpu_memory, total_gpu_memory = torch.zeus.mem_get_info(gpu_id)
+
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
         torch.distributed.all_reduce(
@@ -573,7 +596,7 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available() -> bool:
-    return torch.cuda.is_available()
+    return torch.cuda.is_available() or is_zeus()
 
 
 class LayerFn(Protocol):
@@ -1729,6 +1752,9 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_cpu_memory_capacity()
     elif device == "xpu":
         gpu_mem = get_xpu_memory_capacity()
+    elif device == "zeus":
+        _, total = torch.zeus.mem_get_info(0)
+        gpu_mem = total // 1024 // 1024  # unit: MB
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None
@@ -1870,6 +1896,11 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "npu"
         return "npu:{}".format(device_id)
 
+    if is_zeus():
+        if device_id is None:
+            return "zeus"
+        return "zeus:{}".format(device_id)
+
     if is_habana_available():
         try:
             import habana_frameworks.torch.hpu  # noqa: F401
@@ -1900,6 +1931,12 @@ def get_device_count() -> int:
         except RuntimeError:
             return 0
 
+    if is_zeus():
+        try:
+            return torch.zeus.device_count()
+        except RuntimeError:
+            return 0
+
     if is_habana_available():
         try:
             import habana_frameworks.torch.hpu  # noqa: F401
@@ -1916,6 +1953,10 @@ def get_device_core_count(device_id: int = 0) -> int:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         return torch.cuda.get_device_properties(device_id).multi_processor_count
 
+    if is_zeus():
+        props = torch.zeus.get_device_properties(device_id)
+        return getattr(props, "multi_processor_count", 1)
+
     return 0
 
 
@@ -1923,6 +1964,9 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     major, minor = None, None
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability(device_id)
+
+    if is_zeus():
+        major, minor = torch.zeus.get_device_capability(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         major, minor, *_ = torch.xpu.get_device_capability(device_id)["version"].split(
@@ -2481,6 +2525,8 @@ def create_checksum(directory: str):
 
 
 def set_cuda_arch():
+    if not is_cuda_alike():
+        return
     if is_flashinfer_available():
         capability = torch.cuda.get_device_capability()
         arch = f"{capability[0]}.{capability[1]}"

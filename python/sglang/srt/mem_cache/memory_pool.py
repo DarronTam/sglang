@@ -50,7 +50,9 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_npu, is_zeus, next_power_of_2
+
+_is_zeus = is_zeus()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -96,7 +98,24 @@ class ReqToTokenPool:
         self.free_slots = list(range(size))
 
     def write(self, indices, values):
-        self.req_to_token[indices] = values
+        if _is_zeus:
+            # Do index_put on CPU, then copy back to avoid fallback
+            device = self.req_to_token.device
+            r2t = self.req_to_token.cpu()
+            # Recursively move indices to CPU
+            if isinstance(indices, torch.Tensor):
+                idx = indices.cpu()
+            elif isinstance(indices, tuple):
+                idx = tuple(
+                    i.cpu() if isinstance(i, torch.Tensor) else i for i in indices
+                )
+            else:
+                idx = indices
+            val = values.cpu() if isinstance(values, torch.Tensor) else values
+            r2t[idx] = val
+            self.req_to_token = r2t.to(device)
+        else:
+            self.req_to_token[indices] = values
 
     def available_size(self):
         return len(self.free_slots)
@@ -271,7 +290,12 @@ class MambaPool:
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
-        self.free_slots = torch.cat((self.free_slots, free_index))
+        if _is_zeus:
+            self.free_slots = torch.cat(
+                (self.free_slots.cpu(), free_index.cpu())
+            ).to(self.free_slots.device)
+        else:
+            self.free_slots = torch.cat((self.free_slots, free_index))
         for i in range(len(self.mamba_cache.conv)):
             self.mamba_cache.conv[i][:, free_index] = 0
         self.mamba_cache.temporal[:, free_index] = 0
@@ -642,7 +666,12 @@ class MHATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
-        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        if _is_zeus:
+            self.data_ptrs = torch.cat(
+                [self.k_data_ptrs.cpu(), self.v_data_ptrs.cpu()], dim=0
+            ).to(self.device)
+        else:
+            self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
         self.data_strides = torch.tensor(
             [
                 np.prod(x.shape[1:]) * x.dtype.itemsize

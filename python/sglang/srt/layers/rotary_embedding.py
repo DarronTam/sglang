@@ -21,12 +21,14 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_xpu,
+    is_zeus,
 )
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_npu = is_npu()
+_is_zeus = is_zeus()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
@@ -147,7 +149,12 @@ class RotaryEmbedding(CustomOp):
         # create the cache on GPU for faster initialization. This may cause
         # a slight numerical difference between the HF implementation and ours.
         init_device = (
-            "cpu" if get_global_server_args().rl_on_policy_target is not None else None
+            "cpu"
+            if (
+                get_global_server_args().rl_on_policy_target is not None
+                or _is_zeus
+            )
+            else None
         )
         inv_freq = 1.0 / (
             base
@@ -165,7 +172,9 @@ class RotaryEmbedding(CustomOp):
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        t = torch.arange(
+            self.max_position_embeddings, dtype=torch.float, device=inv_freq.device
+        )
 
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
@@ -217,6 +226,34 @@ class RotaryEmbedding(CustomOp):
             cos.view(-1, 1, 1, last_dim).contiguous(),
             sin.view(-1, 1, 1, last_dim).contiguous(),
         )
+
+    def forward_zeus(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if fused_set_kv_buffer_arg is not None:
+            raise NotImplementedError("fused_set_kv_buffer_arg is not supported in Zeus backend yet.")
+            
+        if offsets is not None:
+            positions = positions + offsets
+
+        from sgl_kernel_zeus import rotary_embedding
+        query = query.contiguous()
+        key = key.contiguous()
+        rotary_embedding(
+            positions.flatten(),
+            query,
+            key,
+            self.head_size,
+            self.cos_sin_cache,
+            self.is_neox_style
+        )
+        return query, key
+
 
     def forward_native(
         self,
@@ -855,6 +892,34 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         sin = freqs.sin() * self.mscale
         cache = torch.cat((cos, sin), dim=-1)
         return cache
+
+    def forward_zeus(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if fused_set_kv_buffer_arg is not None:
+            raise NotImplementedError("fused_set_kv_buffer_arg is not supported in Zeus backend yet.")
+            
+        if offsets is not None:
+            positions = positions + offsets
+
+        from sgl_kernel_zeus import rotary_embedding
+        query = query.contiguous()
+        key = key.contiguous()
+        rotary_embedding(
+            positions.flatten(),
+            query,
+            key,
+            self.head_size,
+            self.cos_sin_cache,
+            self.is_neox_style
+        )
+        return query, key
+
 
     def forward_native(
         self,

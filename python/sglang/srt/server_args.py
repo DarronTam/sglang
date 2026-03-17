@@ -61,6 +61,7 @@ from sglang.srt.utils.common import (
     nullable_str,
     parse_connector_type,
     wait_port_available,
+    is_zeus,
     xpu_has_xmx_support,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file, get_config
@@ -131,6 +132,7 @@ ATTENTION_BACKEND_CHOICES = [
     # Other platforms
     "intel_amx",
     "ascend",
+    "zeus",
     "intel_xpu",
 ]
 
@@ -644,6 +646,7 @@ class ServerArgs:
         self._handle_hpu_backends()
         self._handle_cpu_backends()
         self._handle_npu_backends()
+        self._handle_zeus_backends()
 
         # Handle compilation config
         self._handle_compilation_cfg()
@@ -978,6 +981,14 @@ class ServerArgs:
             from sglang.srt.hardware_backend.npu.utils import set_default_server_args
 
             set_default_server_args(self)
+
+    def _handle_zeus_backends(self):
+        if is_zeus():
+            if self.attention_backend is None:
+                self.attention_backend = "zeus"
+            self.disable_cuda_graph = True
+            # Zeus requires page-aligned KV cache (page_size must be multiple of 128)
+            self.page_size = 128
 
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import is_deepseek_nsa
@@ -1352,9 +1363,12 @@ class ServerArgs:
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
-            self.sampling_backend = (
-                "flashinfer" if is_flashinfer_available() else "pytorch"
-            )
+            if is_zeus():
+                self.sampling_backend = "zeus"
+            else:
+                self.sampling_backend = (
+                    "flashinfer" if is_flashinfer_available() else "pytorch"
+                )
 
     def _handle_attention_backend_compatibility(self):
         model_config = self.get_model_config()
@@ -3098,7 +3112,7 @@ class ServerArgs:
         parser.add_argument(
             "--sampling-backend",
             type=str,
-            choices=["flashinfer", "pytorch", "ascend"],
+            choices=["flashinfer", "pytorch", "ascend", "zeus"],
             default=ServerArgs.sampling_backend,
             help="Choose the kernels for sampling layers.",
         )

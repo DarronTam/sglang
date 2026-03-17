@@ -102,6 +102,13 @@ def create_triton_backend(runner):
         return TritonAttnBackend(runner)
 
 
+@register_attention_backend("zeus")
+def create_zeus_backend(runner):
+    from sglang.srt.layers.attention.zeus_backend import ZeusAttnBackend
+
+    return ZeusAttnBackend(runner)
+
+
 @register_attention_backend("torch_native")
 def create_torch_native_backend(runner):
     from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend

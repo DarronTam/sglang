@@ -47,11 +47,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_npu, use_intel_amx_backend
+from sglang.srt.utils import is_npu, is_zeus, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_zeus = is_zeus()
 
 
 @dataclasses.dataclass
@@ -416,24 +417,55 @@ class LogitsProcessor(nn.Module):
             and not logits_metadata.extend_return_logprob
         ):
             # Prefill without input logprobs.
-            if logits_metadata.padded_static_len < 0:
-                last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+            if _is_zeus:
+                # Zeus: compute indices on CPU, gather via select (view) +
+                # copy_ to avoid cumsum/sub/index fallback to CPU.
+                seq_lens_cpu = logits_metadata.extend_seq_lens.cpu()
+                if logits_metadata.padded_static_len < 0:
+                    indices = (torch.cumsum(seq_lens_cpu, dim=0) - 1).tolist()
+                else:
+                    pad = logits_metadata.padded_static_len
+                    indices = (
+                        torch.arange(len(seq_lens_cpu)) * pad + seq_lens_cpu - 1
+                    ).tolist()
+                hdim = hidden_states.size(-1)
+                pruned_states = torch.empty(
+                    len(indices), hdim,
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+                for i, idx in enumerate(indices):
+                    pruned_states[i].copy_(hidden_states[idx])
+                if aux_hidden_states is not None:
+                    aux_pruned_states = []
+                    for hidden in aux_hidden_states:
+                        buf = torch.empty(
+                            len(indices), hidden.size(-1),
+                            dtype=hidden.dtype,
+                            device=hidden.device,
+                        )
+                        for i, idx in enumerate(indices):
+                            buf[i].copy_(hidden[idx])
+                        aux_pruned_states.append(buf)
             else:
-                # If padding_static length is 5 and extended_seq_lens is [2, 3],
-                # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
-                # and this retrieves t01 and t12, which are the valid last tokens
-                idx = torch.arange(
-                    len(logits_metadata.extend_seq_lens),
-                    device=logits_metadata.extend_seq_lens.device,
-                )
-                last_index = (
-                    idx * logits_metadata.padded_static_len
-                    + logits_metadata.extend_seq_lens
-                    - 1
-                )
-            pruned_states = hidden_states[last_index]
-            if aux_hidden_states is not None:
-                aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
+                if logits_metadata.padded_static_len < 0:
+                    last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+                else:
+                    # If padding_static length is 5 and extended_seq_lens is [2, 3],
+                    # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
+                    # and this retrieves t01 and t12, which are the valid last tokens
+                    idx = torch.arange(
+                        len(logits_metadata.extend_seq_lens),
+                        device=logits_metadata.extend_seq_lens.device,
+                    )
+                    last_index = (
+                        idx * logits_metadata.padded_static_len
+                        + logits_metadata.extend_seq_lens
+                        - 1
+                    )
+                pruned_states = hidden_states[last_index]
+                if aux_hidden_states is not None:
+                    aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
             sample_indices = None
             input_logprob_indices = None
         else:
@@ -852,6 +884,12 @@ class LogitsProcessor(nn.Module):
                     None,  # bias
                     True,  # is_vnni
                 )
+            elif _is_zeus:
+                # Weight packed in (K,N) LocalMem by pack_weights — no .T needed.
+                # Works for both standalone ParallelLMHead and tied
+                # VocabParallelEmbedding (same object, transposed at pack time).
+                h = hidden_states.to(lm_head.weight.dtype)
+                logits = torch.mm(h, lm_head.weight)
             elif get_global_server_args().rl_on_policy_target is not None:
                 # Due to tie-weight, we may not be able to change lm_head's weight dtype
                 logits = torch.matmul(

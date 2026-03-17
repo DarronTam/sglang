@@ -31,6 +31,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_compiler_backend,
     is_cpu,
+    is_zeus,
     set_weight_attrs,
 )
 
@@ -38,6 +39,7 @@ DEFAULT_VOCAB_PADDING_SIZE = 64
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_zeus = is_zeus()
 
 logger = logging.getLogger(__name__)
 
@@ -474,9 +476,15 @@ class VocabParallelEmbedding(torch.nn.Module):
         else:
             masked_input = input_
 
-        # Get the embeddings.
-        with use_symmetric_memory(get_tp_group(), disabled=not self.enable_tp):
-            output_parallel = self.quant_method.embedding(self, masked_input.long())
+        # Zeus: weight is transposed (K,N) in LocalMem for GEMM compat.
+        # Use sgl-kernel-zeus column-gather embedding instead of F.embedding.
+        if _is_zeus and hasattr(self, '_zeus_local_mems'):
+            from sgl_kernel_zeus import embedding as zeus_embedding
+            output_parallel = zeus_embedding(masked_input.long(), self.weight)
+        else:
+            # Get the embeddings.
+            with use_symmetric_memory(get_tp_group(), disabled=not self.enable_tp):
+                output_parallel = self.quant_method.embedding(self, masked_input.long())
 
         if self.tp_size > 1:
             # Mask the output embedding.

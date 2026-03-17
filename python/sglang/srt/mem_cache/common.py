@@ -13,7 +13,9 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import support_triton
+from sglang.srt.utils import is_zeus, support_triton
+
+_is_zeus = is_zeus()
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -127,15 +129,33 @@ def get_last_loc(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    if (
-        get_global_server_args().attention_backend != "ascend"
-        and get_global_server_args().attention_backend != "torch_native"
-    ):
-        impl = get_last_loc_triton
-    else:
+    backend = get_global_server_args().attention_backend
+    if backend == "zeus":
+        impl = _get_last_loc_cpu
+    elif backend in ("ascend", "torch_native"):
         impl = get_last_loc_torch
+    else:
+        impl = get_last_loc_triton
 
     return impl(req_to_token, req_pool_indices_tensor, prefix_lens_tensor)
+
+
+def _get_last_loc_cpu(
+    req_to_token: torch.Tensor,
+    req_pool_indices_tensor: torch.Tensor,
+    prefix_lens_tensor: torch.Tensor,
+) -> torch.Tensor:
+    """Zeus: compute on CPU to avoid ATen fallback for where/lt/index."""
+    device = prefix_lens_tensor.device
+    r2t = req_to_token.cpu()
+    rpi = req_pool_indices_tensor.cpu()
+    pl = prefix_lens_tensor.cpu()
+    result = torch.where(
+        pl > 0,
+        r2t[rpi, pl - 1],
+        torch.full_like(pl, -1),
+    )
+    return result.to(device)
 
 
 def get_last_loc_torch(
@@ -438,10 +458,18 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
     else:
         # Paged allocation
-        last_loc = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices, batch.seq_lens - 1
-        ]
-        seq_lens_next = batch.seq_lens + token_per_req
+        if _is_zeus:
+            device = batch.seq_lens.device
+            r2t_cpu = batch.req_to_token_pool.req_to_token.cpu()
+            rpi_cpu = batch.req_pool_indices.cpu()
+            sl_cpu = batch.seq_lens.cpu()
+            last_loc = r2t_cpu[rpi_cpu, sl_cpu - 1].to(device)
+            seq_lens_next = (sl_cpu + token_per_req).to(device)
+        else:
+            last_loc = batch.req_to_token_pool.req_to_token[
+                batch.req_pool_indices, batch.seq_lens - 1
+            ]
+            seq_lens_next = batch.seq_lens + token_per_req
         out_cache_loc = alloc_paged_token_slots_decode(
             tree_cache=batch.tree_cache,
             seq_lens=seq_lens_next,
@@ -454,7 +482,10 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     if batch.model_config.is_encoder_decoder:
         locs = batch.encoder_lens + batch.seq_lens
     else:
-        locs = batch.seq_lens.clone()
+        if _is_zeus:
+            locs = batch.seq_lens.cpu().clone().to(batch.seq_lens.device)
+        else:
+            locs = batch.seq_lens.clone()
 
     batch.req_to_token_pool.write(
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)

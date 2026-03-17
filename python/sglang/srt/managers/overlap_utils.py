@@ -5,7 +5,9 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import get_compiler_backend, is_zeus
+
+_is_zeus = is_zeus()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
@@ -16,6 +18,12 @@ if TYPE_CHECKING:
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _resolve_future_token_ids(input_ids, future_token_ids_map):
+    if _is_zeus:
+        ids = input_ids.cpu()
+        buf = future_token_ids_map.cpu()
+        resolved = torch.where(ids < 0, buf[torch.clamp(-ids, min=0)], ids)
+        input_ids[:] = resolved.to(input_ids.device)
+        return
     input_ids[:] = torch.where(
         input_ids < 0,
         future_token_ids_map[torch.clamp(-input_ids, min=0)],
@@ -107,7 +115,10 @@ class FutureMap:
         self.future_ct = (cur_future_ct + bs) % self.future_limit
         start = cur_future_ct + 1
         end = cur_future_ct + 1 + bs
-        indices = torch.arange(start, end, dtype=torch.int64, device=self.device)
+        if _is_zeus:
+            indices = torch.arange(start, end, dtype=torch.int64).to(self.device)
+        else:
+            indices = torch.arange(start, end, dtype=torch.int64, device=self.device)
         return FutureIndices(indices=indices, interval=slice(start, end))
 
     def resolve_future(self, model_worker_batch: ModelWorkerBatch):
