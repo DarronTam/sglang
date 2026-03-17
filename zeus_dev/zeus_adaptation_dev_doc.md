@@ -52,6 +52,7 @@ Zeus NPU 的底层存储对数据对齐有严格要求（如 Paged Attention 必
 
 ### 做了什么？
 *   **权重格式转换 (Packing)**：在 `model_loader` 中，模型加载完成后，利用 `torch_zeus.zeus.pack_weights` 将 `LinearBase` 和 `ParallelLMHead` 的权重转换打包到 **LocalMem** 中。
+    *   **⚠️ 避坑指南 (权重转置)**：在使用底层的 `to_local_mem` 接口打包权重时，Zeus GEMM 算子期望的 LocalMem 权重布局是 `(K, N)`，而 PyTorch 中 `nn.Linear.weight` 默认形状为 `(out_features, in_features)` 即 `(N, K)`。因此在手动打包权重时（如在编写算子对比测试用例时），**必须先显式调用 `.t().contiguous()` 进行转置**，例如 `to_local_mem(weight.t().contiguous(), ...)`。如果不进行转置，会导致计算时维度完全错乱并引发诸如 `RuntimeError: shape '...' is invalid for input of size ...` 的隐蔽错误。
 *   **解绑词嵌入 (Tie-embeddings Override)**：特殊处理了 `tie_word_embeddings`。强制要求 `embed_tokens` 留在普通的 **GDG (Global Memory)**，而为其单独拷贝一份独立权重到 `lm_head` 并打包进 **LocalMem**。
 
 ### 为什么这么做？
