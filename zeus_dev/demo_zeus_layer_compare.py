@@ -326,7 +326,7 @@ def test_qkv_proj(model, tokenizer):
     qkv_zeus = qkv_proj.to("zeus")
 
     # to_local_mem with kind='weight' auto-transposes (N,K) → (K,N) for ZENL GEMM
-    local_weight = to_local_mem(qkv_zeus.weight.data, kind='weight', aligned_size=0)
+    local_weight = to_local_mem(qkv_zeus.weight.data.t().contiguous(), kind='weight', aligned_size=0)
     print(f"  weight: {qkv_zeus.weight.data.shape} (N,K) -> {local_weight.shape} (K,N) in LocalMem")
     qkv_zeus.weight = torch.nn.Parameter(
         wrap_as_dispatch_tensor(local_weight), requires_grad=False
@@ -395,7 +395,7 @@ def test_o_proj(model, tokenizer):
     o_proj.cpu()
     o_zeus = o_proj.to("zeus")
 
-    local_weight = to_local_mem(o_zeus.weight.data, kind='weight', aligned_size=0)
+    local_weight = to_local_mem(o_zeus.weight.data.t().contiguous(), kind='weight', aligned_size=0)
     print(f"  weight: {o_zeus.weight.data.shape} (N,K) -> {local_weight.shape} (K,N) in LocalMem")
     o_zeus.weight = torch.nn.Parameter(
         wrap_as_dispatch_tensor(local_weight), requires_grad=False
@@ -479,11 +479,11 @@ def test_mlp(model, tokenizer):
     act_zeus = act_fn.to("zeus")
 
     # LocalMem for gate_up
-    gu_local_weight = to_local_mem(gate_up_zeus.weight.data, kind='weight', aligned_size=0)
+    gu_local_weight = to_local_mem(gate_up_zeus.weight.data.t().contiguous(), kind='weight', aligned_size=0)
     gate_up_zeus.weight = torch.nn.Parameter(wrap_as_dispatch_tensor(gu_local_weight), requires_grad=False)
     
     # LocalMem for down
-    d_local_weight = to_local_mem(down_zeus.weight.data, kind='weight', aligned_size=0)
+    d_local_weight = to_local_mem(down_zeus.weight.data.t().contiguous(), kind='weight', aligned_size=0)
     down_zeus.weight = torch.nn.Parameter(wrap_as_dispatch_tensor(d_local_weight), requires_grad=False)
     
     x_zeus = x.to("zeus")
@@ -1042,7 +1042,7 @@ def test_transformer_block(model, tokenizer):
     def make_local_weight(weight_data):
         """Convert (N, K) weight to LocalMem (K, N) dispatch tensor."""
         w_zeus = weight_data.to("zeus")
-        local_w = to_local_mem(w_zeus, kind='weight', aligned_size=0)
+        local_w = to_local_mem(w_zeus.t().contiguous(), kind='weight', aligned_size=0)
         return wrap_as_dispatch_tensor(local_w)
 
     def linear_zeus(x_2d, weight_dispatch, bias=None):
@@ -1222,7 +1222,7 @@ def test_lm_head(model, tokenizer):
     # ── Zeus (LocalMem weight) ──
     lm_head_weight = model.lm_head.weight.data  # [vocab_size, hidden_size] = [151936, 896]
     w_zeus = lm_head_weight.to("zeus")
-    local_w = to_local_mem(w_zeus, kind='weight', aligned_size=0)
+    local_w = to_local_mem(w_zeus.t().contiguous(), kind='weight', aligned_size=0)
     w_dispatch = wrap_as_dispatch_tensor(local_w)
     print(f"  weight: {lm_head_weight.shape} (N,K) -> {local_w.shape} (K,N) in LocalMem")
     print(f"  weight LocalMem: Tr={local_w.Tr}, Tc={local_w.Tc}")
@@ -1315,7 +1315,7 @@ def test_full_model(model, tokenizer):
     # ── Helper ──
     def make_local_weight(weight_data):
         w_zeus = weight_data.to("zeus")
-        local_w = to_local_mem(w_zeus, kind='weight', aligned_size=0)
+        local_w = to_local_mem(w_zeus.t().contiguous(), kind='weight', aligned_size=0)
         return wrap_as_dispatch_tensor(local_w)
 
     def linear_zeus(x_2d, weight_dispatch, bias=None):
