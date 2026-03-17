@@ -82,7 +82,23 @@ def main():
         print("Attempting generate()...")
         print("=" * 60)
         try:
-            out = llm.generate("Hello, my name is", {"max_new_tokens": 16})
+            # Qwen Instruct models respond better to explicit prompt formatting.
+            # Using an unformatted string like "Hello, my name is" can confuse the model
+            # or cause it to output unstructured text indefinitely until it hits a max_new_tokens limit.
+            # To ensure the model knows it is answering a user query and should output a concise response,
+            # we format it using ChatML or instruct format. We also set a hard stop limit.
+            
+            prompts = [
+                "<|im_start|>user\nWhat is the capital of France? Please answer in one word.<|im_end|>\n<|im_start|>assistant\n"
+            ]
+            
+            sampling_params = {
+                "max_new_tokens": 32, # limit the max length just in case
+                "temperature": 0.0,   # greedy decoding for determinism
+            }
+            
+            print(f"  Input prompt: {prompts[0]!r}")
+            out = llm.generate(prompts, sampling_params)
             print(f"  generate() succeeded!")
             print(f"  output: {out}")
         except Exception as e:
