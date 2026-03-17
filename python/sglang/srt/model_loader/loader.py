@@ -226,13 +226,8 @@ def _zeus_init_lm_head_from_embed(model, lm_head_cls, embed_cls):
         )
         return
 
-    # Already identical (same storage or same values).
+    # Already identical (same storage).
     if lm_w.data_ptr() == em_w.data_ptr():
-        return
-    if getattr(lm_w, "device", torch.device("cpu")).type == "zeus":
-        if torch.equal(lm_w.cpu(), em_w.cpu()):
-            return
-    elif torch.equal(lm_w, em_w):
         return
 
     # Check if lm_head.weight was actually loaded from checkpoint.
