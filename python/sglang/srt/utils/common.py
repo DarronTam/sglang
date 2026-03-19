@@ -596,7 +596,7 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available() -> bool:
-    return torch.cuda.is_available() or is_zeus()
+    return torch.cuda.is_available()
 
 
 class LayerFn(Protocol):
@@ -1739,6 +1739,16 @@ def get_xpu_memory_capacity():
         raise RuntimeError("torch.xpu is not available.")
 
 
+def get_zeus_memory_capacity():
+    try:
+        if is_zeus():
+            _, total = torch.zeus.mem_get_info(0)
+            return total // 1024 // 1024  # unit: MB
+        raise ValueError("No Zeus memory values found.")
+    except AttributeError:
+        raise RuntimeError("torch.zeus is not available.")
+
+
 def get_device_memory_capacity(device: str = None):
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
@@ -1753,8 +1763,7 @@ def get_device_memory_capacity(device: str = None):
     elif device == "xpu":
         gpu_mem = get_xpu_memory_capacity()
     elif device == "zeus":
-        _, total = torch.zeus.mem_get_info(0)
-        gpu_mem = total // 1024 // 1024  # unit: MB
+        gpu_mem = get_zeus_memory_capacity()
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None

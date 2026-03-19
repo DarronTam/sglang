@@ -89,11 +89,11 @@ def main():
             # we format it using ChatML or instruct format. We also set a hard stop limit.
             
             prompts = [
-                "<|im_start|>user\nWhat is the capital of France? Please answer in one word.<|im_end|>\n<|im_start|>assistant\n"
+                "<|im_start|>user\nWhat is the highest of mountain in the world and how about its height? Please answer briefly.<|im_end|>\n<|im_start|>assistant\n"
             ]
             
             sampling_params = {
-                "max_new_tokens": 32, # limit the max length just in case
+                "max_new_tokens": 64, # limit the max length just in case
                 "temperature": 0.0,   # greedy decoding for determinism
             }
             
