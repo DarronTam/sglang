@@ -732,6 +732,9 @@ class ServerArgs:
             self.served_model_name = self.model_path
         if self.device is None:
             self.device = get_device()
+        # Propagate device choice so child processes (via is_zeus(), etc.)
+        # see a consistent SGLANG_DEVICE without manual env-var setup.
+        os.environ.setdefault("SGLANG_DEVICE", self.device.split(":")[0])
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
         if self.mm_process_config is None:

@@ -166,10 +166,19 @@ def is_npu() -> bool:
 
 @lru_cache(maxsize=1)
 def is_zeus() -> bool:
+    device = os.environ.get("SGLANG_DEVICE", "")
+    # Explicit device selection takes priority
+    if device:
+        return device == "zeus"
     try:
         import torch_zeus  # noqa: F401
 
-        return hasattr(torch, "zeus") and torch.zeus.is_available()
+        if not (hasattr(torch, "zeus") and torch.zeus.is_available()):
+            return False
+        # Zeus and CUDA can coexist; default to CUDA unless explicitly chosen
+        if torch.cuda.is_available():
+            return False
+        return True
     except ImportError:
         return False
 

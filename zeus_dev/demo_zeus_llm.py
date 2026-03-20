@@ -10,6 +10,12 @@ Milestones:
   M6: Weight loading (needs localmem loader)  [PASS - CPU fallback]
 """
 
+import os
+
+# Tell SGLang to use Zeus device (must be set before importing sglang,
+# so that is_zeus() returns True even when CUDA is also available).
+os.environ["SGLANG_DEVICE"] = "zeus"
+
 import torch
 
 # Must import torch_zeus BEFORE sglang to register the zeus backend
