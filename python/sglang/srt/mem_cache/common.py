@@ -460,10 +460,12 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         # Paged allocation
         if _is_zeus:
             device = batch.seq_lens.device
-            r2t_cpu = batch.req_to_token_pool.req_to_token.cpu()
             rpi_cpu = batch.req_pool_indices.cpu()
             sl_cpu = batch.seq_lens.cpu()
-            last_loc = r2t_cpu[rpi_cpu, sl_cpu - 1].to(device)
+            # Only copy the rows we need (bs rows) instead of the entire
+            # req_to_token matrix (max_reqs × max_seq_len, typically 128MB+).
+            r2t_rows_cpu = batch.req_to_token_pool.req_to_token[rpi_cpu].cpu()
+            last_loc = r2t_rows_cpu[torch.arange(bs), sl_cpu - 1].to(device)
             seq_lens_next = (sl_cpu + token_per_req).to(device)
         else:
             last_loc = batch.req_to_token_pool.req_to_token[
@@ -483,7 +485,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         locs = batch.encoder_lens + batch.seq_lens
     else:
         if _is_zeus:
-            locs = batch.seq_lens.cpu().clone().to(batch.seq_lens.device)
+            locs = batch.seq_lens.cpu().to(batch.seq_lens.device)
         else:
             locs = batch.seq_lens.clone()
 

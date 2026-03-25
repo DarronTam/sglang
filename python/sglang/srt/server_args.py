@@ -991,7 +991,11 @@ class ServerArgs:
                 self.attention_backend = "zeus"
             self.disable_cuda_graph = True
             # Zeus requires page-aligned KV cache (page_size must be multiple of 128)
-            self.page_size = 128
+            if self.page_size is None:
+                self.page_size = 128
+            assert self.page_size % 128 == 0, (
+                f"Zeus requires page_size to be a multiple of 128, got {self.page_size}"
+            )
 
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import is_deepseek_nsa
