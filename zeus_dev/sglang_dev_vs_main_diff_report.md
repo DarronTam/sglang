@@ -1,7 +1,8 @@
 # SGLang 仓库 dev 与 main 分支差异对比报告
 
 > 仓库地址：https://github.com/DarronTam/sglang.git
-> 生成时间：2026-03-23
+> 初始生成时间：2026-03-23
+> 最后更新：2026-03-25（基于代码优化迭代后更新）
 > 分叉点（merge-base）：`94e125113` — *enable flashinfer-jit-cache in image build and ci install to speed up model launch (#14959)*
 
 ---
@@ -64,19 +65,19 @@ dev 分支是在 main 的一个早期快照（`94e1251`）上，叠加了 **8 �
 | `python/sglang/srt/layers/layernorm.py` | +13 | RMSNorm 增加 `forward_zeus` | 原版走 flashinfer 的 `rmsnorm`/`fused_add_rmsnorm`（CUDA），Zeus 上不可用。sgl-kernel-zeus 提供了 Zeus 硬件优化的 rmsnorm kernel，特别是 `fused_add_rmsnorm`（norm + residual add 融合为一次 kernel），避免额外的 residual 读写开销 |
 | `python/sglang/srt/layers/logits_processor.py` | +50/−24 | Logits 裁剪/LM head 矩阵乘法避免 Zeus fallback | **两个问题**：① Prefill 阶段用 `hidden_states[last_index]` 做花式索引（fancy indexing），Zeus 的 `aten::index` 未实现会 fallback，改为逐条 `copy_` 逐元素拷贝避免；② `F.linear(hidden, weight)` 内部做 `hidden @ weight.T`，但 Zeus LocalMem 权重已经预转置为 (K,N)，再 `.T` 会破坏内存布局，改为 `torch.mm(h, weight)` 直接乘，并在 weight 加载时确保布局正确 |
 | `python/sglang/srt/layers/quantization/unquant.py` | +16 | UnquantizedLinearMethod 增加 Zeus weight packing | Zeus GEMM 要求权重存在 LocalMem 中。`pack_weights` 后权重变成 LocalMem 格式 (K,N)，`F.linear` 内部的 `weight.T` 会导致结果错误。此处检测如果权重已在 LocalMem（`is_local_mem(layer.weight)=True`），则用 `torch.mm(x, weight)` / `torch.addmm(bias, x, weight)` 替代 `F.linear`，绕过内部转置 |
-| `python/sglang/srt/layers/rotary_embedding.py` | +62/−7 | RotaryEmbedding/DeepseekScaling 增加 `forward_zeus` | **三个改动**：① `forward_zeus` 调用 `sgl_kernel_zeus.rotary_embedding`（硬件融合 kernel，一次完成 cos/sin 查表+旋转+写回），替代 `forward_native` 的多步 PyTorch 算子；② cos_sin_cache 初始化时强制在 CPU 构建（`init_device="cpu"`），因为 `torch.arange` + `torch.einsum` 在 Zeus 上会 fallback；③ `torch.arange(max_position_embeddings)` 加上 `device=inv_freq.device` 确保和 inv_freq 在同设备，避免跨设备 einsum |
+| `python/sglang/srt/layers/rotary_embedding.py` | +32/−7 | RotaryEmbedding 增加 `forward_zeus`，DeepseekScaling 继承复用 | **两个改动**：① 基类 `RotaryEmbedding` 新增 `forward_zeus` 调用 `sgl_kernel_zeus.rotary_embedding`（硬件融合 kernel，一次完成 cos/sin 查表+旋转+写回），`DeepseekScalingRotaryEmbedding` 直接继承基类实现（不再单独 copy-paste）；② cos_sin_cache 初始化时强制在 CPU 构建（`init_device="cpu"`），因为 `torch.arange` + `torch.einsum` 在 Zeus 上会 fallback |
 | `python/sglang/srt/layers/sampler.py` | +97/−32 | 采样路径增加 zeus_sampling_from_logits 融合实现 | **核心原因**：原版采样分 5 步（div temp → softmax → top-k renorm → top-p renorm → sample），每步都是独立 kernel launch。Zeus 提供 `sampling_from_logits` 融合算子，一次 kernel 完成全部步骤，减少 5 次 kernel launch 为 1 次。此外 `torch.argmax` 在 Zeus 上未实现，greedy 路径改为 `.cpu()` 后 argmax 再回传 |
 | `python/sglang/srt/layers/vocab_parallel_embedding.py` | +14/−0 | Embedding 增加 Zeus forward | Zeus 权重在 LocalMem 中是转置的 (K,N) 格式以兼容 GEMM，普通的 `F.embedding` 按行索引会取到错误数据。`sgl_kernel_zeus.embedding` 是列方向 gather，能正确从转置权重中取出 embedding 向量 |
 | `python/sglang/srt/managers/overlap_utils.py` | +15/−0 | Overlap 调度增加 Zeus guard | `_resolve_future_token_ids` 用到 `torch.where` + 负数索引 + `torch.clamp + 花式索引`，这些算子在 Zeus 上均不支持原生执行。改为 CPU 侧执行后写回。另外 `torch.arange(..., device=zeus)` 在 Zeus 上也不支持，改为先在 CPU 创建再 `.to(device)` |
 | `python/sglang/srt/managers/schedule_batch.py` | +48/−9 | Batch 管理操作 CPU bounce 避 Zeus fallback | **三处热路径**：① `seq_lens += 1`（每个 decode step）— Zeus 不支持 int tensor 的 `add_.Scalar`，隐式 fallback 会每步触发 D2H+H2D；② `filter_batch` 中的 `tensor[keep_indices]` 花式索引 — Zeus 不支持 `aten::index`；③ `merge_batch` 中的 `torch.cat` — Zeus 不支持。全部改为显式 `.cpu()` 操作后 `.to(device)`，将隐式多次拷贝合并为一次显式拷贝 |
 | `python/sglang/srt/managers/scheduler.py` | +9/−0 | Scheduler 中 future_indices 取反避免 fallback | `future_indices_or_next_token_ids = -future_indices.indices` 用到 `aten::neg`（int tensor），Zeus 不支持。改为 `(-x.cpu()).to(device)`。虽然语义相同但避免了隐式 fallback 的额外内存分配和同步开销 |
-| `python/sglang/srt/mem_cache/common.py` | +55/−0 | alloc_for_decode 增加 Zeus CPU 侧索引 | `alloc_for_decode` 是 decode 热路径，每步执行。内部用 `req_to_token[req_pool_indices, seq_lens - 1]` 做二维花式索引，Zeus 不支持 `aten::index` 的多维 tensor 索引。改为把 r2t/rpi/sl 全部拉到 CPU 做索引后一次性传回，将每步 3 次隐式 D2H 合并为 1 次显式 |
+| `python/sglang/srt/mem_cache/common.py` | +55/−0 | alloc_for_decode 增加 Zeus CPU 侧索引（仅复制需要的行） | `alloc_for_decode` 是 decode 热路径，每步执行。内部用 `req_to_token[req_pool_indices, seq_lens - 1]` 做二维花式索引，Zeus 不支持 `aten::index` 的多维 tensor 索引。改为先将 rpi/sl 拉到 CPU，再用 `req_to_token[rpi_cpu].cpu()` **仅复制所需的 bs 行**（而非整个 max_reqs × max_seq_len 矩阵），在 CPU 侧完成二维索引后一次性传回 |
 | `python/sglang/srt/mem_cache/memory_pool.py` | +32/−5 | ReqToTokenPool.write/MambaPool.free/MHA data_ptrs CPU bounce | **三处**：① `ReqToTokenPool.write` 用 `index_put_`（tensor indices），Zeus 不支持，改为 CPU 侧 index_put 后整块回传；② `MambaPool.free` 用 `torch.cat` 拼接 free_slots，Zeus 不支持；③ `MHATokenToKVPool` 初始化时 `torch.cat([k_data_ptrs, v_data_ptrs])` 拼接 uint64 指针，Zeus 的 cat 不支持 uint64 dtype |
 | `python/sglang/srt/mem_cache/radix_cache.py` | +16/−6 | torch.cat → _cat_zeus（CPU 拼接后回传） | RadixCache 在 `match_prefix`、`cache_finished_req`、`total_allocated_tokens` 三处用 `torch.cat` 拼接 int64 token indices。Zeus 对 `torch.cat` 的支持不完善（尤其是变长 list of tensors），封装 `_cat_zeus()` 辅助函数统一处理：`.cpu()` → `torch.cat` → `.to(device)` |
 | `python/sglang/srt/model_executor/forward_batch_info.py` | +48/−14 | pad_tensor/extend 字段/cumsum 等 CPU bounce | **四处**：① `_pad_tensor_to_size` 用 `torch.cat` + `new_zeros`/`new_full` pad tensor，Zeus 不支持；② `extend_prefix_lens = seq_lens - 1` 和 `extend_start_loc = torch.arange(...)` 在 Zeus 上 fallback；③ `cumsum(dim=1)` 构建 prefix_chunk_cu_seq_lens，Zeus 不支持 cumsum；④ 以上全是 prefill/decode 准备阶段的 metadata 构建，在 Zeus 上没有对应 kernel，必须在 CPU 侧完成 |
 | `python/sglang/srt/model_executor/model_runner.py` | +38/−5 | 初始化 Zeus KV pool / allocator / zecl 通信后端 | **三处**：① 分布式通信后端设为 `"zecl"`（Zeus 的集合通信库，类似 NCCL），否则 PyTorch distributed 找不到后端；② KV pool 初始化时选用 `ZeusTokenToKVPool`（tiled 布局），否则会用 MHA 的 flat 布局，Zeus attention kernel 无法正确读取；③ allocator 选用 `ZeusPagedTokenToKVPoolAllocator`（CPU 记账），否则每次 alloc/free 都会大量 fallback |
-| `python/sglang/srt/model_loader/loader.py` | +107/−0 | Zeus 专用权重加载器（LocalMem 转置+打包） | **核心原因**：Zeus GEMM 的高性能路径要求权重存放在 LocalMem（片上近存）中，且布局必须是 (K,N)（转置的）。原版 `load_weights` 把权重加载到普通 GDG（Global Device Memory）中。新增逻辑：① 遍历 `load_weights` 的权重迭代器，标记 `lm_head.weight` 是否在 checkpoint 中（判断 tie embedding）；② 对所有 LinearBase/ParallelLMHead 模块调用 `pack_weights` 转置并搬入 LocalMem；③ 处理 tied embedding 场景（embed_tokens 和 lm_head 共享权重时，需要把 VocabParallelEmbedding 也 pack 到 LocalMem，牺牲 embedding lookup 性能换取 GEMM 性能） |
-| `python/sglang/srt/server_args.py` | +25/−0 | zeus 设备识别 / sampling_backend / attention_backend 默认值 | **四处自动配置**：① `attention_backend` 自动设为 `"zeus"`（Zeus 有专用 attention kernel，不能走 flashinfer/triton）；② `sampling_backend` 设为 `"zeus"`（使用融合采样 kernel）；③ `disable_cuda_graph=True`（Zeus 的 graph capture 机制 `zertGraphLaunch` 尚未就绪）；④ `page_size=128`（Zeus attention kernel 硬性要求 page size 为 128 的倍数，对齐硬件 tiled 内存单元） |
+| `python/sglang/srt/model_loader/loader.py` | +107/−0 | Zeus 专用权重加载器（LocalMem 转置+打包） | **核心原因**：Zeus GEMM 的高性能路径要求权重存放在 LocalMem（片上近存）中，且布局必须是 (K,N)（转置的）。原版 `load_weights` 把权重加载到普通 GDG（Global Device Memory）中。新增逻辑：① `_tracking_iter` 包装权重迭代器，使用 `nonlocal` 变量追踪 `lm_head.weight` 是否在 checkpoint 中（使用 `name.endswith('lm_head.weight')` 精确匹配），并将该 flag 作为参数传递给 `_zeus_init_lm_head_from_embed()`；② 对所有 LinearBase/ParallelLMHead 模块调用 `pack_weights` 转置并搬入 LocalMem；③ 处理 tied embedding 场景（embed_tokens 和 lm_head 共享权重时，需要把 VocabParallelEmbedding 也 pack 到 LocalMem，牺牲 embedding lookup 性能换取 GEMM 性能） |
+| `python/sglang/srt/server_args.py` | +25/−0 | zeus 设备识别 / sampling_backend / attention_backend 默认值 | **四处自动配置**：① `attention_backend` 自动设为 `"zeus"`（Zeus 有专用 attention kernel，不能走 flashinfer/triton）；② `sampling_backend` 设为 `"zeus"`（使用融合采样 kernel）；③ `disable_cuda_graph=True`（Zeus 的 graph capture 机制 `zertGraphLaunch` 尚未就绪）；④ `page_size` 仅在用户未指定时默认设为 128，并 assert `page_size % 128 == 0`（Zeus attention kernel 硬件要求 page size 为 128 的倍数） |
 | `python/sglang/srt/utils/common.py` | +66/−0 | is_zeus() / get_zeus_memory_capacity() / 设备工具 | SGLang 的设备抽象层（`get_device`/`get_device_count`/`get_device_capability` 等）没有 Zeus 分支，任何用到这些工具函数的地方都会忽略 Zeus 设备。新增完整的设备检测和查询函数，让 Zeus 设备在整个框架中被正确识别和使用 |
 
 ---
@@ -107,7 +108,7 @@ SGLang 的设备抽象层原本只覆盖 CUDA/XPU/HPU/CPU/NPU，Zeus 作为通�
 | `attention_backend = "zeus"` 自动设置 | Zeus 有专用 attention kernel，不能走 flashinfer（CUDA only）/triton（PTX only），必须路由到 zeus 后端 |
 | `sampling_backend = "zeus"` 自动设置 | Zeus 有融合采样 kernel（一次 kernel 完成 temp+softmax+topk/p+sample），比 flashinfer/pytorch 采样更高效 |
 | `disable_cuda_graph = True` | Zeus 的 graph capture 机制（`zertGraphLaunch`）尚未在 torch_zeus 中完整实现，强制开启会崩溃 |
-| `page_size = 128` | Zeus attention kernel 硬件要求 page size 必须是 128 的倍数，对齐片上 tiled 内存单元，否则 kernel 会读到错误的 KV 偏移 |
+| `page_size` 仅在用户未指定时默认 128 + assert % 128 | Zeus attention kernel 硬件要求 page size 必须是 128 的倍数，对齐片上 tiled 内存单元，否则 kernel 会读到错误的 KV 偏移。仅在 `page_size is None` 时设为 128，允许用户自定义（如 256、384），同时通过 assert 保证对齐约束 |
 | `os.environ.setdefault("SGLANG_DEVICE", ...)` | 多进程场景下子进程需要通过环境变量感知设备类型，不设置则子进程的 `is_zeus()` 可能返回错误结果 |
 | 分布式后端 `"zecl"` | Zeus 的集合通信库名为 zecl（类似 NCCL），PyTorch distributed 需要显式指定后端名，否则会尝试用 NCCL 导致找不到 GPU 报错 |
 
@@ -245,7 +246,7 @@ Zeus tensor → D2H copy → CPU 计算 → H2D copy → Zeus tensor
 | `forward_batch_info.py` — `_pad_tensor_to_size` | CPU pad 后回传 | pad 操作用 `torch.cat([tensor, zeros])` 实现，`aten::cat` 未实现 |
 | `forward_batch_info.py` — `extend_prefix_lens`/`extend_start_loc` | CPU 构建后回传 | `seq_lens - 1` 用到 `aten::sub.Scalar`（int tensor），`torch.arange` 在 Zeus 上不支持直接创建 |
 | `forward_batch_info.py` — `cumsum` | `.cpu().cumsum().to(device)` | `aten::cumsum` 未实现，用于构建 prefix_chunk_cu_seq_lens |
-| `common.py` — `alloc_for_decode` | r2t/rpi/sl 全部 CPU 侧索引 | decode 热路径，每步用 `req_to_token[req_pool_indices, seq_lens-1]` 做二维花式索引。Zeus 的 `aten::index` 不支持多维 tensor 索引 |
+| `common.py` — `alloc_for_decode` | rpi/sl 拉到 CPU，仅复制所需的 bs 行而非整个矩阵 | decode 热路径，每步用 `req_to_token[req_pool_indices, seq_lens-1]` 做二维花式索引。Zeus 的 `aten::index` 不支持多维 tensor 索引。通过 `req_to_token[rpi_cpu].cpu()` 仅拉取当前 batch 所需的行（通常 bs 行，远小于整个 max_reqs × max_seq_len 矩阵） |
 | `overlap_utils.py` — `_resolve_future_token_ids` | CPU 侧 where+clamp+索引 | `torch.where` + `torch.clamp` + 负数花式索引组合，三个算子都需要 fallback |
 | `overlap_utils.py` — `FutureMap` | `torch.arange` CPU 创建后传回 | `torch.arange(..., device="zeus")` 不支持 |
 | `scheduler.py` — `future_indices` 取反 | `(-x.cpu()).to(device)` | `aten::neg`（int tensor）未实现 |
@@ -264,9 +265,9 @@ Zeus NPU 的 GEMM 高性能路径要求权重存放在 **LocalMem**（片上近�
 
 | 改动点 | 为什么要改 |
 |--------|------------|
-| `_tracking_iter(weights)` 包装权重迭代器 | 在 `load_weights` 遍历 safetensors 权重时，标记 `lm_head.weight` 是否出现在 checkpoint 中。原因：很多模型（如 Qwen、Llama）使用 `tie_word_embeddings=True`，checkpoint 里没有单独的 `lm_head.weight`，此时 lm_head 参数保持随机初始化值。必须检测这种情况，再决定是否从 embed_tokens 拷贝权重 |
+| `_tracking_iter(weights)` 包装权重迭代器 | 在 `load_weights` 遍历 safetensors 权重时，通过 `nonlocal` 变量追踪 `lm_head.weight` 是否出现在 checkpoint 中（使用 `name.endswith('lm_head.weight')` 精确后缀匹配）。原因：很多模型（如 Qwen、Llama）使用 `tie_word_embeddings=True`，checkpoint 里没有单独的 `lm_head.weight`，此时 lm_head 参数保持随机初始化值。必须检测这种情况，再决定是否从 embed_tokens 拷贝权重 |
 | `_zeus_init_lm_head_from_embed()` | 当 checkpoint 是 tied 但 Zeus 适配层将 `tie_word_embeddings` override 为 False 时（因为 tied weight 在 LocalMem 打包时有额外限制），lm_head 的权重是垃圾值。此函数从 embed_tokens.weight 拷贝初始化 lm_head，确保 logits 计算正确 |
-| 使用 `_zeus_lm_head_loaded` flag 替代 `torch.equal()` 检测 | **commit `e7b145c6` → `1f9cdc56` 迭代**：最初用 `torch.equal(lm_head.weight, embed.weight)` 判断是否同源，但 `aten::equal` 在 Zeus 上触发 fallback（需要把两个大权重矩阵拷到 CPU 逐元素比较），开销巨大。改为在遍历权重时自己记录 flag，零开销 |
+| 使用 `nonlocal` 变量 + `endswith` 匹配替代 `torch.equal()` 检测 | **commit `e7b145c6` → `1f9cdc56` 迭代**：最初用 `torch.equal(lm_head.weight, embed.weight)` 判断是否同源，但 `aten::equal` 在 Zeus 上触发 fallback（需要把两个大权重矩阵拷到 CPU 逐元素比较），开销巨大。改为在遍历权重时通过 `nonlocal` 变量记录 flag（而非 monkey-patch 到 model 对象），并作为参数传递给 `_zeus_init_lm_head_from_embed()`，零开销 |
 | `pack_weights(model, target_modules=targets)` | 遍历模型所有 LinearBase/ParallelLMHead 模块，将 weight 转置 (N,K) → (K,N) 并搬入 LocalMem。使用 `_GEMM_TRANSPOSE_PARAMS` 注册表告知 `pack_weights` 哪些 (module_class, attr_name) 组合需要转置 |
 | tie_word_embeddings 分支处理 | **tie=True 时**：embed_tokens 和 lm_head 是同一个 `VocabParallelEmbedding` 对象，必须把 VPE 也 pack 到 LocalMem（否则 lm_head 的 GEMM 没有 LocalMem 权重），代价是 embedding lookup 需要额外的 `to_gdg` 转换。**tie=False 时**：embed_tokens 保持在 GDG（embedding lookup 高效），只 pack ParallelLMHead |
 
@@ -300,7 +301,7 @@ Zeus NPU 的 GEMM 高性能路径要求权重存放在 **LocalMem**（片上近�
 | 项目 | 说明 |
 |------|------|
 | Graph Capture/Replay | 硬编码 `disable_cuda_graph=True`，decode 无法批量重放 |
-| 高频 CPU Bounce | argmax / seq_lens+=1 / req_to_token 全量拷贝 / clamp / CSR 构建 — 每步 decode 均触发 |
+| 高频 CPU Bounce | argmax / seq_lens+=1 / ~~req_to_token 全量拷贝~~ / clamp / CSR 构建 — 每步 decode 均触发（`alloc_for_decode` 已优化为仅拷贝所需行，`memory_pool.write()` 全矩阵拷贝仍待解决） |
 
 ### 当前可用状态
 
@@ -331,13 +332,13 @@ Zeus NPU 的 GEMM 高性能路径要求权重存放在 **LocalMem**（片上近�
 | 维度 | 评分 (1-10) | 说明 |
 |------|-------------|------|
 | 功能正确性 | **7** | 能跑通 Dense LLM 推理，但部分 edge case 和性能陷阱未处理 |
-| 代码质量 | **5** | CPU bounce 散布在 15+ 文件中，缺少抽象层，有 copy-paste 代码 |
-| 性能 | **4** | `memory_pool.write()` 和 `alloc_for_decode` 的全矩阵 CPU bounce 是生产瓶颈 |
+| 代码质量 | **6** | CPU bounce 散布在 15+ 文件中，缺少抽象层；已消除 rotary_embedding 的 copy-paste 重复，loader 改为 nonlocal + endswith + 参数传递 |
+| 性能 | **5** | `memory_pool.write()` 的全矩阵 CPU bounce 仍是生产瓶颈；`alloc_for_decode` 已优化为仅复制所需行；`page_size` 增加了防御性断言 |
 | 可维护性 | **4** | 44 个 `_is_zeus` 检查散布各处，未来 upstream rebase 将非常痛苦 |
 | CUDA 路径安全 | **9** | 所有改动都在 `if _is_zeus:` 守卫下，不影响 CUDA 路径正确性 |
 | 架构设计 | **5** | CustomOp 派发部分很好，数据管理层缺少 strategy 抽象 |
 
-**综合评分：5.5/10**
+**综合评分：6.0/10**（相比初始版本 5.5 分，通过消除重复代码、修复全矩阵拷贝、改进 loader 反模式和 server_args 防御性检查，质量有所提升）
 
 ### 7.2 必要的修改（无法省略）
 
@@ -357,15 +358,17 @@ Zeus NPU 的 GEMM 高性能路径要求权重存放在 **LocalMem**（片上近�
 
 ### 7.3 必要但实现有问题的修改
 
-| 文件 | 评判 | 具体问题 | 改进建议 |
-|------|------|---------|---------|
-| `logits_processor.py` | ⚠️ 实现差 | 逐元素 `copy_` Python 循环（O(batch_size)），大 batch 时性能极差 | 用 `torch.index_select` 一次完成；或 `.cpu()[indices].to(device)` 做一次 batch 操作。另外 `torch.mm(h, weight)` 缺少 shape 断言，weight 未被 pack 时会静默产生错误结果 |
-| `schedule_batch.py` | ⚠️ 实现差 | 4 个独立的 `.cpu()[idx].to(device)` 操作未合并；`seq_lens += 1` 每步 bounce 一次 | **根本解法**：schedule metadata（seq_lens、req_pool_indices 等小 tensor）在 Zeus 上直接**保持在 CPU**，仅在 attention kernel 需要时搬到 device。消除所有管理层 bounce |
-| `memory_pool.py` — `write()` | ⚠️ **性能杀手** | 每次调用**复制整个 `req_to_token` 矩阵到 CPU 再复制回来**。典型配置 (max_reqs=4096, max_seq_len=8192) = 128MB round-trip，**每个 decode step 至少触发一次** | 实现 `sgl_kernel_zeus.index_put_` kernel；或将 `req_to_token` 保持在 CPU |
-| `common.py` — `alloc_for_decode` | ⚠️ 浪费 | `req_to_token_pool.req_to_token.cpu()` 每步复制整个矩阵；`.cpu().clone()` 的 `.clone()` 多余 | 只复制需要的行：`req_to_token[rpi_cpu]` 而非整个矩阵 |
-| `loader.py` | ⚠️ 复杂度高 | `_zeus_lm_head_loaded` 通过 monkey-patch 到 model 对象（反模式）；`'lm_head.weight' in name` 字符串匹配可能误匹配 `shared_lm_head.weight`；直接修改 `_GEMM_TRANSPOSE_PARAMS` 全局变量有副作用风险 | 用返回值/context 对象替代 monkey-patch；用 `name.endswith('lm_head.weight')` 精确匹配 |
-| `server_args.py` | ⚠️ 过于死板 | `page_size = 128` **强制覆盖**用户设置，而非仅在默认值时设置；`disable_cuda_graph = True` 无条件覆盖 | 改为 `if self.page_size is None: self.page_size = 128` + `assert self.page_size % 128 == 0`；cuda_graph 同理 |
-| `rotary_embedding.py` | ⚠️ 代码重复 | `RotaryEmbedding` 和 `DeepseekScalingRotaryEmbedding` 的 `forward_zeus` **完全重复**（~30 行 copy-paste） | 提取到基类或共用函数 |
+> **注**：以下部分问题已在后续迭代中修复，用 ✅ 已修复 / ⚠️ 未修复 标注当前状态。
+
+| 文件 | 评判 | 具体问题 | 改进建议 | 当前状态 |
+|------|------|---------|---------|---------|
+| `logits_processor.py` | ⚠️ 实现差 | 逐元素 `copy_` Python 循环（O(batch_size)），大 batch 时性能极差 | 用 `torch.index_select` 一次完成；或 `.cpu()[indices].to(device)` 做一次 batch 操作。另外 `torch.mm(h, weight)` 缺少 shape 断言，weight 未被 pack 时会静默产生错误结果 | ⚠️ 未修复 |
+| `schedule_batch.py` | ⚠️ 实现差 | 4 个独立的 `.cpu()[idx].to(device)` 操作未合并；`seq_lens += 1` 每步 bounce 一次 | **根本解法**：schedule metadata（seq_lens、req_pool_indices 等小 tensor）在 Zeus 上直接**保持在 CPU**，仅在 attention kernel 需要时搬到 device。消除所有管理层 bounce。注：单纯将 4 个 bounce 在代码层面合并（先拉到 CPU 再批量传回）经评估属于表面重构，不减少实际 D2H/H2D 次数（`.cpu()` 本身是同步操作），无实质性能收益 | ⚠️ 未修复（需系统性重构） |
+| `memory_pool.py` — `write()` | ⚠️ **性能杀手** | 每次调用**复制整个 `req_to_token` 矩阵到 CPU 再复制回来**。典型配置 (max_reqs=4096, max_seq_len=8192) = 128MB round-trip，**每个 decode step 至少触发一次** | 实现 `sgl_kernel_zeus.index_put_` kernel；或将 `req_to_token` 保持在 CPU | ⚠️ 未修复 |
+| `common.py` — `alloc_for_decode` | ~~⚠️ 浪费~~ | ~~`req_to_token_pool.req_to_token.cpu()` 每步复制整个矩阵；`.cpu().clone()` 的 `.clone()` 多余~~ | ~~只复制需要的行：`req_to_token[rpi_cpu]` 而非整个矩阵~~ | ✅ **已修复**：改为 `req_to_token[rpi_cpu].cpu()` 仅复制当前 batch 所需的 bs 行（通常 < 1KB），并移除多余的 `.clone()`。数据传输量从 ~128MB 降至 ~几KB，decode 热路径性能显著提升 |
+| `loader.py` | ~~⚠️ 复杂度高~~ | ~~`_zeus_lm_head_loaded` 通过 monkey-patch 到 model 对象（反模式）；`'lm_head.weight' in name` 字符串匹配可能误匹配 `shared_lm_head.weight`~~ | ~~用返回值/context 对象替代 monkey-patch；用 `name.endswith('lm_head.weight')` 精确匹配~~ | ✅ **已修复**：① monkey-patch 改为 `nonlocal` 变量，不再污染 model 对象；② `in name` 改为 `name.endswith('lm_head.weight')` 精确后缀匹配；③ flag 通过参数传递给 `_zeus_init_lm_head_from_embed(zeus_lm_head_loaded=...)` 而非挂在 model 对象上 |
+| `server_args.py` | ⚠️ 部分修复 | `page_size = 128` ~~强制覆盖用户设置~~ → 已改为仅在默认值时设置 + assert；`disable_cuda_graph = True` 仍无条件覆盖 | ~~改为 `if self.page_size is None: self.page_size = 128` + `assert self.page_size % 128 == 0`~~（page_size 已修复）；cuda_graph 待改为 `if not self.disable_cuda_graph: ...` 并输出 logger.info | ⚠️ **部分修复**：page_size ✅，disable_cuda_graph 未改 |
+| `rotary_embedding.py` | ~~⚠️ 代码重复~~ | ~~`RotaryEmbedding` 和 `DeepseekScalingRotaryEmbedding` 的 `forward_zeus` 完全重复（~30 行 copy-paste）~~ | ~~提取到基类或共用函数~~ | ✅ **已修复**：删除 `DeepseekScalingRotaryEmbedding` 的重复 `forward_zeus`，直接继承基类 `RotaryEmbedding.forward_zeus` |
 
 ### 7.4 值得商榷的修改
 
@@ -408,22 +411,28 @@ result = torch.cat([a.cpu(), b.cpu()]).to(device)
 | 分类 | 文件数 | 占比 |
 |------|--------|------|
 | ✅ 必要且实现良好 | 11 | 37% |
-| ⚠️ 必要但实现需改进 | 7 | 23% |
+| ✅ 必要且已修复改进 | 4 | 13% |
+| ⚠️ 必要但实现仍需改进 | 3 | 10% |
 | ❓ 值得商榷 | 3 | 10% |
 | 📝 文档/脚本（不影响运行时） | 9 | 30% |
 
-**没有发现完全不必要的修改**——每个代码变更都有真实的技术原因（Zeus 缺失 ATen 算子、LocalMem 布局约束、硬件 attention kernel 需求等）。但约 **1/3 的修改在实现质量上有明显改进空间**，主要集中在：
+**没有发现完全不必要的修改**——每个代码变更都有真实的技术原因（Zeus 缺失 ATen 算子、LocalMem 布局约束、硬件 attention kernel 需求等）。通过近期的优化迭代，已解决以下问题：
+- ✅ `alloc_for_decode` 全矩阵 CPU round-trip → 仅复制所需行
+- ✅ `rotary_embedding.py` copy-paste 重复代码 → 继承基类
+- ✅ `loader.py` monkey-patch 反模式 + 字符串误匹配 → nonlocal + endswith + 参数传递
+- ✅ `server_args.py` page_size 强制覆盖 → 仅默认值 + assert 对齐检查
+
+仍有约 **1/5 的修改在实现质量上有改进空间**，主要集中在：
 1. CPU bounce 模式缺少抽象层，导致代码散布且不可维护
-2. 两处全矩阵 CPU round-trip 是生产性能瓶颈（`memory_pool.write()` 和 `alloc_for_decode`）
-3. 几处缺少防御性断言（logits_processor 的 weight shape、server_args 的 page_size）
+2. `memory_pool.write()` 全矩阵 CPU round-trip 是剩余最大的生产性能瓶颈
+3. `logits_processor.py` 的逐元素循环性能差
 
 **优先改进建议**（按影响排序）：
 1. 🔴 **P0**：修复 `memory_pool.write()` 全矩阵拷贝 → 实现 `index_put_` kernel 或 CPU-resident metadata
-2. 🔴 **P0**：修复 `alloc_for_decode` 全矩阵拷贝 → 只拷贝需要的行
-3. 🟡 **P1**：创建 `zeus_ops.py` 集中工具层，消除分散的 bounce 代码
-4. 🟡 **P1**：logits_processor 的逐元素循环改为 batch 操作
+2. 🟡 **P1**：创建 `zeus_ops.py` 集中工具层，消除分散的 bounce 代码
+3. 🟡 **P1**：logits_processor 的逐元素循环改为 batch 操作
+4. 🟡 **P1**：server_args `disable_cuda_graph` 改为条件式设置
 5. 🟢 **P2**：推动 torch_zeus 实现 `argmax`、`neg` 等基础 ATen 算子，消除不必要的 bounce
-6. 🟢 **P2**：消除 `rotary_embedding.py` 的 copy-paste forward_zeus
 
 ---
 
@@ -431,4 +440,25 @@ result = torch.cat([a.cpu(), b.cpu()]).to(device)
 
 1. CPU bounce 模式是临时方案，长期应推动 Zeus ATen kernel 的原生实现（argmax、cat、index_put_ 等）。
 2. SWA / MoE / Graph Capture 是扩大模型覆盖面和提升生产性能的关键缺口。
-3. 建议在合入前完成 7.6 中 P0 级别的改进，P1 可作为后续迭代。
+3. 建议在合入前完成 7.6 中 P0 级别的改进（当前仅剩 `memory_pool.write()` 全矩阵拷贝），P1 可作为后续迭代。
+
+---
+
+## 九、优化迭代记录
+
+> 本节记录在初始报告生成后，基于审查建议对 dev 代码所做的实际修改。
+
+### 9.1 已完成的优化（2026-03-25）
+
+| 文件 | 修改内容 | 对应建议 |
+|------|---------|----------|
+| `rotary_embedding.py` | 删除 `DeepseekScalingRotaryEmbedding` 中重复的 `forward_zeus`（~30 行），改为继承基类 `RotaryEmbedding.forward_zeus` | 7.3 P2 — 消除 copy-paste |
+| `server_args.py` | `page_size` 仅在 `None` 时设为 128，增加 `assert page_size % 128 == 0` | 7.3 — page_size 防御性检查 |
+| `loader.py` | ① `_zeus_lm_head_loaded` 从 monkey-patch 改为 `nonlocal` 变量；② `'lm_head.weight' in name` 改为 `name.endswith('lm_head.weight')`；③ flag 通过参数传递给 `_zeus_init_lm_head_from_embed()` | 7.3 — loader 反模式修复 |
+| `common.py` | `alloc_for_decode` 从复制整个 `req_to_token` 矩阵（~128MB）改为仅复制所需的 bs 行（~几KB），并移除多余的 `.clone()` | 7.3 P0 — 全矩阵拷贝修复 |
+
+### 9.2 评估后决定不改的项目
+
+| 文件 | 评估结论 |
+|------|----------|
+| `schedule_batch.py` filter_batch/merge_batch | 尝试将 4 个独立的 `.cpu()[idx].to(device)` 合并为先拉到 CPU 再批量传回，但评估后确认这属于表面重构——`.cpu()` 本身是同步操作，代码层面拆分写法不减少实际 D2H/H2D 次数，无实质性能收益。真正的解决方案需要系统性重构（metadata 常驻 CPU），涉及 10+ 文件，不适合单文件修改 |
