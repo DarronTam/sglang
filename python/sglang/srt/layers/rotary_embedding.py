@@ -893,34 +893,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
-    def forward_zeus(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        offsets: Optional[torch.Tensor] = None,
-        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if fused_set_kv_buffer_arg is not None:
-            raise NotImplementedError("fused_set_kv_buffer_arg is not supported in Zeus backend yet.")
-            
-        if offsets is not None:
-            positions = positions + offsets
-
-        from sgl_kernel_zeus import rotary_embedding
-        query = query.contiguous()
-        key = key.contiguous()
-        rotary_embedding(
-            positions.flatten(),
-            query,
-            key,
-            self.head_size,
-            self.cos_sin_cache,
-            self.is_neox_style
-        )
-        return query, key
-
-
     def forward_native(
         self,
         positions: torch.Tensor,
