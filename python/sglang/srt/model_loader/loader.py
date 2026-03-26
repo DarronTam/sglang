@@ -188,7 +188,7 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
 logger = logging.getLogger(__name__)
 
 
-def _zeus_init_lm_head_from_embed(model, lm_head_cls, embed_cls):
+def _zeus_init_lm_head_from_embed(model, lm_head_cls, embed_cls, zeus_lm_head_loaded=False):
     """Copy embed_tokens weight to lm_head when the checkpoint has no lm_head.
 
     When a checkpoint was trained with tie_word_embeddings=True but Zeus
@@ -235,7 +235,7 @@ def _zeus_init_lm_head_from_embed(model, lm_head_cls, embed_cls):
     # or fall back to a heuristic: random-init weights (torch.empty on Zeus)
     # tend to have near-zero or garbage values with very different statistics
     # from pretrained embeddings.
-    if getattr(model, '_zeus_lm_head_loaded', False):
+    if zeus_lm_head_loaded:
         logger.info("Zeus: lm_head.weight loaded from checkpoint; keeping as-is.")
         return
 
@@ -674,15 +674,16 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
+        zeus_lm_head_loaded = False
         if _is_zeus:
             # Track whether lm_head.weight is present in the checkpoint so
             # _zeus_init_lm_head_from_embed knows whether to copy from embed.
             def _tracking_iter(it):
+                nonlocal zeus_lm_head_loaded
                 for name, tensor in it:
-                    if 'lm_head.weight' in name:
-                        model._zeus_lm_head_loaded = True
+                    if name.endswith('lm_head.weight'):
+                        zeus_lm_head_loaded = True
                     yield name, tensor
-            model._zeus_lm_head_loaded = False
             weights = _tracking_iter(weights)
         model.load_weights(weights)
 
@@ -729,7 +730,8 @@ class DefaultModelLoader(BaseModelLoader):
                 # tied (no separate lm_head.weight), lm_head stays at init
                 # values after load_weights. Copy embed_tokens weight to it.
                 _zeus_init_lm_head_from_embed(model, ParallelLMHead,
-                                              VocabParallelEmbedding)
+                                              VocabParallelEmbedding,
+                                              zeus_lm_head_loaded)
             _GEMM_TRANSPOSE_PARAMS.add((ParallelLMHead, 'weight'))
             targets.add(ParallelLMHead)
 
