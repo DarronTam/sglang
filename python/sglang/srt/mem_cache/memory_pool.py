@@ -90,32 +90,78 @@ class ReqToTokenPool:
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
-        with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+
+        if _is_zeus:
+            # Keep req_to_token on Zeus device. Writes use the Zeus-native
+            # scatter_2d_put kernel (sgl_kernel_zeus); reads use gather_2d_points
+            # / gather_2d_rows — avoiding the aten::index_put_ CPU fallback that
+            # would copy the entire matrix (64-128 MB) to CPU and back.
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
+        else:
+            with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                self.req_to_token = torch.zeros(
+                    (size, max_context_len), dtype=torch.int32, device=device
+                )
 
         self.free_slots = list(range(size))
 
     def write(self, indices, values):
         if _is_zeus:
-            # Do index_put on CPU, then copy back to avoid fallback
-            device = self.req_to_token.device
-            r2t = self.req_to_token.cpu()
-            # Recursively move indices to CPU
-            if isinstance(indices, torch.Tensor):
-                idx = indices.cpu()
-            elif isinstance(indices, tuple):
-                idx = tuple(
-                    i.cpu() if isinstance(i, torch.Tensor) else i for i in indices
-                )
-            else:
-                idx = indices
-            val = values.cpu() if isinstance(values, torch.Tensor) else values
-            r2t[idx] = val
-            self.req_to_token = r2t.to(device)
+            self._write_zeus(indices, values)
         else:
             self.req_to_token[indices] = values
+
+    def _write_zeus(self, indices, values):
+        """Zeus device-resident write using sgl_kernel_zeus.scatter_2d_put.
+
+        Handles two index patterns:
+          1. (tensor[bs], tensor[bs]) — point scatter (decode hot path)
+          2. (scalar/tensor, slice)   — row segment (extend/cache path)
+        """
+        from sgl_kernel_zeus import scatter_2d_put
+
+        if not isinstance(indices, tuple) or len(indices) != 2:
+            # Fallback for unexpected patterns
+            self.req_to_token[indices] = values
+            return
+
+        row_idx, col_idx = indices
+
+        if isinstance(col_idx, slice):
+            # Row segment write: req_to_token[row, start:end] = values
+            start = col_idx.start or 0
+            n = values.shape[0] if isinstance(values, torch.Tensor) else len(values)
+            if n == 0:
+                return
+            # Build column indices on CPU (cheap) and move to device (tiny).
+            # arange may not be natively supported on Zeus.
+            col_range = torch.arange(
+                start, start + n, dtype=torch.int32
+            ).to(self.device)
+            if isinstance(row_idx, (int, np.integer)):
+                row_expanded = torch.full(
+                    (n,), int(row_idx), dtype=torch.int32
+                ).to(self.device)
+            elif isinstance(row_idx, torch.Tensor):
+                row_expanded = row_idx.to(torch.int32).expand(n).contiguous().to(self.device)
+            else:
+                row_expanded = torch.full(
+                    (n,), int(row_idx), dtype=torch.int32
+                ).to(self.device)
+            if isinstance(values, torch.Tensor):
+                values = values.to(torch.int32).to(self.device)
+            scatter_2d_put(self.req_to_token, row_expanded, col_range, values)
+        else:
+            # Point scatter: req_to_token[rows[i], cols[i]] = values[i]
+            if isinstance(row_idx, torch.Tensor):
+                row_idx = row_idx.to(torch.int32).to(self.device)
+            if isinstance(col_idx, torch.Tensor):
+                col_idx = col_idx.to(torch.int32).to(self.device)
+            if isinstance(values, torch.Tensor):
+                values = values.to(torch.int32).to(self.device)
+            scatter_2d_put(self.req_to_token, row_idx, col_idx, values)
 
     def available_size(self):
         return len(self.free_slots)

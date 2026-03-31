@@ -44,33 +44,62 @@ class ZeusAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Build kv_indptr, kv_indices (and qo_indptr for extend) from forward_batch.
 
-        All metadata is computed on CPU (avoiding Zeus ATen fallback for
-        cumsum/cat/indexing), then moved to the Zeus device at the end.
+        Metadata (cumsum, mask) is computed on CPU, then moved to Zeus device.
+        req_to_token is on Zeus device — we use gather_2d_rows to efficiently
+        extract only the needed rows (bs × max_seq ≈ KB), avoiding a full
+        matrix copy (64-128 MB).
         """
         seq_lens = forward_batch.seq_lens
         batch_size = seq_lens.shape[0]
         req_pool_indices = forward_batch.req_pool_indices
         req_to_token = forward_batch.req_to_token_pool.req_to_token
 
-        # Pull inputs to CPU for metadata computation
+        # Pull small tensors to CPU for metadata computation
         seq_lens_cpu = seq_lens.cpu()
         req_pool_indices_cpu = req_pool_indices.cpu()
-        req_to_token_cpu = req_to_token.cpu()
+
+        # Efficiently gather needed rows from req_to_token.
+        # If on device, use Zeus gather kernel (transfers only bs×max_seq elements).
+        # If on CPU (legacy path), direct indexing (zero transfer).
+        if req_to_token.device.type != "cpu" and batch_size > 0:
+            max_seq = int(seq_lens_cpu.max().item()) if batch_size > 0 else 0
+            if max_seq > 0:
+                from sgl_kernel_zeus import gather_2d_rows
+
+                rows_device = gather_2d_rows(
+                    req_to_token,
+                    req_pool_indices.to(torch.int32),
+                    max_seq,
+                )
+                rows_cpu = rows_device.cpu()  # small: bs × max_seq × 4B
+            else:
+                rows_cpu = torch.empty(
+                    (batch_size, 0), dtype=torch.int32
+                )
+        else:
+            req_to_token_cpu = (
+                req_to_token
+                if req_to_token.device.type == "cpu"
+                else req_to_token.cpu()
+            )
+            max_seq = int(seq_lens_cpu.max().item()) if batch_size > 0 else 0
+            rows_cpu = req_to_token_cpu[req_pool_indices_cpu, :max_seq] if max_seq > 0 else torch.empty(
+                (batch_size, 0), dtype=torch.int32
+            )
 
         # kv_indptr: [batch_size + 1], CSR prefix sum of seq_lens
         kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32)
         kv_indptr[1:] = torch.cumsum(seq_lens_cpu, dim=0).to(torch.int32)
 
-        # kv_indices: concatenated absolute token positions for all sequences
-        kv_indices_list = []
-        for b in range(batch_size):
-            req_idx = req_pool_indices_cpu[b]
-            kv_indices_list.append(
-                req_to_token_cpu[req_idx, : seq_lens_cpu[b]].to(torch.int32)
-            )
-        kv_indices = torch.cat(kv_indices_list) if kv_indices_list else torch.empty(
-            0, dtype=torch.int32
-        )
+        # kv_indices: concatenated absolute token positions for all sequences.
+        total_kv = int(kv_indptr[-1].item())
+        if total_kv > 0 and batch_size > 0:
+            # Build a boolean mask: col < seq_len for each row
+            col_idx = torch.arange(max_seq, dtype=torch.int32).unsqueeze(0)  # [1, max_seq]
+            mask = col_idx < seq_lens_cpu.unsqueeze(1)  # [bs, max_seq]
+            kv_indices = rows_cpu[mask].to(torch.int32)
+        else:
+            kv_indices = torch.empty(0, dtype=torch.int32)
 
         # Extend-specific metadata
         qo_indptr = None

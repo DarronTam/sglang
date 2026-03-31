@@ -145,15 +145,34 @@ def _get_last_loc_cpu(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    """Zeus: compute on CPU to avoid ATen fallback for where/lt/index."""
+    """Zeus: use gather_2d_points on device-resident req_to_token.
+
+    Reads only bs points (bs×4B) instead of copying the entire matrix.
+    where/lt are computed on CPU (cheap, avoids ATen fallback).
+    """
     device = prefix_lens_tensor.device
-    r2t = req_to_token.cpu()
-    rpi = req_pool_indices_tensor.cpu()
-    pl = prefix_lens_tensor.cpu()
+    rpi_cpu = req_pool_indices_tensor.cpu()
+    pl_cpu = prefix_lens_tensor.cpu()
+
+    # Clamp col indices to >= 0 so gather doesn't read garbage;
+    # the torch.where below masks out entries where prefix_lens <= 0.
+    col_safe = (pl_cpu - 1).clamp(min=0)
+
+    if req_to_token.device.type != "cpu":
+        from sgl_kernel_zeus import gather_2d_points
+
+        gathered = gather_2d_points(
+            req_to_token,
+            req_pool_indices_tensor.to(torch.int32),
+            (prefix_lens_tensor - 1).clamp(min=0).to(torch.int32),
+        ).cpu()  # small: bs × 4B
+    else:
+        gathered = req_to_token[rpi_cpu, col_safe]
+
     result = torch.where(
-        pl > 0,
-        r2t[rpi, pl - 1],
-        torch.full_like(pl, -1),
+        pl_cpu > 0,
+        gathered,
+        torch.full_like(pl_cpu, -1),
     )
     return result.to(device)
 
@@ -459,14 +478,16 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     else:
         # Paged allocation
         if _is_zeus:
+            from sgl_kernel_zeus import gather_2d_points
+
             device = batch.seq_lens.device
-            rpi_cpu = batch.req_pool_indices.cpu()
-            sl_cpu = batch.seq_lens.cpu()
-            # Only copy the rows we need (bs rows) instead of the entire
-            # req_to_token matrix (max_reqs × max_seq_len, typically 128MB+).
-            r2t_rows_cpu = batch.req_to_token_pool.req_to_token[rpi_cpu].cpu()
-            last_loc = r2t_rows_cpu[torch.arange(bs), sl_cpu - 1].to(device)
-            seq_lens_next = (sl_cpu + token_per_req).to(device)
+            r2t = batch.req_to_token_pool.req_to_token
+            # Use Zeus gather kernel: read only bs points from device-resident
+            # req_to_token — transfers bs×4B instead of entire matrix (64-128MB).
+            col_idx = (batch.seq_lens - 1).to(torch.int32)  # [bs] on device
+            rpi = batch.req_pool_indices.to(torch.int32)     # [bs] on device
+            last_loc = gather_2d_points(r2t, rpi, col_idx)   # [bs] int32 on device
+            seq_lens_next = batch.seq_lens + token_per_req
         else:
             last_loc = batch.req_to_token_pool.req_to_token[
                 batch.req_pool_indices, batch.seq_lens - 1
@@ -484,10 +505,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     if batch.model_config.is_encoder_decoder:
         locs = batch.encoder_lens + batch.seq_lens
     else:
-        if _is_zeus:
-            locs = batch.seq_lens.cpu().to(batch.seq_lens.device)
-        else:
-            locs = batch.seq_lens.clone()
+        locs = batch.seq_lens.clone()
 
     batch.req_to_token_pool.write(
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
@@ -515,9 +533,18 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if start_p >= end_p:
         return
 
-    indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
-        start_p:end_p
-    ]
+    r2t = tree_cache.req_to_token_pool.req_to_token
+    if _is_zeus and r2t.device.type != "cpu":
+        # Device-resident: use gather_2d_rows for the slice, or gather specific range.
+        # This is not a hot path, so we gather on device and keep on device.
+        from sgl_kernel_zeus import gather_2d_rows
+
+        n_free = end_p - start_p
+        row_idx = torch.tensor([req.req_pool_idx], dtype=torch.int32, device=r2t.device)
+        row_data = gather_2d_rows(r2t, row_idx, end_p)  # [1, end_p]
+        indices_to_free = row_data[0, start_p:end_p]
+    else:
+        indices_to_free = r2t[req.req_pool_idx][start_p:end_p]
     tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
 
 

@@ -102,11 +102,22 @@ class Sampler(nn.Module):
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
             if _is_zeus:
-                batch_next_token_ids = torch.argmax(logits.cpu(), -1).to(logits.device)
+                # Greedy via fused Zeus sampling kernel: temperature=1 + top_k=1
+                # gives deterministic argmax entirely on device — eliminates D2H
+                # of entire logits tensor (bs × vocab × 2B per step).
+                if return_logprob:
+                    # Compute log-probs BEFORE sampling_from_logits modifies logits in-place
+                    logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+                bs = logits.shape[0]
+                batch_next_token_ids = zeus_sampling_from_logits(
+                    logits,
+                    torch.ones(bs, 1, dtype=logits.dtype, device=logits.device),
+                    top_k=1,
+                ).long()
             else:
                 batch_next_token_ids = torch.argmax(logits, -1)
-            if return_logprob:
-                logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+                if return_logprob:
+                    logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
         else:
             can_sample_directly_from_probs = (
                 not sampling_info.need_top_p_sampling

@@ -496,70 +496,91 @@ Zeus Decode Step:  ~25.5ms (17+ 次 CPU 传输, ~200MB 数据搬运)
 
 每次 decode step 中发生的 CPU↔Zeus 数据传输：
 
-| # | 位置 | 方向 | 数据 | 大小估算 | 严重程度 |
-|---|------|------|------|----------|----------|
+| # | 位置 | 方向 | 数据 | 大小估算 | 状态 |
+|---|------|------|------|----------|------|
 | T1 | `zeus_backend.py:init_forward_metadata` | Zeus→CPU | seq_lens | bs × 4B | 🟢 小 |
 | T2 | `zeus_backend.py:init_forward_metadata` | Zeus→CPU | req_pool_indices | bs × 4B | 🟢 小 |
-| T3 | `zeus_backend.py:init_forward_metadata` | Zeus→CPU | **req_to_token 整个矩阵** | ⚠️ max_reqs × max_ctx × 4B | 🔴 **巨大** |
+| T3 | `zeus_backend.py:init_forward_metadata` | Zeus→CPU | ~~req_to_token 整个矩阵~~ → gather_2d_rows 结果 | bs × max_seq × 4B | ✅ **已优化** |
 | T4 | `zeus_backend.py:init_forward_metadata` | CPU→Zeus | kv_indptr, kv_indices | (bs + total_kv) × 4B | 🟡 中 |
-| T5 | `memory_pool.py:write()` | Zeus→CPU | **req_to_token 整个矩阵** | ⚠️ 同 T3 | 🔴 **巨大** |
-| T6 | `memory_pool.py:write()` | CPU→Zeus | **req_to_token 整个矩阵** | ⚠️ 同 T3 | 🔴 **巨大** |
-| T7 | `common.py:alloc_for_decode` | Zeus→CPU | rpi, seq_lens | bs × 8B | 🟢 小 |
-| T8 | `common.py:alloc_for_decode` | Zeus→CPU | req_to_token (仅 bs 行) | bs × max_ctx × 4B | 🟡 已优化 |
-| T11 | `sampler.py` (greedy) | Zeus→CPU | logits | bs × vocab × 2B | 🟡 中 |
-| T12 | `sampler.py` (greedy) | CPU→Zeus | argmax result | bs × 8B | 🟢 小 |
+| T5 | `memory_pool.py:write()` | — | ~~整矩阵拷贝~~ → scatter_2d_put 设备端写入 | 0 | ✅ **已消除** |
+| T6 | `memory_pool.py:write()` | — | ~~整矩阵拷贝~~ → scatter_2d_put 设备端写入 | 0 | ✅ **已消除** |
+| T7 | `common.py:alloc_for_decode` | — | ~~rpi, seq_lens 搬 CPU~~ → gather_2d_points 设备端读取 | 0 | ✅ **已消除** |
+| T8 | `common.py:_get_last_loc_cpu` | Zeus→CPU | ~~req_to_token 整个矩阵~~ → gather_2d_points 结果 | bs × 4B | ✅ **已优化** |
+| T11 | `sampler.py` (greedy) | — | ~~logits 搬 CPU argmax~~ → zeus_sampling_from_logits | 0 | ✅ **已消除** |
 
-### 7.2 严重问题分级
+### 7.2 严重问题分级（已完成优化）
 
-#### 🔴 P1: ReqToTokenPool.write() — 每步拷贝整个矩阵
+> 以下三个 P0 问题已全部解决。`req_to_token` 矩阵现在常驻 Zeus 设备，所有读写
+> 通过 `sgl_kernel_zeus` 的三个专用 2D int32 索引算子完成，消除了整矩阵 CPU bounce。
 
-**位置:** `memory_pool.py:101-116`
+#### ✅ P1: ReqToTokenPool.write() — ~~每步拷贝整个矩阵~~ 已消除
 
-每个 decode step 把整个 `req_to_token` 矩阵（典型 64~128 MB）从 Zeus 拷到 CPU，写入几个元素后整块拷回。生成 100 token = 12.8 GB 无效传输。
+**位置:** `memory_pool.py` — `ReqToTokenPool.__init__` + `_write_zeus()`
 
-**根因:** Zeus 缺少 `aten::index_put_` (tensor indices 版本)
+**原问题:** 每个 decode step 触发 `aten::index_put_` CPU fallback，拷贝整个 `req_to_token`
+矩阵（64~128 MB）到 CPU 再拷回。生成 100 token = 12.8 GB 无效传输。
 
-**解法方案:**
+**已实施方案:** 采用方案 A — 实现 Zeus 端专用散写算子，零传输。
+
 ```python
-# 方案 A：实现 Zeus 端 index_put_ 算子 (最优，零传输)
-sgl_kernel_zeus.index_put_(self.req_to_token, indices, values)
+# req_to_token 常驻 Zeus 设备（不再放 CPU）
+self.req_to_token = torch.zeros((size, max_context_len), dtype=torch.int32, device=device)
 
-# 方案 B：注册 Zeus ATen index_put_ 实现 (通用性更好)
-# 在 torch_zeus 中注册 aten::index_put_ 的实现
-
-# 方案 C：req_to_token 保持在 CPU (改动最少但有其他影响)
+# _write_zeus() 根据索引模式分派：
+#   (tensor, tensor) 点散写 → scatter_2d_put（decode 热路径）
+#   (scalar, slice)  行段写 → scatter_2d_put + arange 展开（extend/cache 路径）
+from sgl_kernel_zeus import scatter_2d_put
+scatter_2d_put(self.req_to_token, row_idx, col_idx, values)  # 全在设备端，零传输
 ```
 
-#### 🔴 P2: init_forward_metadata() — 每次拷贝整个 req_to_token
+#### ✅ P2: init_forward_metadata() — ~~每次拷贝整个矩阵~~ 已优化
 
-**位置:** `zeus_backend.py:48`
+**位置:** `zeus_backend.py` — `init_forward_metadata()`
 
-与 P1 叠加，每个 decode step **3 次**整矩阵传输。
+**原问题:** 与 P1 叠加，每个 decode step **3 次**整矩阵传输。
 
-**解法方案:**
+**已实施方案:** 使用 `gather_2d_rows` 只提取所需行（bs × max_seq），传输量从
+max_reqs × max_ctx × 4B 降至 bs × max_seq × 4B（典型缩减 100x+）。
+
 ```python
-# 快速修复：只拷贝需要的行
-req_to_token_needed = req_to_token[req_pool_indices_cpu].cpu()  # bs 行 vs 全矩阵
+from sgl_kernel_zeus import gather_2d_rows
 
-# 最优方案：实现 Zeus 端 kv_indices 构建算子 (类似 FlashInfer Triton kernel)
-kv_indices = sgl_kernel_zeus.create_kv_indices(
-    req_to_token, req_pool_indices, seq_lens, kv_indptr
-)
+# 只从设备端提取 bs 行 × max_seq 列，而非拷贝整个矩阵
+rows_device = gather_2d_rows(req_to_token, req_pool_indices.to(torch.int32), max_seq)
+rows_cpu = rows_device.cpu()  # 小：bs × max_seq × 4B
 ```
 
-#### 🔴 P3: Greedy argmax 在 CPU 执行
+同时，`common.py` 中的相关读取也做了对应优化：
+- `alloc_for_decode` paged 路径：`gather_2d_points(r2t, rpi, col_idx)` 只读 bs 个点（bs×4B），不再搬 CPU
+- `_get_last_loc_cpu`：`gather_2d_points(...)` 在设备端读取后 `.cpu()`（bs×4B），替代整矩阵 `.cpu()`
+- `release_kv_cache`：`gather_2d_rows` 在设备端读取单行，替代整行 CPU 索引
 
-**位置:** `sampler.py:104-105`
+#### ✅ P3: Greedy argmax — ~~在 CPU 执行~~ 已消除
 
-`torch.argmax(logits.cpu(), -1).to(device)` 把整个 logits (vocab_size × 2B / sample) 搬到 CPU。
+**位置:** `sampler.py` — `Sampler.forward()` greedy 分支
 
-**解法方案:**
+**原问题:** `torch.argmax(logits.cpu(), -1).to(device)` 搬整个 logits（bs × vocab × 2B）到 CPU。
+
+**已实施方案:** 复用 Zeus sampling kernel，temperature=1 + top_k=1 实现确定性 argmax，全在设备端完成。
+
 ```python
-# 方案 A：实现 Zeus argmax 算子
-batch_next_token_ids = sgl_kernel_zeus.argmax(logits, dim=-1)
-
-# 方案 B：复用 Zeus sampling kernel (极小 temperature 模拟 greedy)
+# Greedy via fused Zeus sampling kernel: top_k=1 gives deterministic argmax on device
+batch_next_token_ids = zeus_sampling_from_logits(
+    logits,
+    torch.ones(bs, 1, dtype=logits.dtype, device=logits.device),
+    top_k=1,
+).long()
 ```
+
+#### 优化效果总结
+
+| 问题 | 原传输量/step | 优化后传输量/step | 涉及算子 |
+|------|-------------|-----------------|----------|
+| P1 write | 128 MB × 2（D2H+H2D） | **0** | `scatter_2d_put` |
+| P2 metadata | 128 MB（D2H） | bs × max_seq × 4B（≈ KB） | `gather_2d_rows` |
+| P2 alloc_for_decode | bs × max_ctx × 4B | **0**（设备端） | `gather_2d_points` |
+| P2 _get_last_loc | 128 MB（D2H） | bs × 4B | `gather_2d_points` |
+| P3 greedy | bs × vocab × 2B | **0** | `zeus_sampling_from_logits` |
 
 ---
 
