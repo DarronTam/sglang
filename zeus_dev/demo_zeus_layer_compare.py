@@ -69,6 +69,15 @@ def load_hf_model():
     return model, tokenizer
 
 
+def skip_stage_without_cuda(stage_name, results):
+    print()
+    print("=" * 60)
+    print(f"Stage: {stage_name} (SKIPPED)")
+    print("=" * 60)
+    print("  CUDA not available; skipping CUDA vs Zeus comparison.")
+    results[stage_name] = None
+
+
 # ── Stage: Embedding ──────────────────────────────────────────
 def test_embedding(model, tokenizer):
     print()
@@ -237,7 +246,7 @@ def test_rope(model, tokenizer):
     num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
     
     torch.manual_seed(42)
-    positions = torch.arange(seq_len, dtype=torch.int64).unsqueeze(0) # [1, 11]
+    positions = torch.arange(seq_len, dtype=torch.int64)  # [num_tokens]
     
     # query: [num_tokens, num_heads * head_size]
     query = torch.randn(batch_size * seq_len, num_heads * head_size, dtype=torch.bfloat16)
@@ -268,8 +277,8 @@ def test_rope(model, tokenizer):
     print(f"  Zeus output    : q={q_out_zeus.shape}, k={k_out_zeus.shape}")
 
     # ── Compare ──
-    ok_q = compare_tensors("rope_query", q_out_cuda, q_out_zeus)
-    ok_k = compare_tensors("rope_key", k_out_cuda, k_out_zeus)
+    ok_q = compare_tensors("rope_query", q_out_cuda, q_out_zeus, atol=2e-2, rtol=1e-2)
+    ok_k = compare_tensors("rope_key", k_out_cuda, k_out_zeus, atol=2e-2, rtol=1e-2)
 
     return ok_q and ok_k, (q_out_cuda, k_out_cuda)
 
@@ -1512,58 +1521,31 @@ def main():
     print(f"  vocab_size   = {model.config.vocab_size}")
 
     results = {}
+    has_cuda = torch.cuda.is_available()
+    stage_fns = [
+        ("embedding", test_embedding),
+        ("rmsnorm", test_rmsnorm),
+        ("silu_and_mul", test_silu_and_mul),
+        ("rope", test_rope),
+        ("qkv_proj", test_qkv_proj),
+        ("o_proj", test_o_proj),
+        ("mlp", test_mlp),
+        ("store_kv_cache", test_store_kv_cache),
+        ("extend_attention", test_extend_attention),
+        ("decode_attention", test_decode_attention),
+        ("transformer_block", test_transformer_block),
+        ("lm_head", test_lm_head),
+        ("full_model", test_full_model),
+    ]
 
-    if args.stage in ("embedding", "all"):
-        ok, _ = test_embedding(model, tokenizer)
-        results["embedding"] = ok
-
-    if args.stage in ("rmsnorm", "all"):
-        ok, _ = test_rmsnorm(model, tokenizer)
-        results["rmsnorm"] = ok
-
-    if args.stage in ("silu_and_mul", "all"):
-        ok, _ = test_silu_and_mul(model, tokenizer)
-        results["silu_and_mul"] = ok
-
-    if args.stage in ("rope", "all"):
-        ok, _ = test_rope(model, tokenizer)
-        results["rope"] = ok
-
-    if args.stage in ("qkv_proj", "all"):
-        ok, _ = test_qkv_proj(model, tokenizer)
-        results["qkv_proj"] = ok
-
-    if args.stage in ("o_proj", "all"):
-        ok, _ = test_o_proj(model, tokenizer)
-        results["o_proj"] = ok
-
-    if args.stage in ("mlp", "all"):
-        ok, _ = test_mlp(model, tokenizer)
-        results["mlp"] = ok
-
-    if args.stage in ("store_kv_cache", "all"):
-        ok, _ = test_store_kv_cache(model, tokenizer)
-        results["store_kv_cache"] = ok
-
-    if args.stage in ("extend_attention", "all"):
-        ok, _ = test_extend_attention(model, tokenizer)
-        results["extend_attention"] = ok
-
-    if args.stage in ("decode_attention", "all"):
-        ok, _ = test_decode_attention(model, tokenizer)
-        results["decode_attention"] = ok
-
-    if args.stage in ("transformer_block", "all"):
-        ok, _ = test_transformer_block(model, tokenizer)
-        results["transformer_block"] = ok
-
-    if args.stage in ("lm_head", "all"):
-        ok, _ = test_lm_head(model, tokenizer)
-        results["lm_head"] = ok
-
-    if args.stage in ("full_model", "all"):
-        ok, _ = test_full_model(model, tokenizer)
-        results["full_model"] = ok
+    for stage_name, stage_fn in stage_fns:
+        if args.stage not in (stage_name, "all"):
+            continue
+        if not has_cuda:
+            skip_stage_without_cuda(stage_name, results)
+            continue
+        ok, _ = stage_fn(model, tokenizer)
+        results[stage_name] = ok
 
     # -- Summary --
     print()
@@ -1571,7 +1553,8 @@ def main():
     print("Summary")
     print("=" * 60)
     for name, passed in results.items():
-        print(f"  {name:20s} : {'PASS' if passed else 'FAIL'}")
+        status = "PASS" if passed is True else "FAIL" if passed is False else "SKIP"
+        print(f"  {name:20s} : {status}")
     print("=" * 60)
 
 

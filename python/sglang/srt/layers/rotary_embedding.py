@@ -116,7 +116,7 @@ class RotaryEmbedding(CustomOp):
             cache = cache.to(dtype)
 
         if (
-            (not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512])
+            (not (_is_cuda or _is_npu or _is_zeus) or self.head_size not in [64, 128, 256, 512])
             and not (_is_cpu and _is_cpu_amx_available)
             and not (_is_xpu)
         ):
