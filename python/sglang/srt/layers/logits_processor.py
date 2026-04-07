@@ -885,11 +885,15 @@ class LogitsProcessor(nn.Module):
                     True,  # is_vnni
                 )
             elif _is_zeus:
-                # Weight packed in (K,N) LocalMem by pack_weights — no .T needed.
-                # Works for both standalone ParallelLMHead and tied
-                # VocabParallelEmbedding (same object, transposed at pack time).
+                # ParallelLMHead: weight is (K,N) in LocalMem (transposed).
+                # Tied VocabParallelEmbedding: weight is (N,K) in GDG
+                # (standard layout, not packed); GEMM via weight.t().
                 h = hidden_states.to(lm_head.weight.dtype)
-                logits = torch.mm(h, lm_head.weight)
+                transposed = getattr(lm_head, '_zeus_transposed_params', set())
+                if 'weight' in transposed:
+                    logits = torch.mm(h, lm_head.weight)
+                else:
+                    logits = torch.mm(h, lm_head.weight.t())
             elif get_global_server_args().rl_on_policy_target is not None:
                 # Due to tie-weight, we may not be able to change lm_head's weight dtype
                 logits = torch.matmul(

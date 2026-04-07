@@ -476,15 +476,11 @@ class VocabParallelEmbedding(torch.nn.Module):
         else:
             masked_input = input_
 
-        # Zeus: weight is transposed (K,N) in LocalMem for GEMM compat.
-        # Use sgl-kernel-zeus column-gather embedding instead of F.embedding.
-        if _is_zeus and hasattr(self, '_zeus_local_mems'):
-            from sgl_kernel_zeus import embedding as zeus_embedding
-            output_parallel = zeus_embedding(masked_input.long(), self.weight)
-        else:
-            # Get the embeddings.
-            with use_symmetric_memory(get_tp_group(), disabled=not self.enable_tp):
-                output_parallel = self.quant_method.embedding(self, masked_input.long())
+        # Zeus: embedding weight stays in GDG, standard (N,K) row-major.
+        # ATen aten::embedding dispatch handles it via zenl_embedding.
+        # Get the embeddings.
+        with use_symmetric_memory(get_tp_group(), disabled=not self.enable_tp):
+            output_parallel = self.quant_method.embedding(self, masked_input.long())
 
         if self.tp_size > 1:
             # Mask the output embedding.

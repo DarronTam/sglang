@@ -713,18 +713,18 @@ class DefaultModelLoader(BaseModelLoader):
             _GEMM_TRANSPOSE_PARAMS.add((LinearBase, 'weight'))
             targets = {LinearBase}
 
+            # Embedding weight stays in GDG, standard (N,K) row-major layout.
+            # VocabParallelEmbedding is never packed into LocalMem.
+            #
             # lm_head weight needs LocalMem for GEMM (torch.mm in logits).
-            # When tie_word_embeddings=True, lm_head IS embed_tokens (same
-            # VocabParallelEmbedding object) — must pack VPE so GEMM works,
-            # at the cost of to_gdg conversion on each embedding lookup.
+            # When tie_word_embeddings=True, lm_head IS embed_tokens — the
+            # weight remains in GDG (N,K); logits GEMM uses weight.t().
             # When tie_word_embeddings=False, lm_head is a separate
-            # ParallelLMHead — only pack that; leave embed_tokens unpacked
-            # so embedding lookup runs directly on GDG memory (no to_gdg).
+            # ParallelLMHead — pack that into LocalMem as (K,N) for GEMM.
             tie = getattr(getattr(model, 'config', None),
                           'tie_word_embeddings', False)
             if tie:
-                _GEMM_TRANSPOSE_PARAMS.add((VocabParallelEmbedding, 'weight'))
-                targets.add(VocabParallelEmbedding)
+                pass  # VPE stays in GDG; logits_processor handles .t()
             else:
                 # tie_word_embeddings=False: if the checkpoint was originally
                 # tied (no separate lm_head.weight), lm_head stays at init
