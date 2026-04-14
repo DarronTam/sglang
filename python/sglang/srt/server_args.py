@@ -639,6 +639,12 @@ class ServerArgs:
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
 
+        # Zeus sets cuda_graph_max_bs before the generic GPU-memory heuristic
+        # so that its conservative default (32) is respected rather than being
+        # overwritten.  User-specified --cuda-graph-max-bs still wins because
+        # both check `is None` before writing.
+        self._handle_zeus_backends()
+
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
 
@@ -646,7 +652,6 @@ class ServerArgs:
         self._handle_hpu_backends()
         self._handle_cpu_backends()
         self._handle_npu_backends()
-        self._handle_zeus_backends()
 
         # Handle compilation config
         self._handle_compilation_cfg()
@@ -989,7 +994,9 @@ class ServerArgs:
         if is_zeus():
             if self.attention_backend is None:
                 self.attention_backend = "zeus"
-            self.disable_cuda_graph = True
+            # Zeus graph capture/replay is supported — don't force-disable
+            if self.cuda_graph_max_bs is None:
+                self.cuda_graph_max_bs = 32
             # Zeus requires page-aligned KV cache (page_size must be multiple of 128)
             if self.page_size is None:
                 self.page_size = 128

@@ -1,0 +1,38 @@
+{
+  "eager": {
+    "1": {
+      "avg_latency_s": 15.18,
+      "avg_tokens": 8.0,
+      "throughput_tok_s": 0.53
+    },
+    "4": {
+      "avg_latency_s": 120.6534,
+      "avg_tokens": 125.0,
+      "throughput_tok_s": 1.04
+    },
+    "8": {
+      "avg_latency_s": 154.8877,
+      "avg_tokens": 197.0,
+      "throughput_tok_s": 1.27
+    },
+    "memory_used_mb": 4096.0
+  },
+  "graph": {
+    "1": {
+      "avg_latency_s": 16.146,
+      "avg_tokens": 8.0,
+      "throughput_tok_s": 0.5
+    },
+    "4": {
+      "avg_latency_s": 121.1717,
+      "avg_tokens": 125.0,
+      "throughput_tok_s": 1.03
+    },
+    "8": {
+      "avg_latency_s": 154.4413,
+      "avg_tokens": 197.0,
+      "throughput_tok_s": 1.28
+    },
+    "memory_used_mb": 4096.0
+  }
+}

@@ -40,7 +40,6 @@ logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
-_is_zeus = is_zeus()
 
 
 class Sampler(nn.Module):
@@ -101,10 +100,7 @@ class Sampler(nn.Module):
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
-            if _is_zeus:
-                batch_next_token_ids = torch.argmax(logits.cpu(), -1).to(logits.device)
-            else:
-                batch_next_token_ids = torch.argmax(logits, -1)
+            batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
         else:

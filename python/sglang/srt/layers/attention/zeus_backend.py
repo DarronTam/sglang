@@ -19,7 +19,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
@@ -40,6 +40,92 @@ class ZeusAttnBackend(AttentionBackend):
         self.forward_metadata: Optional[ZeusAttnMetadata] = None
         self.device = model_runner.device
         self.page_size = model_runner.page_size
+        self.max_context_len = model_runner.model_config.context_len
+        self.req_to_token = model_runner.req_to_token_pool.req_to_token
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        """Pre-allocate fixed-size tensors for graph capture/replay."""
+        self.cuda_graph_kv_indptr = torch.zeros(
+            max_bs + 1, dtype=torch.int32, device=self.device
+        )
+        max_total_kv = max_bs * self.max_context_len
+        self.cuda_graph_kv_indices = torch.zeros(
+            max_total_kv, dtype=torch.int32, device=self.device
+        )
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: "ForwardMode",
+        spec_info=None,
+    ):
+        """Fill metadata for graph capture (decode only)."""
+        self._fill_decode_metadata_for_graph(bs, req_pool_indices, seq_lens)
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: "ForwardMode",
+        spec_info=None,
+        seq_lens_cpu: Optional[torch.Tensor] = None,
+    ):
+        """Update metadata in-place for graph replay (decode only)."""
+        self._fill_decode_metadata_for_graph(bs, req_pool_indices, seq_lens)
+
+    def _fill_decode_metadata_for_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ):
+        """Build CSR kv_indptr / kv_indices and set forward_metadata.
+
+        This runs *outside* graph capture (before capture or before replay),
+        so CPU work is fine.
+        """
+        seq_lens_cpu = seq_lens[:bs].cpu()
+        req_pool_indices_cpu = req_pool_indices[:bs].cpu()
+
+        # kv_indptr — compute on CPU, copy into pre-allocated device buffer
+        kv_indptr_cpu = torch.zeros(bs + 1, dtype=torch.int32)
+        kv_indptr_cpu[1:] = torch.cumsum(seq_lens_cpu, dim=0).to(torch.int32)
+        self.cuda_graph_kv_indptr[: bs + 1].copy_(kv_indptr_cpu)
+
+        # kv_indices — gather from req_to_token on CPU, copy into pre-allocated buffer
+        req_to_token_cpu = self.req_to_token.cpu()
+        total_kv = int(kv_indptr_cpu[bs].item())
+        if total_kv > 0:
+            kv_indices_cpu = torch.empty(total_kv, dtype=torch.int32)
+            offset = 0
+            for b in range(bs):
+                sl = int(seq_lens_cpu[b].item())
+                if sl > 0:
+                    req_idx = int(req_pool_indices_cpu[b].item())
+                    kv_indices_cpu[offset : offset + sl] = req_to_token_cpu[
+                        req_idx, :sl
+                    ].to(torch.int32)
+                    offset += sl
+            self.cuda_graph_kv_indices[:total_kv].copy_(kv_indices_cpu)
+
+        # Use the full pre-allocated kv_indices buffer (not a slice).
+        # Graph capture records tensor shape; the kernel uses kv_indptr to
+        # determine valid access ranges, so the full buffer is safe and
+        # consistent across different batch sizes and replay seq_lens.
+        self.forward_metadata = ZeusAttnMetadata(
+            kv_indptr=self.cuda_graph_kv_indptr[: bs + 1],
+            kv_indices=self.cuda_graph_kv_indices,
+        )
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 1
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Build kv_indptr, kv_indices (and qo_indptr for extend) from forward_batch.
