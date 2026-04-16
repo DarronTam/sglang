@@ -27,10 +27,107 @@ import triton
 import triton.language as tl
 
 from sglang.srt.mem_cache.memory_pool import SWAKVPool
-from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_num_new_pages,
+    is_zeus,
+    next_power_of_2,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
+
+_is_zeus = is_zeus()
+
+
+def _alloc_extend_native(
+    prefix_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    last_loc: torch.Tensor,
+    free_pages: torch.Tensor,
+    out_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    # Pure-python fallback for alloc_extend_kernel. Triton has no driver on
+    # zeus/cpu, so we copy the (small) bookkeeping tensors to CPU, run the
+    # per-batch loop in python, then scatter the result back into out_indices.
+    pre = prefix_lens.detach().cpu().tolist()
+    seq = seq_lens.detach().cpu().tolist()
+    last = last_loc.detach().cpu().tolist()
+    free = free_pages.detach().cpu().tolist()
+
+    def cdiv(a: int, b: int) -> int:
+        return (a + b - 1) // b
+
+    bs = len(pre)
+    total = sum(s - p for s, p in zip(seq, pre))
+    flat = [0] * total
+    out_off = 0
+    new_page_off = 0
+    for i in range(bs):
+        pre_len = pre[i]
+        seq_len = seq[i]
+        ext_len = seq_len - pre_len
+        num_new_pages_i = cdiv(seq_len, page_size) - cdiv(pre_len, page_size)
+
+        part1 = min(seq_len, cdiv(pre_len, page_size) * page_size) - pre_len
+        for j in range(part1):
+            flat[out_off + j] = last[i] + 1 + j
+
+        if pre_len + part1 < seq_len:
+            part2 = (seq_len // page_size) * page_size - cdiv(pre_len, page_size) * page_size
+            for j in range(part2):
+                page = free[new_page_off + j // page_size]
+                flat[out_off + part1 + j] = page * page_size + j % page_size
+
+            if pre_len + part1 + part2 < seq_len:
+                part3 = seq_len - (seq_len // page_size) * page_size
+                start = free[new_page_off + num_new_pages_i - 1]
+                for j in range(part3):
+                    flat[out_off + part1 + part2 + j] = start * page_size + j
+
+        out_off += ext_len
+        new_page_off += num_new_pages_i
+
+    out_indices.copy_(
+        torch.tensor(flat, dtype=out_indices.dtype, device=out_indices.device)
+    )
+
+
+def _alloc_decode_native(
+    seq_lens: torch.Tensor,
+    last_loc: torch.Tensor,
+    free_pages: torch.Tensor,
+    out_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    # Pure-python fallback for alloc_decode_kernel. Decode always extends by
+    # exactly one token per sequence, so we either reuse the previous slot
+    # (last_loc+1) or claim the first slot of a fresh page.
+    seq = seq_lens.detach().cpu().tolist()
+    last = last_loc.detach().cpu().tolist()
+    free = free_pages.detach().cpu().tolist()
+
+    def cdiv(a: int, b: int) -> int:
+        return (a + b - 1) // b
+
+    bs = len(seq)
+    flat = [0] * bs
+    new_page_off = 0
+    for i in range(bs):
+        seq_len = seq[i]
+        pre_len = seq_len - 1
+        num_new_pages_i = cdiv(seq_len, page_size) - cdiv(pre_len, page_size)
+        if num_new_pages_i == 0:
+            flat[i] = last[i] + 1
+        else:
+            page = free[new_page_off]
+            flat[i] = page * page_size
+        new_page_off += num_new_pages_i
+
+    out_indices.copy_(
+        torch.tensor(flat, dtype=out_indices.dtype, device=out_indices.device)
+    )
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -484,16 +581,26 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
-        alloc_extend_kernel[(bs,)](
-            prefix_lens,
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            next_power_of_2(bs),
-            self.page_size,
-            self.seen_max_num_extend_tokens_next_power_of_2,
-        )
+        if _is_zeus:
+            _alloc_extend_native(
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.page_size,
+            )
+        else:
+            alloc_extend_kernel[(bs,)](
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                next_power_of_2(bs),
+                self.page_size,
+                self.seen_max_num_extend_tokens_next_power_of_2,
+            )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
@@ -525,14 +632,23 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.merge_and_sort_free()
 
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
-        alloc_decode_kernel[(bs,)](
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            next_power_of_2(bs),
-            self.page_size,
-        )
+        if _is_zeus:
+            _alloc_decode_native(
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.page_size,
+            )
+        else:
+            alloc_decode_kernel[(bs,)](
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                next_power_of_2(bs),
+                self.page_size,
+            )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)

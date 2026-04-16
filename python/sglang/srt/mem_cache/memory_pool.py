@@ -821,6 +821,16 @@ class MHATokenToKVPool(KVCache):
             with self.device_module.stream(self.alt_stream):
                 self.v_buffer[layer_id - self.start_layer][loc] = cache_v
             current_stream.wait_stream(self.alt_stream)
+        elif _is_zeus:
+            # zeus backend's index_put_ does not broadcast multi-dim value
+            # tensors correctly — it treats the value as flat and complains
+            # `values size N*H*D vs num_indices N`. Use scatter_ with an
+            # explicitly expanded index tensor instead.
+            k_buf = self.k_buffer[layer_id - self.start_layer]
+            v_buf = self.v_buffer[layer_id - self.start_layer]
+            idx = loc.view(-1, *([1] * (k_buf.dim() - 1))).expand_as(cache_k)
+            k_buf.scatter_(0, idx, cache_k)
+            v_buf.scatter_(0, idx, cache_v)
         else:
             self.k_buffer[layer_id - self.start_layer][loc] = cache_k
             self.v_buffer[layer_id - self.start_layer][loc] = cache_v

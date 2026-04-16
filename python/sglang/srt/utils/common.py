@@ -141,6 +141,14 @@ builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 
 @lru_cache(maxsize=1)
 def is_cuda():
+    # Respect explicit device selection: when SGLANG_DEVICE pins a non-CUDA
+    # backend (e.g. "zeus"), force is_cuda() to False even on a box that also
+    # has a CUDA GPU + CUDA-enabled torch build. Without this, modules that
+    # gate CUDA-only sgl_kernel imports and forward paths on `_is_cuda = is_cuda()`
+    # still pull in CUDA ops and co-run with the zeus path.
+    device = os.environ.get("SGLANG_DEVICE", "")
+    if device and device != "cuda":
+        return False
     return torch.cuda.is_available() and torch.version.cuda
 
 
@@ -1751,10 +1759,17 @@ def get_xpu_memory_capacity():
 def get_zeus_memory_capacity():
     try:
         if is_zeus():
+            # `torch.zeus` is only registered as an attribute on the `torch`
+            # module once `torch_zeus` has been imported somewhere in the
+            # process. Importing it eagerly here makes this function safe to
+            # call from server startup even when nothing else has touched
+            # torch_zeus yet.
+            import torch_zeus  # noqa: F401
+
             _, total = torch.zeus.mem_get_info(0)
             return total // 1024 // 1024  # unit: MB
         raise ValueError("No Zeus memory values found.")
-    except AttributeError:
+    except (AttributeError, ImportError):
         raise RuntimeError("torch.zeus is not available.")
 
 
@@ -2019,6 +2034,14 @@ def get_npu_compiler_config():
 def get_compiler_backend() -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
+
+    if is_zeus():
+        # torch_zeus does not support the inductor backend. Without this
+        # branch, module-level `@torch.compile(backend=get_compiler_backend())`
+        # decorators (e.g. overlap_utils._resolve_future_token_ids) bind to
+        # inductor at import time and then blow up at first call with
+        # `device zeus nyi`.
+        return "eager"
 
     if hasattr(torch, "npu") and torch.npu.is_available():
         try:

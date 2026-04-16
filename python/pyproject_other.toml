@@ -91,6 +91,21 @@ srt_npu = ["sglang[runtime_common]"]
 # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
 srt_hpu = ["sglang[runtime_common]"]
 
+# Zeus backend (pure-zeus, no CUDA).
+#
+# This extra intentionally lists ONLY the common runtime deps. The two
+# packages that make zeus actually work — `torch_zeus` (provides the
+# `torch.zeus` device) and `sgl_kernel_zeus` (fused kernels) — are still
+# in internal development and are NOT published to PyPI, so we cannot
+# reference them here. Install them from their source trees first, then
+# `pip install sglang[srt_zeus]`.
+#
+# See `zeus_dev/zeus_install.md` for the full, tested install workflow.
+srt_zeus = [
+  "sglang[runtime_common]",
+  "torch",
+]
+
 test = [
   "accelerate",
   "expecttest",
@@ -106,10 +121,12 @@ test = [
 all_hip = ["sglang[srt_hip]"]
 all_npu = ["sglang[srt_npu]"]
 all_hpu = ["sglang[srt_hpu]"]
+all_zeus = ["sglang[srt_zeus]"]
 
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
 dev_npu = ["sglang[all_npu]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
+dev_zeus = ["sglang[all_zeus]", "sglang[test]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"

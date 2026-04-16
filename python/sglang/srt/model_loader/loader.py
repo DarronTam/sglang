@@ -246,6 +246,64 @@ def _zeus_init_lm_head_from_embed(model, lm_head_cls, embed_cls, zeus_lm_head_lo
     lm_w.copy_(em_w)
 
 
+def _zeus_decouple_tied_lm_head(model, lm_head_cls, embed_cls):
+    """Break the shared-module/storage tie between `model.lm_head` and
+    `model.model.embed_tokens` for tie_word_embeddings=True models on zeus.
+
+    Qwen2-style tying sets `self.lm_head = self.model.embed_tokens` — the
+    lm_head is literally the *same* `VocabParallelEmbedding` module (not a
+    separate `ParallelLMHead`). Walking `named_modules()` with an
+    `isinstance(ParallelLMHead)` filter therefore never finds it. Both
+    `model.lm_head.weight` and `embed_tokens.weight` point at the same
+    `torch.nn.Parameter`.
+
+    `torch_zeus.zeus.pack_weights` cannot pack that shared storage: the
+    embedding path needs GDG (N,K) row-major, the logits GEMM needs
+    LocalMem (K,N) tiled — the same tensor can't be both. pack_weights
+    aliases-detects the share and silently skips, leaving lm_head in GDG
+    and blowing up at the first logits `torch.mm` with
+    ``Zeus mm: mat2 must be a LocalMem tensor``.
+
+    The fix is to replace `model.lm_head` with a fresh `ParallelLMHead`
+    module holding an independent clone of the embedding weight BEFORE
+    pack_weights runs. Embedding lookup keeps using the original GDG
+    storage on VocabParallelEmbedding; lm_head gets its own copy that
+    pack_weights is then free to transpose and tile into LocalMem. The
+    memory overhead is one extra (vocab × hidden) bf16 tensor.
+
+    Inference never trains the embedding, so decoupling is safe.
+    """
+    lm_head = getattr(model, "lm_head", None)
+    embed = getattr(getattr(model, "model", None), "embed_tokens", None)
+    if lm_head is None or embed is None:
+        return
+    if not hasattr(lm_head, "weight") or not hasattr(embed, "weight"):
+        return
+    if lm_head.weight.data_ptr() != embed.weight.data_ptr():
+        return  # not tied in memory — nothing to do
+
+    # If lm_head is already a ParallelLMHead instance, just swap its weight.
+    # If it's the embed_tokens module itself (Qwen2 tied path), replace the
+    # whole lm_head with a fresh ParallelLMHead so pack_weights can find a
+    # module of the right class to transpose.
+    cloned = embed.weight.data.detach().clone()
+    if isinstance(lm_head, lm_head_cls):
+        lm_head.weight = torch.nn.Parameter(cloned, requires_grad=False)
+    else:
+        new_lm_head = lm_head_cls(
+            num_embeddings=embed.num_embeddings,
+            embedding_dim=embed.embedding_dim,
+            params_dtype=embed.weight.dtype,
+        )
+        new_lm_head.weight = torch.nn.Parameter(cloned, requires_grad=False)
+        new_lm_head = new_lm_head.to(embed.weight.device)
+        model.lm_head = new_lm_head
+    logger.info(
+        "Zeus: decoupled tied lm_head from embed_tokens "
+        "(independent ParallelLMHead clone for LocalMem packing)."
+    )
+
+
 def _get_quantization_config(
     model_config: ModelConfig,
     load_config: LoadConfig,
@@ -713,25 +771,37 @@ class DefaultModelLoader(BaseModelLoader):
             _GEMM_TRANSPOSE_PARAMS.add((LinearBase, 'weight'))
             targets = {LinearBase}
 
-            # Embedding weight stays in GDG, standard (N,K) row-major layout.
-            # VocabParallelEmbedding is never packed into LocalMem.
+            # Embedding weight stays in GDG (standard (N,K) row-major layout)
+            # because F.embedding is an index gather, not a GEMM, and is
+            # therefore supported by the zeus backend in its native GDG form.
+            # VocabParallelEmbedding is deliberately NOT added to the pack
+            # targets.
             #
-            # lm_head weight needs LocalMem for GEMM (torch.mm in logits).
-            # When tie_word_embeddings=True, lm_head IS embed_tokens — the
-            # weight remains in GDG (N,K); logits GEMM uses weight.t().
-            # When tie_word_embeddings=False, lm_head is a separate
-            # ParallelLMHead — pack that into LocalMem as (K,N) for GEMM.
-            tie = getattr(getattr(model, 'config', None),
-                          'tie_word_embeddings', False)
-            if tie:
-                pass  # VPE stays in GDG; logits_processor handles .t()
-            else:
-                # tie_word_embeddings=False: if the checkpoint was originally
-                # tied (no separate lm_head.weight), lm_head stays at init
-                # values after load_weights. Copy embed_tokens weight to it.
-                _zeus_init_lm_head_from_embed(model, ParallelLMHead,
-                                              VocabParallelEmbedding,
-                                              zeus_lm_head_loaded)
+            # lm_head weight, by contrast, IS consumed by a torch.mm in the
+            # logits processor, and zeus mm requires mat2 to be a LocalMem
+            # tensor. So we always want ParallelLMHead.weight packed into
+            # LocalMem in (K,N) transposed orientation.
+            #
+            # tie_word_embeddings=True complication: at load time,
+            # `lm_head.weight is embed_tokens.weight` — the exact same
+            # Parameter object. If we let pack_weights walk both modules,
+            # it would either (a) pack the shared storage once and corrupt
+            # the embedding path, or (b) detect the alias and silently skip
+            # lm_head, leaving it in GDG and then blowing up at the first
+            # `torch.mm(h, lm_head.weight)` call.
+            #
+            # We break the tie BEFORE pack_weights runs, by cloning
+            # embed_tokens.weight into a fresh Parameter on lm_head. The
+            # small memory cost (one extra vocab×hidden bf16 copy) buys us a
+            # fully native zeus logits path with no CPU fallback. Inference
+            # never trains the embedding, so decoupling is safe.
+            _zeus_init_lm_head_from_embed(
+                model, ParallelLMHead, VocabParallelEmbedding,
+                zeus_lm_head_loaded,
+            )
+            _zeus_decouple_tied_lm_head(
+                model, ParallelLMHead, VocabParallelEmbedding,
+            )
             _GEMM_TRANSPOSE_PARAMS.add((ParallelLMHead, 'weight'))
             targets.add(ParallelLMHead)
 
@@ -2189,7 +2259,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             tp_rank=load_config.tp_rank,
             instance_ip=instance_ip,
         )
-        torch.cuda.synchronize()
+        torch.get_device_module(device_config.device).synchronize()
         end_build_group_tic = time.time()
         logger.debug(
             f"finish building group for remote instance, time used: {(end_build_group_tic - start_build_group_tic):.4f}s"
@@ -2215,7 +2285,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     src=0,
                     group=client._model_update_group,
                 )
-            torch.cuda.synchronize()
+            torch.get_device_module(device_config.device).synchronize()
 
             if hasattr(model, "post_load_weights"):
                 model.post_load_weights()

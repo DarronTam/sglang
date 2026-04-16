@@ -711,8 +711,8 @@ class LlamaForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.get_device_module(embed.device).empty_cache()
+        torch.get_device_module(embed.device).synchronize()
 
     def get_embed(self):
         return self.model.embed_tokens.weight
@@ -726,8 +726,8 @@ class LlamaForCausalLM(nn.Module):
             return
         del self.model.embed_tokens.weight
         self.model.embed_tokens.weight = embed
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.get_device_module(embed.device).empty_cache()
+        torch.get_device_module(embed.device).synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)

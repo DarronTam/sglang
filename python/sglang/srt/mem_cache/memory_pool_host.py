@@ -16,12 +16,13 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer as jit_transfer_hicache_one_layer,
 )
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
-from sglang.srt.utils import is_cuda, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_npu, is_xpu, is_zeus
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
-if not (_is_npu or _is_xpu):
+_is_zeus = is_zeus()
+if not (_is_npu or _is_xpu or _is_zeus):
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
         transfer_kv_all_layer_direct_lf_pf,

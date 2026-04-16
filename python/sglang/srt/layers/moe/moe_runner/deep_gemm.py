@@ -16,7 +16,14 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
+from sglang.srt.utils import (
+    ceil_div,
+    dispose_tensor,
+    get_bool_env_var,
+    is_hip,
+    is_npu,
+    is_zeus,
+)
 from sglang.srt.utils.offloader import get_offloader
 
 if TYPE_CHECKING:
@@ -33,9 +40,10 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_zeus = is_zeus()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if not (_is_npu or _is_hip):
+if not (_is_npu or _is_hip or _is_zeus):
     from sgl_kernel import silu_and_mul
 
 
