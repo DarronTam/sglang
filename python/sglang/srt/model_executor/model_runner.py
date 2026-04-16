@@ -135,7 +135,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
-from sglang.srt.model_executor.input_buffers import GraphInputBuffers
+from sglang.srt.model_executor.input_buffers import (
+    GraphInputBuffers,
+    create_filled_tensor,
+    fill_tensor_,
+)
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
@@ -530,7 +534,7 @@ class ModelRunner:
             self.init_attention_backend()
             self.kernel_warmup()
             self.init_device_graphs()
-        elif self.device in ["npu", "cpu"]:
+        elif self.device in ["npu", "cpu", "zeus"]:
             self.init_attention_backend()
             self.init_device_graphs()
         else:
@@ -2311,15 +2315,18 @@ class ModelRunner:
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
         )
-        buffers.num_token_non_padded[...] = num_tokens
+        fill_tensor_(buffers.num_token_non_padded, num_tokens)
 
         # For extend mode
         if not self.is_generation:
             extend_prefix_lens_cpu = [0] * batch_size
             extend_seq_lens_cpu = [seq_len_fill_value] * batch_size
             extend_num_tokens = num_tokens
-            extend_seq_lens = torch.full(
-                (batch_size,), seq_len_fill_value, dtype=torch.int32, device=self.device
+            extend_seq_lens = create_filled_tensor(
+                (batch_size,),
+                seq_len_fill_value,
+                dtype=torch.int32,
+                device=self.device,
             )
             extend_prefix_lens = torch.zeros(
                 (batch_size,), dtype=torch.int32, device=self.device

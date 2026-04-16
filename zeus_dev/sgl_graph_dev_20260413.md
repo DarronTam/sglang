@@ -304,3 +304,209 @@ Zeus 的 `_handle_zeus_backends()` 必须在 `_handle_gpu_memory_settings()` 之
 1. **真实硬件验证**：在 Zeus 硬件上运行 `python zeus_dev/test_zeus_graph_e2e.py`，验证 graph mode 正确性和性能
 2. **性能数据**：收集 graph vs eager 的吞吐量 / 延迟 / 显存对比，结果存入 `zeus_dev/zeus_graph_perf_results.json`
 3. **P1 优化**（可选）：将 CSR 构建移到 device 端，消除 metadata 构建的 CPU bounce（需 `cumsum` kernel）
+
+---
+
+## 六、2026-04-16 补充：Zeus metadata fill 的 CPU 协助
+
+### 6.1 问题本质
+
+本轮补丁处理的不是模型主计算 kernel，而是 **graph input / metadata tensor 的标量填充能力缺口**。
+
+当前 `torch_zeus` 在 Zeus device 上对以下路径支持不完整：
+
+| 类别 | 典型调用 | 当前表现 |
+|------|----------|----------|
+| device 端整型填充 | `torch.full(..., dtype=torch.int32, device="zeus")` | ❌ 不支持 |
+| device 端 bool 填充 | `torch.ones(..., dtype=torch.bool, device="zeus")` | ❌ 不支持（底层同样会走 fill 路径） |
+| 原位标量填充 | `tensor.fill_(x)`，其中 `tensor.dtype in {bool, int16, int32, int64}` | ❌ 不支持 |
+| 标量广播赋值 | `tensor[...] = scalar`，若底层退化到 fill | ❌ 不支持 |
+
+服务启动时实际见到的报错形式包括：
+
+- `Zeus fill_ does not support dtype Int`
+- `Zeus fill_ does not support dtype Bool`
+
+这类张量多数不是模型主数据，而是 graph capture / replay 需要的固定 shape 控制信息：
+
+- `seq_lens`
+- `custom_mask`
+- `encoder_lens`
+- `global_num_tokens_gpu`
+- `global_num_tokens_for_logprob_gpu`
+- `num_token_non_padded`
+
+因此补丁的目标不是“把计算放回 CPU”，而是更窄地做：
+
+1. **在 CPU 上构造 filled template**
+2. **再 `copy_` 到 Zeus 常驻 buffer**
+
+模型 forward、attention、KV cache 更新仍然在 Zeus 上执行。
+
+### 6.2 当前 workaround 依赖的算子支持
+
+要让 CPU 协助路径成立，Zeus 至少需要具备下面这些基础能力：
+
+| 能力 | 例子 | 用途 |
+|------|------|------|
+| Zeus 上分配零值 tensor | `torch.zeros(shape, dtype=..., device="zeus")` | 先建出目标 buffer |
+| CPU 上构造 filled tensor | `torch.full(shape, fill_value, dtype=..., device="cpu")` | 在 CPU 侧生成模板值 |
+| CPU -> Zeus 拷贝 | `zeus_tensor.copy_(cpu_tensor)` | 把 filled template 写回 Zeus |
+| Zeus -> Zeus 拷贝 | `zeus_tensor.copy_(other_zeus_tensor)` | 正常 replay 时用真实 batch 数据覆盖 buffer |
+| 普通 slice / view | `buffer[:bs]`、`buffer[:num_tokens]` | graph buffer 切片传给 `ForwardBatch` |
+
+这意味着 workaround 依赖的是：
+
+- `zeros`
+- `copy_`
+- 常规 tensor slicing
+
+而不是依赖：
+
+- `fill_`
+- Zeus device 上的 `torch.full`
+- Zeus device 上的 `torch.ones(bool)`
+
+### 6.3 新增 helper
+
+本轮在 `python/sglang/srt/model_executor/input_buffers.py` 中新增两个 helper：
+
+- `create_filled_tensor(...)`
+- `fill_tensor_(...)`
+
+实现策略：
+
+```python
+if not zeus_bool_or_int_tensor:
+    # 原生路径
+    return torch.full(...) / tensor.fill_(...)
+
+# Zeus bool/int metadata tensor:
+tensor = torch.zeros(..., device="zeus")
+src = torch.full(..., device="cpu")
+tensor.copy_(src)
+```
+
+只对 `dtype in {bool, int16, int32, int64}` 且 `device.type == "zeus"` 生效，避免影响 CUDA / CPU / NPU 路径。
+
+### 6.4 已落地的 CPU 协助点
+
+下表汇总当前已经加了 CPU 协助的地方、它们各自做什么，以及成本类别。
+
+| 位置 | 调用点 | CPU 协助方式 | 这些 tensor 的作用 | 成本类别 |
+|------|--------|--------------|--------------------|----------|
+| `input_buffers.py:108` | `seq_lens = create_filled_tensor(...)` | CPU `full` -> Zeus `copy_` | 为 graph buffer 预填充每个 request 的默认 `seq_len`，给 padding 槽位一个合法 sentinel 值 | **启动一次性成本**（每次 graph create / recapture 一次） |
+| `input_buffers.py:118` | `custom_mask = create_filled_tensor(..., True, dtype=torch.bool)` | CPU `full(True)` -> Zeus `copy_` | 构造 decode graph 的默认 custom attention mask | **启动一次性成本** |
+| `input_buffers.py:138` | `encoder_lens = create_filled_tensor(...)` | CPU `full` -> Zeus `copy_` | encoder-decoder 模型下，为 padding 槽位提供默认 encoder length | **启动一次性成本** |
+| `input_buffers.py:197` | `fill_tensor_(self.seq_lens, seq_len_fill_value)` | CPU `full` -> Zeus `copy_` | replay 前把未使用 batch 槽位恢复到默认 `seq_len`，保证 graph 输入 shape 固定且数值合法 | **每次请求重复成本**（graph replay 前执行） |
+| `input_buffers.py:221` | `fill_tensor_(self.global_num_tokens_gpu, bs * num_tokens_per_bs)` | CPU `full` -> Zeus `copy_` | 为 DP/TP gather 路径写入“本轮 graph replay 的 token 总数” | **每次请求重复成本** |
+| `input_buffers.py:222` | `fill_tensor_(self.global_num_tokens_for_logprob_gpu, ...)` | CPU `full` -> Zeus `copy_` | 为 logprob 相关 gather 路径写入 token 总数 | **每次请求重复成本** |
+| `cuda_graph_runner.py:558` | `fill_tensor_(buffers.num_token_non_padded, num_tokens)` | CPU `full` -> Zeus `copy_` | capture 时写入“真实 token 数”，区分 graph 固定 shape 与真实非 padding token 数 | **启动一次性成本**（每个 capture BS 一次；recapture 会重复） |
+| `model_runner.py:2318` | `fill_tensor_(buffers.num_token_non_padded, num_tokens)` | CPU `full` -> Zeus `copy_` | dummy warmup / 初始化路径里同步设置真实 token 数 | **启动一次性成本** |
+| `model_runner.py:2325` | `extend_seq_lens = create_filled_tensor(...)` | CPU `full` -> Zeus `copy_` | 非 generation 的 dummy extend 路径预填默认 `seq_len` | **启动一次性成本** |
+
+### 6.5 各字段的具体职责
+
+#### 6.5.1 `seq_lens`
+
+- **语义**：每个 request 当前的序列长度
+- **为什么需要默认值**：graph capture 使用固定 `max_bs`，当真实 batch 小于 `max_bs` 时，后面的 padding 槽位仍然必须有合法 `seq_len`
+- **下游用途**：
+  - attention metadata 构建
+  - `ForwardBatch.seq_lens`
+  - `ForwardBatch.seq_lens_sum`
+
+#### 6.5.2 `custom_mask`
+
+- **语义**：自定义 attention mask buffer
+- **为什么需要默认全 True**：graph 初始化时先给出“允许全部”的基础 mask，后续按具体路径覆盖或切片使用
+- **下游用途**：attention backend / 特殊 masking 路径的元数据输入
+
+#### 6.5.3 `encoder_lens`
+
+- **语义**：encoder-decoder 模型中 encoder 侧长度
+- **为什么需要默认值**：padding 槽位也要满足固定 shape graph 的输入契约
+- **下游用途**：enc-dec attention metadata
+
+#### 6.5.4 `global_num_tokens_gpu`
+
+- **语义**：DP/TP gather 视角下的 token 总数
+- **为什么每次 replay 都要重写**：不同请求的 `bs` / `num_tokens_per_bs` 会变化
+- **下游用途**：
+  - `ForwardBatch.global_num_tokens_gpu`
+  - DP/TP gather buffer 长度计算
+
+#### 6.5.5 `global_num_tokens_for_logprob_gpu`
+
+- **语义**：logprob 相关路径使用的 token 总数
+- **下游用途**：
+  - `ForwardBatch.global_num_tokens_for_logprob_gpu`
+  - logprob 路径的 gather / reduce 元数据
+
+#### 6.5.6 `num_token_non_padded`
+
+- **语义**：当前 graph batch 中真实非 padding token 数
+- **为什么 capture 和 dummy init 都要设置**：很多下游逻辑需要区分“固定 shape graph token 数”与“真实 token 数”
+- **下游用途**：
+  - `ForwardBatch.num_token_non_padded`
+  - `compute_local_num_token_non_padded(...)`
+  - 一些 attention / logits / gather 元数据路径
+
+#### 6.5.7 `extend_seq_lens`
+
+- **语义**：非 generation dummy extend 路径中的序列长度模板
+- **下游用途**：warmup / extend graph 初始化时构造 `ForwardBatch`
+
+### 6.6 启动一次性成本 vs 每次请求重复成本
+
+#### 6.6.1 启动一次性成本
+
+这类成本只在 graph 初始化、dummy run、或 recapture 时发生：
+
+- `seq_lens` 初始模板创建
+- `custom_mask` 初始模板创建
+- `encoder_lens` 初始模板创建
+- capture 阶段的 `num_token_non_padded`
+- dummy init 阶段的 `num_token_non_padded`
+- dummy extend 阶段的 `extend_seq_lens`
+
+特点：
+
+- 次数少
+- 多数发生在服务启动、模型加载完成后的 graph capture 阶段
+- 即使 tensor 较大（如 `custom_mask`），也不是每个请求都付费
+
+#### 6.6.2 每次请求重复成本
+
+这类成本发生在 graph replay 前的 buffer 复用阶段：
+
+- `seq_lens` reset
+- `global_num_tokens_gpu` 重写
+- `global_num_tokens_for_logprob_gpu` 重写
+
+特点：
+
+- 会随每次 graph replay 重复发生
+- 但张量规模通常较小，主要是 `bs` 或 `dp_size` 级别
+- 本质是 metadata 更新成本，不是主算子计算成本
+
+### 6.7 当前评估
+
+这批 CPU 协助的影响应这样理解：
+
+1. **不是主计算回退**
+   forward、attention、KV cache 仍在 Zeus 上执行。
+
+2. **主要是 metadata 填充补丁**
+   问题集中在 `fill_` / `torch.full` / bool-int 控制张量。
+
+3. **短期工程上可接受**
+   现有实现已经能让 `sglang.launch_server` 在 Zeus graph 模式下成功启动。
+
+4. **长期最值得补齐的仍是 Zeus 原生 fill 支持**
+   如果 `torch_zeus` 后续补上以下能力，这一整批 CPU 协助都可以显著简化：
+
+   - `torch.full(..., dtype=int32/bool, device="zeus")`
+   - `zeus_int_tensor.fill_(scalar)`
+   - `zeus_bool_tensor.fill_(True/False)`
+   - 标量广播赋值到 Zeus int/bool tensor

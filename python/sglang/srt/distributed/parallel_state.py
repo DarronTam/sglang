@@ -52,12 +52,14 @@ from sglang.srt.utils import (
     is_npu,
     is_shm_available,
     is_xpu,
+    is_zeus,
     supports_custom_op,
 )
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
+_is_zeus = is_zeus()
 _supports_custom_op = supports_custom_op()
 
 
@@ -303,7 +305,12 @@ class GroupCoordinator:
         assert self.cpu_group is not None
         assert self.device_group is not None
 
-        if is_cuda_alike():
+        if _is_zeus:
+            device_id = (
+                0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
+            )
+            self.device = torch.device(f"zeus:{device_id}")
+        elif is_cuda_alike():
             device_id = (
                 0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
             )

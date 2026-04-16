@@ -12,6 +12,58 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 
 
+def _requires_zeus_fill_workaround(
+    *, device: torch.device | str | None, dtype: torch.dtype
+) -> bool:
+    if device is None:
+        return False
+    device_type = torch.device(device).type
+    return device_type == "zeus" and dtype in (
+        torch.bool,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    )
+
+
+def create_filled_tensor(
+    shape,
+    fill_value: int | bool,
+    *,
+    dtype: torch.dtype,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Allocate a filled tensor while avoiding Zeus int fill_ limitations."""
+    normalized_shape = (shape,) if isinstance(shape, int) else shape
+
+    if not _requires_zeus_fill_workaround(device=device, dtype=dtype):
+        with torch.device(device):
+            return torch.full(normalized_shape, fill_value, dtype=dtype)
+
+    with torch.device(device):
+        tensor = torch.zeros(normalized_shape, dtype=dtype)
+
+    if fill_value != 0:
+        tensor.copy_(
+            torch.full(normalized_shape, fill_value, dtype=dtype, device="cpu")
+        )
+
+    return tensor
+
+
+def fill_tensor_(tensor: torch.Tensor, fill_value: int | bool) -> torch.Tensor:
+    """In-place fill that works around Zeus int fill_ limitations."""
+    if not _requires_zeus_fill_workaround(device=tensor.device, dtype=tensor.dtype):
+        return tensor.fill_(fill_value)
+
+    if fill_value == 0:
+        src = torch.zeros(tensor.shape, dtype=tensor.dtype, device="cpu")
+    else:
+        src = torch.full(tensor.shape, fill_value, dtype=tensor.dtype, device="cpu")
+
+    return tensor.copy_(src)
+
+
 @dataclass
 class GraphInputBuffers:
     input_ids: torch.Tensor
@@ -53,14 +105,21 @@ class GraphInputBuffers:
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
             input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int32)
-            seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
+            seq_lens = create_filled_tensor(
+                (max_bs,),
+                seq_len_fill_value,
+                dtype=torch.int32,
+                device=device,
+            )
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
             positions = torch.zeros((max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
-            custom_mask = torch.ones(
+            custom_mask = create_filled_tensor(
                 (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
+                True,
                 dtype=torch.bool,
+                device=device,
             )
             next_token_logits_buffer = torch.zeros(
                 (max_num_token, vocab_size),
@@ -76,8 +135,11 @@ class GraphInputBuffers:
                 pp_proxy_tensors = None
 
             if is_encoder_decoder:
-                encoder_lens = torch.full(
-                    (max_bs,), encoder_len_fill_value, dtype=torch.int32
+                encoder_lens = create_filled_tensor(
+                    (max_bs,),
+                    encoder_len_fill_value,
+                    dtype=torch.int32,
+                    device=device,
                 )
             else:
                 encoder_lens = None
@@ -132,7 +194,7 @@ class GraphInputBuffers:
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Optional[torch.Tensor]:
         if bs != raw_bs:
-            self.seq_lens.fill_(seq_len_fill_value)
+            fill_tensor_(self.seq_lens, seq_len_fill_value)
             self.out_cache_loc.zero_()
 
         # Common inputs
@@ -156,8 +218,11 @@ class GraphInputBuffers:
             self.mrope_positions[:, :raw_num_token].copy_(forward_batch.mrope_positions)
 
         if require_gathered_buffer:
-            self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
-            self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_bs)
+            fill_tensor_(self.global_num_tokens_gpu, bs * num_tokens_per_bs)
+            fill_tensor_(
+                self.global_num_tokens_for_logprob_gpu,
+                bs * num_tokens_per_bs,
+            )
 
         if enable_num_token_non_padded_flag:
             if require_gathered_buffer and not nsa_enable_prefill_cp:

@@ -59,7 +59,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     enable_num_token_non_padded,
 )
-from sglang.srt.model_executor.input_buffers import GraphInputBuffers
+from sglang.srt.model_executor.input_buffers import GraphInputBuffers, fill_tensor_
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.utils import (
     empty_context,
@@ -555,7 +555,7 @@ class CudaGraphRunner:
             encoder_lens = None
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
-        buffers.num_token_non_padded[...] = num_tokens
+        fill_tensor_(buffers.num_token_non_padded, num_tokens)
 
         # pipeline parallelism
         if self.pp_size > 1:
