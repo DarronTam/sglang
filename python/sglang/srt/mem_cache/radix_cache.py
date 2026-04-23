@@ -39,14 +39,6 @@ from sglang.srt.utils import is_zeus
 _is_zeus = is_zeus()
 
 
-def _cat_zeus(tensors):
-    """torch.cat on CPU then move back to device (avoids Zeus fallback)."""
-    if not tensors:
-        return torch.empty((0,), dtype=torch.int64)
-    device = tensors[0].device
-    return torch.cat([t.cpu() for t in tensors]).to(device)
-
-
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
@@ -413,7 +405,7 @@ class RadixCache(BasePrefixCache):
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
-            value = _cat_zeus(value) if _is_zeus else torch.cat(value)
+            value = torch.cat(value)
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
         return MatchResult(
@@ -540,7 +532,7 @@ class RadixCache(BasePrefixCache):
         # - eagle case: bigram keys will only cache len - 1 kv indices
         if len(new_indices) < len(kv_indices):
             parts = [new_indices, kv_indices[len(new_indices) :]]
-            req.prefix_indices = _cat_zeus(parts) if _is_zeus else torch.cat(parts)
+            req.prefix_indices = torch.cat(parts)
         else:
             req.prefix_indices = new_indices
 
@@ -628,7 +620,7 @@ class RadixCache(BasePrefixCache):
                 _dfs_helper(child)
 
         _dfs_helper(self.root_node)
-        return _cat_zeus(values) if _is_zeus else torch.cat(values)
+        return torch.cat(values)
 
     ##### Internal Helper Functions #####
 

@@ -1772,13 +1772,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.kv_allocated_len += 1
 
         # Update seq_lens after allocation
-        if _is_zeus:
-            self.seq_lens = (self.seq_lens.cpu() + 1).to(self.seq_lens.device)
-            self.seq_lens_cpu = self.seq_lens_cpu + 1
-            self.orig_seq_lens = (self.orig_seq_lens.cpu() + 1).to(
-                self.orig_seq_lens.device
-            )
-        elif self.enable_overlap:
+        if self.enable_overlap or _is_zeus:
             # Do not use in-place operations in the overlap mode
             self.seq_lens = self.seq_lens + 1
             self.seq_lens_cpu = self.seq_lens_cpu + 1
@@ -1887,32 +1881,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
             self.encoder_lens_cpu.extend(other.encoder_lens_cpu)
-        if _is_zeus:
-            self.req_pool_indices = torch.cat(
-                [self.req_pool_indices.cpu(), other.req_pool_indices.cpu()]
-            ).to(self.device)
-            self.seq_lens = torch.cat(
-                [self.seq_lens.cpu(), other.seq_lens.cpu()]
-            ).to(self.device)
-            self.orig_seq_lens = torch.cat(
-                [self.orig_seq_lens.cpu(), other.orig_seq_lens.cpu()]
-            ).to(self.device)
-        else:
-            self.req_pool_indices = torch.cat(
-                [self.req_pool_indices, other.req_pool_indices]
-            )
-            self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
-            self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
+        self.req_pool_indices = torch.cat(
+            [self.req_pool_indices, other.req_pool_indices]
+        )
+        self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
+        self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
-            if _is_zeus:
-                self.output_ids = torch.cat(
-                    [self.output_ids.cpu(), other.output_ids.cpu()]
-                ).to(self.device)
-            else:
-                self.output_ids = torch.cat([self.output_ids, other.output_ids])
+            self.output_ids = torch.cat([self.output_ids, other.output_ids])
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
             self.token_ids_logprobs.extend(other.token_ids_logprobs)

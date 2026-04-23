@@ -42,6 +42,7 @@ class ZeusAttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.max_context_len = model_runner.model_config.context_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.req_to_token_pool = model_runner.req_to_token_pool
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Pre-allocate fixed-size tensors for graph capture/replay."""
@@ -99,8 +100,9 @@ class ZeusAttnBackend(AttentionBackend):
         kv_indptr_cpu[1:] = torch.cumsum(seq_lens_cpu, dim=0).to(torch.int32)
         self.cuda_graph_kv_indptr[: bs + 1].copy_(kv_indptr_cpu)
 
-        # kv_indices — gather from req_to_token on CPU, copy into pre-allocated buffer
-        req_to_token_cpu = self.req_to_token.cpu()
+        # kv_indices — gather from the CPU mirror, then copy into the
+        # pre-allocated device buffer.
+        req_to_token_cpu = self.req_to_token_pool.req_to_token_cpu
         total_kv = int(kv_indptr_cpu[bs].item())
         if total_kv > 0:
             kv_indices_cpu = torch.empty(total_kv, dtype=torch.int32)
@@ -136,12 +138,11 @@ class ZeusAttnBackend(AttentionBackend):
         seq_lens = forward_batch.seq_lens
         batch_size = seq_lens.shape[0]
         req_pool_indices = forward_batch.req_pool_indices
-        req_to_token = forward_batch.req_to_token_pool.req_to_token
 
         # Pull inputs to CPU for metadata computation
         seq_lens_cpu = seq_lens.cpu()
         req_pool_indices_cpu = req_pool_indices.cpu()
-        req_to_token_cpu = req_to_token.cpu()
+        req_to_token_cpu = forward_batch.req_to_token_pool.req_to_token_cpu
 
         # kv_indptr: [batch_size + 1], CSR prefix sum of seq_lens
         kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32)
