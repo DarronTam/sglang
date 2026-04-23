@@ -94,15 +94,19 @@ class ReqToTokenPool:
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
+        if _is_zeus:
+            # Keep a CPU mirror so Zeus metadata readers do not need to pull
+            # req_to_token back from device on every step.
+            self.req_to_token_cpu = torch.zeros(
+                (size, max_context_len), dtype=torch.int32
+            )
 
         self.free_slots = list(range(size))
 
     def write(self, indices, values):
         if _is_zeus:
-            # Do index_put on CPU, then copy back to avoid fallback
-            device = self.req_to_token.device
-            r2t = self.req_to_token.cpu()
-            # Recursively move indices to CPU
+            # Keep the CPU mirror in sync for Zeus-side metadata consumers,
+            # but write req_to_token in place on device via index_put.
             if isinstance(indices, torch.Tensor):
                 idx = indices.cpu()
             elif isinstance(indices, tuple):
@@ -112,10 +116,8 @@ class ReqToTokenPool:
             else:
                 idx = indices
             val = values.cpu() if isinstance(values, torch.Tensor) else values
-            r2t[idx] = val
-            self.req_to_token = r2t.to(device)
-        else:
-            self.req_to_token[indices] = values
+            self.req_to_token_cpu[idx] = val
+        self.req_to_token[indices] = values
 
     def available_size(self):
         return len(self.free_slots)
