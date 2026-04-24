@@ -1,11 +1,31 @@
 # SGLang → Zeus NPU 移植手册
 
-> 日期：2026-04-09（更新）  
+> 日期：2026-04-24（更新）  
 > 代码版本：sglang_dev  
 > 基线分叉点：`94e125113`（sglang main）  
-> 状态：Dense LLM (Qwen2.5/Llama) 推理已跑通，torch_zeus 新增 cat/add/sub/mul/reduce 原生算子，CPU bounce 可大幅消除
+> 状态：Dense LLM (Qwen2.5/Llama) 推理已跑通；`req_to_token_cpu` mirror、Zeus `index_put`、Zeus `cumsum` 已接入，主链路 allocator + req_to_token 写入 + attention metadata 的大块 CPU bounce 已基本消除
 
 ---
+
+## 2026-04-24 最新状态摘要
+
+本手册已合并并取代以下历史文档中的有效内容，旧文档已删除：
+
+- `zeus_dev/update_log_20260415.md`
+- `zeus_dev/zeus_missing_aten_operators_analysis-20260421.md`
+
+当前结论相较 2026-04-15/2026-04-21 版本有几处重要变化：
+
+| 链路 | 旧状态 | 当前状态 |
+|------|--------|----------|
+| `ReqToTokenPool.write()` | Zeus 缺 `index_put`，需要 CPU 写回 | torch_zeus 已支持 `aten::index_put`，device 原地写入；同时维护 `req_to_token_cpu` mirror |
+| `alloc_for_decode()` | 需要从 Zeus 读取 `req_to_token` 行 | 已改为读取 `req_to_token_cpu` mirror，只保留小量 `seq_lens/req_pool_indices` bookkeeping |
+| `ZeusAttnBackend` metadata | `req_to_token.cpu()` 整表拷贝 + CPU cumsum | graph/non-graph 路径均读 `req_to_token_cpu` mirror；`kv_indptr/qo_indptr` cumsum 已切到 Zeus device |
+| Paged KV metadata cumsum | `aten::cumsum` 缺失，必须 CPU bounce | torch_zeus 已新增 `aten::cumsum`，主链路和部分 forward_batch 纯 cumsum 路径已切回 device |
+| 剩余主链路 CPU 工作 | 大块 CPU bounce | 主要剩 CPU mirror ragged gather、`seq_lens.cpu()`/`req_pool_indices.cpu()` 小量调度 bookkeeping |
+| 仍需关注 | `argmax`、`index.Tensor_out`、`where/clamp/arange/neg` | 多数属于 sampler、logits、overlap/scheduler 或混合 CPU 依赖路径，需分阶段处理 |
+
+一句话概括：**主推理链路上最重的 `req_to_token` 整表 CPU bounce 已收掉；继续优化的重点从“消除大块搬运”转为“补齐剩余 ATen、压低 fallback 噪声、推进 graph/分布式能力”。**
 
 ## 目录
 
@@ -103,6 +123,7 @@ Zeus NPU 是全新硬件平台，以上依赖 **全部不可用**，需要用 Ze
 | 采样 (greedy / top-k / top-p / min-p) | ✅ 可用 |
 | 权重 LocalMem 打包 | ✅ 可用 |
 | sgl-kernel-zeus 算子 | ✅ 14 个已实现 |
+| torch_zeus 高频 ATen | ✅ `cat/add/sub/mul/sum/mean/norm/index_put/cumsum` 已覆盖 |
 | SWA / MoE / 量化 / Speculative | ❌ 未支持 |
 | CUDA Graph (计算图重放) | ❌ 已禁用 |
 | 生产级性能优化 | 🔧 进行中 |
@@ -250,21 +271,24 @@ def forward_zeus(self, *args, **kwargs):
 
 | 设计选择 | 原因 |
 |---------|------|
-| metadata (kv_indptr/kv_indices) 在 CPU 侧构建 | Zeus 缺少 cumsum/arange/花式索引的 ATen 支持，CPU 构建后一次性传到 device |
+| `kv_indptr/qo_indptr` 在 Zeus device 上构建 | torch_zeus 已支持 `aten::cumsum`，前缀和不再需要 CPU bounce |
+| `kv_indices` 仍通过 CPU mirror ragged gather 构建 | `req_to_token` 是 ragged 按行按长度读取，Zeus 仍缺 `aten::index.Tensor_out`/专用 gather kernel；使用 mirror 避免整表 D2H |
 | 分离 `forward_extend()` 和 `forward_decode()` | Zeus 的 prefill (变长 Q) 和 decode (Q 长度=1) 使用不同硬件 kernel |
 | KV buffer 为 4D tiled 布局 `[pages, heads, page_size, head_dim]` | Zeus attention 计算单元直接从此布局读取 |
 
 **init_forward_metadata 流程（每次 forward 调用）：**
 ```
 init_forward_metadata(forward_batch)
-  ├── seq_lens_cpu = forward_batch.seq_lens.cpu()          # T1: Zeus→CPU
-  ├── req_pool_indices_cpu = forward_batch.req_pool_indices.cpu()  # T2
-  ├── req_to_token_cpu = req_to_token.cpu()                # T3: ⚠️ 整个矩阵！
-  ├── [CPU] 构建 kv_indptr (cumsum), kv_indices (for 循环拼接)
-  └── kv_indptr.to(device), kv_indices.to(device)          # T4: CPU→Zeus
+  ├── seq_lens_cpu = forward_batch.seq_lens.cpu()                 # 小量 bookkeeping
+  ├── req_pool_indices_cpu = forward_batch.req_pool_indices.cpu() # 小量 bookkeeping
+  ├── kv_indptr[1:] = torch.cumsum(seq_lens, dtype=int32)         # Zeus device
+  ├── qo_indptr[1:] = torch.cumsum(extend_seq_lens, dtype=int32)  # Zeus device
+  ├── req_to_token_cpu = forward_batch.req_to_token_pool.req_to_token_cpu
+  ├── [CPU mirror] ragged gather kv_indices
+  └── kv_indices.to(device)
 ```
 
-> **⚠️ 性能问题：** T3 拷贝整个 req_to_token 矩阵（**64 MB**，128×131072×4B int32），是当前最大的传输瓶颈。详见 [第 7 节](#7-已知性能瓶颈) P0。
+> **当前状态：** 早期 `req_to_token.cpu()` 整表拷贝（典型 64 MB/step）已经通过 `req_to_token_cpu` mirror 收掉。剩余 CPU 工作是 ragged gather，它读的是 CPU mirror，不再从 Zeus device 拉整表。
 
 ---
 
@@ -340,7 +364,7 @@ load_model()
 
 **策略：** 用显式 `.cpu()` → 计算 → `.to(device)` 替代隐式 fallback，将多次隐式拷贝合并为一次显式来回。
 
-> **📢 2026-04 更新：** torch_zeus 已新增 `aten::cat`/`cat.out`（TensorOps.cpp）、`aten::add`/`sub`/`mul`（dispatch stub）、`aten::sum`/`mean`/`norm`（reduce dispatch stub）的原生实现。这意味着下表中标注 🆕 的项目对应的 CPU bounce **可以安全移除**。
+> **📢 2026-04-24 更新：** torch_zeus 已新增 `aten::cat`/`cat.out`、`aten::add`/`sub`/`mul`、`aten::sum`/`mean`/`norm`、`aten::index_put`/`index_put_`、`aten::cumsum` 的原生实现。SGLang 主链路中仅因这些算子缺失而存在的 Zeus CPU bounce 已逐步清理。
 
 **三种主要的 CPU Bounce 模式：**
 ```python
@@ -348,13 +372,13 @@ load_model()
 result = (tensor.cpu() OP value).to(device)
 # 示例: seq_lens += 1, aten::neg, aten::clamp
 
-# 模式 B: 索引 bounce  → aten::index.Tensor_out 仍未注册，需保留
+# 模式 B: 索引读取 bounce  → aten::index.Tensor_out 仍未注册，需保留或改用 CPU mirror
 result = tensor.cpu()[index.cpu()].to(device)
 # 示例: filter_batch, alloc_for_decode
 
-# 模式 C: cat bounce  → aten::cat 已原生，可移除 🆕
+# 模式 C: cat/cumsum bounce  → aten::cat/cumsum 已原生，可移除
 result = torch.cat([a.cpu(), b.cpu()]).to(device)
-# 示例: radix_cache, memory_pool
+prefix = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
 ```
 
 **涉及文件（共 10+ 个，按影响频率排序）：**
@@ -362,15 +386,17 @@ result = torch.cat([a.cpu(), b.cpu()]).to(device)
 | 文件 | 改动点 | 频率 | 当前状态 |
 |------|--------|------|----------|
 | `memory_pool.py` — `write()` | ✅ 已实现 Zeus 原生 `aten::index_put_`，无需 CPU bounce | **每个 decode step** | ✅ 已解决 |
-| `schedule_batch.py` — `merge_batch` | torch.cat 拼接 4 个 tensor | **batch merge 时** | 🆕 cat 已原生，可移除 |
-| `schedule_batch.py` — `update_batch` | seq_lens += 1 标量加法 | **每个 decode step** | 🆕 add 已原生，可移除 |
+| `memory_pool.py` — `req_to_token_cpu` | Zeus 侧维护 CPU mirror | **每次 req_to_token 更新** | ✅ 已解决大块读取 |
+| `zeus_backend.py` — metadata | `kv_indptr/qo_indptr` cumsum device 化，`kv_indices` 读 mirror | **每次 forward** | ✅ 主链路大块 bounce 已解决 |
+| `common.py` — `alloc_for_decode` | 读取 `req_to_token_cpu` mirror 获取 last_loc | **每个 decode step** | ✅ 已解决 bs 行 device→CPU 读取 |
+| `schedule_batch.py` — `merge_batch` | torch.cat 拼接 4 个 tensor | **batch merge 时** | ✅ cat 已原生，可走 device |
+| `schedule_batch.py` — `update_batch` | seq_lens += 1 标量加法 | **每个 decode step** | ✅ add 已原生，可走 device |
 | `schedule_batch.py` — `filter_batch` | `tensor[int64_index]` 花式索引 | **请求结束时** | ❌ index 未注册，需保留 |
-| `common.py` — `alloc_for_decode` | 二维花式索引 → 仅拷贝所需行 | **每个 decode step** | ❌ index 未注册，需保留 |
-| `forward_batch_info.py` | pad/cumsum/clamp/arange | **每次 forward** | 混合：pad 可移除 🆕，cumsum/arange 需保留 |
+| `forward_batch_info.py` | 纯 cumsum 路径已 device 化；混合 arange/cat/cumsum 路径暂不动 | **每次 forward** | 混合：只处理纯 cumsum |
 | `sampler.py` — `argmax` | logits 搬到 CPU 做 argmax | **每个 greedy decode** | ❌ argmax 未注册，需保留 |
 | `logits_processor.py` | 花式索引 → 逐条 copy_ | **每次 prefill** | ❌ index 未注册，需保留 |
-| `radix_cache.py` | `_cat_zeus()` 封装 | 请求结束时 | 🆕 cat 已原生，可移除 |
-| `memory_pool.py` — `free/data_ptrs` | torch.cat 拼接 | 初始化/释放时 | 🆕 cat 已原生，可移除 |
+| `radix_cache.py` | `_cat_zeus()` 历史封装 | 请求结束时 | ✅ cat 已原生，历史分支可清理 |
+| `memory_pool.py` — `free/data_ptrs` | torch.cat 拼接 | 初始化/释放时 | ✅ cat 已原生，历史分支可清理 |
 | `overlap_utils.py` | where/clamp/arange | overlap 调度时 | ❌ where/clamp/arange 未注册 |
 | `scheduler.py` | neg(int tensor) | 每步 | ❌ neg 未注册 |
 
@@ -424,17 +450,17 @@ CPU:  (空闲，无数据传输)
 ```
 Zeus:   ═══╗           ╔══════════════════════════╗           ╔═══
             ║           ║  model.forward() 纯 Zeus  ║           ║
-            ↓T1-T3     ↑T4                         ↓T11     ↑T12
-CPU:  alloc_for_decode  init_forward_metadata     argmax    next
-      ⚠️ 多次 bounce    ⚠️ 整矩阵传输             (greedy)   step
+            ↓small     ↑kv_indices                 ↓logits  ↑ids
+CPU:  alloc bookkeeping  metadata mirror gather    argmax   next
+      小量调度辅助       无 req_to_token 整表搬运   (greedy) step
 ```
 
 ### 5.3 关键模块性能差距
 
 | 模块 | CUDA | Zeus | 差距根因 |
 |------|------|------|----------|
-| Attention metadata | GPU Triton kernel 构建 | CPU for 循环 + 整矩阵拷贝 (**64 MB/step**) | Zeus 缺 cumsum/index ATen 支持 |
-| req_to_token write | GPU 1 行 `index_put_` | ✅ Zeus 原生 `aten::index_put_` (零传输) | ~~Zeus 缺 `index_put_`~~ 已解决 |
+| Attention metadata | GPU Triton kernel 构建 | `cumsum` 在 Zeus，`kv_indices` 从 CPU mirror gather | 整表拷贝已解决；剩余是 ragged gather |
+| req_to_token write | GPU 1 行 `index_put_` | ✅ Zeus 原生 `aten::index_put_` + CPU mirror 同步 | ~~Zeus 缺 `index_put_`~~ 已解决 |
 | tensor 拼接/算术 | GPU 原生 cat/add/sub/mul | ✅ Zeus 原生 (dispatch stub) | ~~Zeus 缺 cat/add~~ 已解决 🆕 |
 | Decode forward | 1 次 CUDA Graph replay (~1μs) | ~200 次 kernel launch | Zeus 无 Graph capture |
 | Greedy argmax | GPU 原生 | CPU round-trip (**9.3 MB** logits 搬回) | Zeus 缺 `argmax` |
@@ -445,20 +471,20 @@ CPU:  alloc_for_decode  init_forward_metadata     argmax    next
 假设: bs=32, max_reqs=128, max_ctx_len=131072, vocab=151936, 28 层模型, bf16
 
 CUDA Decode Step:  ~18μs  (0 次 CPU 传输)
-Zeus Decode Step:  ~25.5ms (7+ 次 CPU 传输, ~89 MB 数据搬运)
+Zeus Decode Step:  仍受 kernel launch + 残留 CPU bookkeeping 影响
 
-传输量拆解 (bs=32):
-  P0  init_forward_metadata req_to_token 整矩阵   64.0 MB  (72%)
-  P1  alloc_for_decode      req_to_token bs 行     16.0 MB  (18%)
-  P2  greedy argmax         logits                  9.3 MB  (10%)
-  --  metadata 小量          seq_lens/rpi/indptr     ~130 KB (<1%)
-  合计:                                            ~89.4 MB / step
+已消除的大块传输:
+  P0  init_forward_metadata req_to_token 整矩阵   64.0 MB  ✅ mirror
+  P1  alloc_for_decode      req_to_token bs 行     16.0 MB  ✅ mirror
+  --  kv_indptr/qo_indptr    cumsum CPU bounce       小量    ✅ device cumsum
 
-注: index_put_ 已解决后传输量已从 ~200MB 降至 ~89MB，
-    cat/add/sub/mul 已原生后约 ~10KB 的 bounce 也可清除。
-    下一步实现 Zeus 端 kv_indices 构建可再消除 ~80MB。
+剩余主要传输/CPU 依赖:
+  P2  greedy argmax         logits                  9.3 MB  🟡
+  --  metadata mirror gather kv_indices             CPU mirror→Zeus
+  --  seq_lens/rpi bookkeeping                      ~KB 级
 
-差距: ~1400× (时间), ~89MB vs 0 (数据传输)
+结论: 主链路最重的 80MB 级 req_to_token device→CPU 传输已经消除；
+      下一步主要是 argmax、index-read/gather kernel、Graph launch overhead。
 ```
 
 ---
@@ -509,7 +535,7 @@ Zeus Decode Step:  ~25.5ms (7+ 次 CPU 传输, ~89 MB 数据搬运)
 
 ## 7. 已知性能瓶颈
 
-> **📢 2026-04 更新：** torch_zeus 新增了 `aten::cat`、`aten::add/sub/mul`、`aten::sum/mean/norm` 的原生实现。标注 🆕 的 bounce 可通过移除 `_is_zeus` 分支直接消除。
+> **📢 2026-04-24 更新：** torch_zeus 新增了 `aten::cat`、`aten::add/sub/mul`、`aten::sum/mean/norm`、`aten::index_put`、`aten::cumsum` 的原生实现。早期 P0/P1 级 `req_to_token` 整表/整行 CPU bounce 已通过 `req_to_token_cpu` mirror 解决，以下表格只保留当前仍有意义的残留项。
 
 ### 7.1 CPU↔Zeus 传输热点汇总（含精确数据量分析）
 
@@ -517,56 +543,43 @@ Zeus Decode Step:  ~25.5ms (7+ 次 CPU 传输, ~89 MB 数据搬运)
 
 | # | 位置 | 方向 | 数据 | 大小估算 | 频率 | 严重度 |
 |---|------|------|------|----------|------|--------|
-| **T1** | `zeus_backend.py:init_forward_metadata` L48 | Zeus→CPU | **req_to_token 整个矩阵** | **64 MB** (128×131072×4B) | 每 decode step | 🔴 **致命** |
-| **T2** | `zeus_backend.py:init_forward_metadata` | Zeus→CPU | seq_lens + req_pool_indices | 256 B (32×4B×2) | 每 decode step | 🟢 忽略 |
-| **T3** | `zeus_backend.py:init_forward_metadata` | CPU→Zeus | kv_indptr + kv_indices | ~128 KB (33×4B + total_kv×4B) | 每 decode step | 🟡 可接受 |
-| **T4** | `common.py:alloc_for_decode` L53-58 | Zeus→CPU | req_to_token (仅 bs 行) | **16 MB** (32×131072×4B) | 每 decode step | 🔴 **严重** |
-| **T5** | `common.py:alloc_for_decode` | Zeus→CPU | rpi + seq_lens | 256 B | 每 decode step | 🟢 忽略 |
-| **T6** | `sampler.py` greedy argmax L104-105 | Zeus→CPU | logits tensor | **9.3 MB** (32×151936×2B) | 每 greedy step | 🟡 中等 |
-| **T7** | `sampler.py` greedy result | CPU→Zeus | argmax 结果 | 256 B (32×8B) | 每 greedy step | 🟢 忽略 |
-| **T8** 🆕 | `schedule_batch.py:merge_batch` L1890-1916 | Zeus→CPU→Zeus | req_pool_indices/seq_lens/orig_seq_lens/output_ids ×2 | ~1.6 KB (4×bs×4B×2) | batch merge 时 | 🟢 可移除 |
-| **T9** 🆕 | `schedule_batch.py:update_batch` L1775-1779 | Zeus→CPU→Zeus | seq_lens +1, orig_seq_lens +1 | ~512 B (2×bs×4B×2) | 每 decode step | 🟢 可移除 |
-| **T10** | `schedule_batch.py:filter_batch` L1840-1845 | Zeus→CPU→Zeus | 4 个 tensor 花式索引 | ~1.5 KB | 请求结束时 | 🟢 小 |
-| **T11** 🆕 | `radix_cache.py:_cat_zeus` L42-48 | Zeus→CPU→Zeus | 变长 index tensor list | ~几 KB | 请求结束时 | 🟢 可移除 |
-| **T12** 🆕 | `memory_pool.py:MambaPool.free` L276-279 | Zeus→CPU→Zeus | free_slots cat | ~几 KB | 释放时 | 🟢 可移除 |
-| **T13** | `forward_batch_info.py:compute_position` L1246-1257 | Zeus→CPU→Zeus | arange+cumsum+cat 混合 | ~bs×seq_len×8B | 每次 extend | 🟡 中等 |
-| **T14** | `forward_batch_info.py:cumsum` L1081, L1118 | Zeus→CPU→Zeus | seq_lens cumsum | ~bs×4B | 每次 forward | 🟢 小 |
-| **T15** 🆕 | `forward_batch_info.py:_pad_tensor` L762-772 | Zeus→CPU→Zeus | padding cat | ~bs×4B | 每次 forward | 🟢 可移除 |
+| **T1** | `sampler.py` greedy argmax | Zeus→CPU | logits tensor | **9.3 MB** (32×151936×2B) | 每 greedy step | 🟡 中等 |
+| **T2** | `sampler.py` greedy result | CPU→Zeus | argmax 结果 | 256 B (32×8B) | 每 greedy step | 🟢 忽略 |
+| **T3** | `zeus_backend.py:init_forward_metadata` | Zeus→CPU | seq_lens + req_pool_indices | 256 B (32×4B×2) | 每 forward | 🟢 忽略 |
+| **T4** | `zeus_backend.py:init_forward_metadata` | CPU mirror→Zeus | kv_indices | ~total_kv×4B | 每 forward | 🟡 可接受 |
+| **T5** | `common.py:alloc_for_decode` | Zeus→CPU | seq_lens + req_pool_indices | 256 B | 每 decode step | 🟢 忽略 |
+| **T6** | `schedule_batch.py:filter_batch` | Zeus→CPU→Zeus | 4 个 tensor 花式索引 | ~1.5 KB | 请求结束时 | 🟢 小 |
+| **T7** | `forward_batch_info.py:compute_position_torch` | Zeus→CPU→Zeus | arange/cat/cumsum 混合 CPU 依赖 | ~bs×seq_len×8B | extend fallback 路径 | 🟡 中等 |
+| **T8** | `logits_processor.py` extend hidden selection | Zeus/CPU 混合 | last-token hidden gather | 与 hidden size/batch 相关 | prefill/logprob | 🟡 需单独评估 |
+| **T9** | `overlap_utils.py` / `scheduler.py` | Zeus→CPU→Zeus | where/clamp/arange/neg 小 tensor | <1 KB/处 | overlap 调度 | 🟢 小 |
 
 ### 7.2 严重问题分级（按数据量排序）
 
-#### 🔴 P0: init_forward_metadata() — 整矩阵拷贝 (64 MB/step)
+#### ✅ 已解决: init_forward_metadata() — 整矩阵拷贝 (64 MB/step)
 
-**位置:** `zeus_backend.py:48` — `req_to_token.cpu()`
+**旧位置:** `zeus_backend.py` — `req_to_token.cpu()`
 
-**问题：** 每个 decode step 无条件拷贝**整个** req_to_token 矩阵到 CPU 用于构建 kv_indices。
+**旧问题：** 每个 decode step 无条件拷贝**整个** req_to_token 矩阵到 CPU 用于构建 kv_indices。
 - 矩阵尺寸：`max_reqs × max_ctx_len = 128 × 131072 = 16M` 个 int32
 - 数据量：**64 MB / step**
 - 100 token 生成 = **6.4 GB** 无效传输
 
-**这是当前最大的性能瓶颈**，远超其他热点之和。
+**当前状态：** 已通过 `ReqToTokenPool.req_to_token_cpu` mirror 解决。`zeus_backend.py` graph/non-graph 路径均从 CPU mirror 读取 ragged 行，不再从 Zeus device 拉整表。
 
 **解法方案：**
 ```python
-# 方案 A（快速修复）：只拷贝需要的 bs 行
-rpi_cpu = req_pool_indices.cpu()  # 已有
-req_to_token_needed = req_to_token[rpi_cpu].cpu()  # bs 行 vs 全矩阵
-# → 64MB 降至 16MB (bs=32)，但仍需 aten::index 支持
-
-# 方案 B（最优）：在 Zeus 端直接构建 kv_indices
-kv_indices = sgl_kernel_zeus.create_kv_indices(
-    req_to_token, req_pool_indices, seq_lens, kv_indptr
-)
-# → 零 CPU 传输
+req_to_token_cpu = forward_batch.req_to_token_pool.req_to_token_cpu
+kv_indices_cpu = ragged_gather(req_to_token_cpu, req_pool_indices_cpu, seq_lens_cpu)
+kv_indices = kv_indices_cpu.to(device)
 ```
 
-#### 🔴 P1: alloc_for_decode() — bs 行拷贝 (16 MB/step)
+#### ✅ 已解决: alloc_for_decode() — bs 行拷贝 (16 MB/step)
 
-**位置:** `common.py:53-58` — `req_to_token[rpi_cpu].cpu()`
+**旧位置:** `common.py` — `req_to_token[rpi_cpu].cpu()`
 
-**问题：** 已优化为只拷贝 bs 行，但 bs=32 时仍拷贝 `32 × 131072 × 4B = 16 MB / step`。
+**旧问题：** bs=32 时仍拷贝 `32 × 131072 × 4B = 16 MB / step`。
 
-**解法：** 与 P0 共用方案 B（Zeus 端构建），或改写 `last_loc` 计算逻辑。
+**当前状态：** 已改为读取 `req_to_token_cpu` mirror 获取 `last_loc`，不再从 Zeus device 读取 bs 行。
 
 #### 🟡 P2: Greedy argmax 在 CPU 执行 (9.3 MB/step)
 
@@ -600,7 +613,7 @@ batch_next_token_ids = sgl_kernel_zeus.argmax(logits, dim=-1)
 
 **收益:** 消除每 step ~128 MB (D2H+H2D) 传输。
 
-#### 🆕 可立即移除的 CPU bounce（aten::cat/add/sub/mul 已原生）
+#### ✅ 已清理/可清理的历史 CPU bounce（aten::cat/add/sub/mul/cumsum 已原生）
 
 以下 bounce 因 torch_zeus 新增算子而**不再需要**：
 
@@ -611,42 +624,39 @@ batch_next_token_ids = sgl_kernel_zeus.argmax(logits, dim=-1)
 | `schedule_batch.py:update_batch` L1776-1779 | seq_lens + 1 | `aten::add` | ~512 B/step |
 | `memory_pool.py:MambaPool.free` L277-279 | 2-tensor cat | `aten::cat` | ~几 KB/次 |
 | `memory_pool.py:data_ptrs` L653-655 | uint64 tensor cat | `aten::cat` | ~几 KB (初始化) |
-| `forward_batch_info.py:_pad_tensor` L762-772 | padding cat | `aten::cat` | ~bs×4B/次 |
+| `forward_batch_info.py` 纯 cumsum 路径 | seq_lens/prefix_chunk cumsum | `aten::cumsum` | 小量但高频 |
 
 **移除方法：** 删除对应的 `if _is_zeus:` 分支，让 Zeus 走与 CUDA 相同的代码路径。
 
-> **注意：** `forward_batch_info.py:compute_position_torch` (L1246-1257) 虽含 cat，但还混合了 `torch.arange`（标量参数需从 Zeus tensor 取值）和 `torch.cumsum`，这两个算子仍未注册，因此**该处 bounce 暂不能移除**。
+> **注意：** `forward_batch_info.py:compute_position_torch` 虽含 cumsum，但还混合 `arange`、CPU 标量取值和 `cat`，按“只处理纯 cumsum”的原则暂不修改。
 
 ### 7.3 CPU bounce 数据量汇总
 
 ```
 每次 Decode Step 的 CPU↔Zeus 数据传输估算 (bs=32, max_ctx=131072, vocab=151936):
 
-┌─ 不可避免的传输 ──────────────────────────────────────────────────┐
-│  P0  init_forward_metadata  req_to_token 整矩阵   64.0 MB  🔴   │
-│  P1  alloc_for_decode       req_to_token bs 行     16.0 MB  🔴   │
-│  P2  greedy argmax          logits                  9.3 MB  🟡   │
-│  --  metadata 小量传输      seq_lens/rpi/indptr     ~130 KB  🟢   │
+┌─ 已解决的大块传输 ───────────────────────────────────────────────┐
+│  P0  init_forward_metadata  req_to_token 整矩阵   64.0 MB  ✅   │
+│  P1  alloc_for_decode       req_to_token bs 行     16.0 MB  ✅   │
+│  --  kv_indptr/qo_indptr     CPU cumsum bounce       小量   ✅   │
 ├──────────────────────────────────────────────────────────────────┤
-│  合计每 step                                       ~89.4 MB      │
-│  生成 100 token                                    ~8.9 GB       │
+│  解决方式: req_to_token_cpu mirror + device cumsum               │
 └───────────────────────────────────────────────────────────────────┘
 
-┌─ 可通过移除 _is_zeus 分支消除的传输 (aten::cat/add/sub/mul 已原生) ┐
-│  merge_batch cat ×4          1.6 KB                               │
-│  update_batch add ×2         512 B                                │
-│  _cat_zeus ×3                几 KB                                │
-│  _pad_tensor cat             几 KB                                │
-│  memory_pool cat ×2          几 KB                                │
+┌─ 当前仍需关注 ───────────────────────────────────────────────────┐
+│  P2  greedy argmax          logits                  9.3 MB  🟡   │
+│  --  kv_indices mirror gather                        中等   🟡   │
+│  --  seq_lens/rpi bookkeeping                        KB 级  🟢   │
+│  --  overlap/scheduler 辅助算子                       <1KB   🟢   │
 ├───────────────────────────────────────────────────────────────────┤
-│  合计                        ~10 KB/step (占比 <0.01%)            │
+│  下一步: argmax / index-read gather / where-clamp-arange 补齐     │
 └───────────────────────────────────────────────────────────────────┘
 
 结论：
-  1. P0 (64 MB) 独占 72% 传输量 → 最高优先级
-  2. P1 (16 MB) 占 18% → 可与 P0 共同解决 (Zeus 端 kv_indices 构建)
-  3. P2 (9.3 MB) 占 10% → 实现 Zeus argmax 可消除
-  4. 已可移除的 cat/add bounce 数据量极小，但消除后简化代码路径
+  1. P0/P1 已解决，主链路不再有 req_to_token 整表/整行 device→CPU bounce
+  2. P2 argmax 仍是 greedy decode 的主要 CPU round-trip
+  3. kv_indices 仍由 CPU mirror ragged gather 构建，功能正确但不是最终性能形态
+  4. overlap/scheduler 残留算子数据量很小，优先级低于 argmax/index-read
 ```
 
 ---
@@ -848,11 +858,12 @@ Prefill 节点：                              Decode 节点：
 | ✅ 完成 | ~~实现 Zeus 原生 `aten::index_put_`~~ | kernel 开发 | ~~P3 write 整矩阵~~ | **已实现** (消除 ~128MB/step) |
 | ✅ 完成 | ~~实现 Zeus 原生 `aten::cat`~~ | kernel 开发 | ~~cat bounce ×10~~ | **已实现** (TensorOps.cpp) |
 | ✅ 完成 | ~~实现 Zeus 原生 `aten::add/sub/mul`~~ | dispatch stub | ~~arithmetic bounce~~ | **已实现** (dispatch stub) |
-| 🔴 P0 | `init_forward_metadata` 改为按行拷贝或实现 Zeus 端 kv_indices 构建 | sglang + kernel | P0 (整矩阵 64MB/step) | 消除最大热点 |
+| ✅ 完成 | `req_to_token_cpu` mirror + metadata 读 mirror | sglang | ~~P0/P1 req_to_token 整表/bs 行拷贝~~ | 消除最大 device→CPU 热点 |
+| ✅ 完成 | `kv_indptr/qo_indptr` 使用 Zeus `aten::cumsum` | sglang + torch_zeus | ~~Paged KV metadata cumsum CPU bounce~~ | 主链路 prefix sum device 化 |
 | 🔴 P0 | 实现 Zeus argmax 或复用 sampling kernel | kernel 开发 | P2 (logits 9.3MB/step) | 消除 greedy decode 瓶颈 |
-| 🟡 P1 | 实现 `aten::index.Tensor_out` | kernel 开发 | filter/alloc 花式索引 | 消除 ~4 处 bounce |
-| 🟡 P1 | 实现 `aten::cumsum` | kernel 开发 | kv_indptr 等 5+ 处 bounce | 解锁 Zeus 端 metadata 构建 |
-| 🟢 P2 | 清理 SGLang 中已失效的 `_is_zeus` cat/add bounce 分支 | sglang 清理 | 代码简化 | ~10 处分支可删除 |
+| 🔴 P0 | 实现 Zeus 端 `kv_indices` ragged gather/build kernel | kernel 开发 | CPU mirror ragged gather | 进一步压低 metadata CPU 工作 |
+| 🟡 P1 | 实现 `aten::index.Tensor_out` | kernel 开发 | filter/logits 等花式索引读取 | 消除残留 index-read bounce |
+| 🟢 P2 | 清理 SGLang 中已失效的 `_is_zeus` cat/add/cumsum bounce 分支 | sglang 清理 | 代码简化 | 已逐步推进 |
 
 #### 8.5.2 扩充 ATen 高频算子
 
@@ -864,10 +875,10 @@ Prefill 节点：                              Decode 节点：
 | ✅ 已完成 | `aten::cat` / `aten::cat.out` | kv_indices 拼接, padding, radix cache | **原生** (TensorOps.cpp) |
 | ✅ 已完成 | `aten::add` / `aten::sub` / `aten::mul` | seq_lens±1, extend_prefix_lens 等 | **原生** (dispatch stub) |
 | ✅ 已完成 | `aten::sum` / `aten::mean` / `aten::norm` | reduce 操作 | **原生** (reduceOps.cpp) |
-| 🔴 高 | `aten::cumsum` | kv_indptr, qo_indptr, chunk 索引 | ❌ 未注册 (5+ 处 bounce) |
-| 🔴 高 | `aten::index.Tensor_out` (花式索引读取) | filter_batch, alloc_for_decode | ❌ 未注册 (4+ 处 bounce) |
+| ✅ 已完成 | `aten::cumsum` | kv_indptr, qo_indptr, chunk 索引 | **原生**，主链路已接入 |
+| 🔴 高 | `aten::index.Tensor_out` (花式索引读取) | filter_batch, logits/hidden gather 等 | ❌ 未注册；alloc 主链路已由 mirror 绕开 |
 | 🟡 中 | `aten::argmax` | greedy 采样 | ❌ 未注册 (9.3 MB/step) |
-| 🟢 低 | `aten::clamp` / `aten::where` | position 计算, last_loc 计算 | ❌ 未注册 |
+| 🟢 低 | `aten::clamp` / `aten::where` | position 计算, overlap future token 解析 | ❌ 未注册 |
 | 🟢 低 | `aten::arange` (device) | position/start_loc 生成 | ❌ 未注册 |
 | 🟢 低 | `aten::neg` (int tensor) | future_indices 取反 | ❌ 未注册 |
 
@@ -934,8 +945,8 @@ Prefill 节点：                              Decode 节点：
 
 阶段四: 理清算子流程 (贯穿始终)
 ████████████████████████████████████████████████████████████████████████
-├─ 消除关键 CPU bounce (index_put_✅, cat✅, add/sub/mul✅, argmax, kv_indices)
-├─ 扩充 ATen 高频算子 (cumsum, index.Tensor_out, clamp...)
+├─ 消除关键 CPU bounce (index_put_✅, cumsum✅, mirror✅, argmax, kv_indices)
+├─ 扩充 ATen 高频算子 (index.Tensor_out, argmax, clamp...)
 ├─ 清理 SGLang 已失效的 _is_zeus bounce 分支 (cat/add ~10 处)
 ├─ 扩大模型覆盖 (SWA, GeluAndMul, MoE...)
 └─ 代码质量改进 (zeus_ops.py, 预分配 buffer, 异步写入)
@@ -995,10 +1006,10 @@ result = a * b                     # aten::mul → zenl_mul_kernel ✅
 result = torch.cat([a, b])         # aten::cat → TensorOps.cpp ✅
 result = torch.sum(x)              # aten::sum → sum_zeus_kernel ✅
 self.req_to_token[idx] = values    # aten::index_put_ → zenlIndexPut ✅
+result = torch.cumsum(x, dim=0)    # aten::cumsum → zenlCumsum ✅
 
 # ❌ 以下操作在 Zeus 上仍会触发隐式 CPU fallback:
 result = tensor[bool_mask]         # aten::index (花式索引读取)
-result = torch.cumsum(x, dim=0)    # aten::cumsum
 result = torch.where(cond, a, b)   # aten::where
 result = torch.argmax(x, dim=-1)   # aten::argmax
 result = torch.arange(n, device="zeus")  # aten::arange
@@ -1010,12 +1021,12 @@ result = -int_tensor               # aten::neg (int)
 
 ### 9.5 req_to_token 矩阵拷贝优化策略
 
-**当前状态：** `alloc_for_decode` 已优化为仅拷贝 bs 行（~KB 级），但 `write()` 和 `init_forward_metadata` 仍拷贝整个矩阵（~MB 级）。
+**当前状态：** `ReqToTokenPool` 在 Zeus 上维护 `req_to_token_cpu` mirror。`write()` 同步写 CPU mirror 和 Zeus device 本体；`alloc_for_decode()` 与 `ZeusAttnBackend` metadata 构建直接读 mirror，因此不再从 Zeus device 拷贝 `req_to_token` 整表或 bs 行。
 
 **优化原则：**
-- 能不拷就不拷（实现 Zeus 端算子）
-- 不得不拷时只拷需要的行（用 `req_to_token[indices].cpu()` 而非 `req_to_token.cpu()`）
-- 整矩阵拷贝是最后手段
+- 读 `req_to_token` 这类调度 metadata 时，优先读 CPU mirror
+- Zeus device 本体继续通过 `index_put` 保持正确，供 attention/kernel 使用
+- 长期目标是实现 device 端 ragged gather/build kernel，进一步取消 CPU mirror gather
 
 ### 9.6 lm_head 权重来源检测
 
@@ -1088,21 +1099,23 @@ decode_step:
   ├── alloc_for_decode(batch)
   │     ├── rpi_cpu = req_pool_indices.cpu()              # [Zeus→CPU] bs×4B
   │     ├── seq_lens_cpu = seq_lens.cpu()                  # [Zeus→CPU] bs×4B
-  │     ├── r2t_rows = req_to_token[rpi_cpu].cpu()         # [Zeus→CPU] bs×max_ctx×4B (仅 bs 行)
-  │     ├── [CPU] last_loc 计算
+  │     ├── req_to_token_cpu mirror                        # [CPU] 无 Zeus→CPU 大块读取
+  │     ├── [CPU mirror] last_loc 计算
   │     ├── last_loc.to(device)                            # [CPU→Zeus] bs×8B
   │     │
   │     ├── ZeusPagedAllocator.alloc_decode()              # [CPU 记账]
   │     │     └── out_indices.to(device)                   # [CPU→Zeus] bs×8B
   │     │
   │     └── ReqToTokenPool.write()
+  │           ├── self.req_to_token_cpu[idx] = values.cpu()# ✅ mirror 同步
   │           └── self.req_to_token[indices] = values      # ✅ Zeus 原生 aten::index_put_
   │
   ├── ZeusAttnBackend.init_forward_metadata()
   │     ├── seq_lens.cpu(), req_pool_indices.cpu()         # [Zeus→CPU] 小
-  │     ├── req_to_token.cpu()                             # ⚠️ [Zeus→CPU] 整个矩阵！
-  │     ├── [CPU] 构建 kv_indptr/kv_indices/qo_indptr
-  │     └── .to(device)                                    # [CPU→Zeus] 中等
+  │     ├── kv_indptr/qo_indptr = torch.cumsum(..., device)# ✅ Zeus device
+  │     ├── req_to_token_cpu mirror                        # ✅ 无整表 D2H
+  │     ├── [CPU mirror] 构建 kv_indices
+  │     └── kv_indices.to(device)                          # [CPU→Zeus] 中等
   │
   ├── model.forward(input_ids=[1 token], positions, forward_batch)
   │     └── 逐层计算 (全部在 Zeus 上):
@@ -1138,6 +1151,7 @@ decode_step:
 | GEMM (CPU fallback) | `bmm`, `mv`, `addmv`, `baddbmm` | operators/zenl/gemm.cpp | CPU 回退 |
 | 算术 | `add`, `sub`, `mul` | operators/zenl/add.cpp, sub.cpp, mul.cpp | **ZENL 加速 (新增 🆕)** |
 | 归约 | `sum`, `mean`, `norm` | operators/zenl/reduceOps.cpp | **ZENL 加速 (新增 🆕)** |
+| 前缀和 | `cumsum`, `cumsum.out` | operators/zenl/cumsum.cpp | **ZENL 加速 (新增 🆕)** |
 | 嵌入 | `embedding` | operators/zenl/embedding.cpp | ZENL 加速 |
 | 索引写入 | `index_put_`, `index_put` | operators/zenl/index_put.cpp | **ZENL 加速 (新增 🆕)** |
 | 随机数 | `uniform_`, `normal_`, `random_*` (3 种), `bernoulli_*` (2 种), `exponential_` | random/*.cpp | 原生 |
@@ -1148,11 +1162,10 @@ decode_step:
 
 | 优先级 | ATen 操作 | SGLang 用途 | CPU bounce 影响 |
 |--------|-----------|-------------|----------------|
-| 🔴 高 | `aten::cumsum` | kv_indptr, qo_indptr, chunk 索引 | 5+ 处，阻碍 Zeus 端 metadata 构建 |
-| 🔴 高 | `aten::index.Tensor_out` (花式索引读取) | filter_batch, alloc_for_decode | 4+ 处，每处 ~KB 级 |
+| 🔴 高 | `aten::index.Tensor_out` (花式索引读取) | filter_batch, logits/hidden gather 等 | 残留 index-read bounce；alloc 主链路已由 mirror 绕开 |
 | 🟡 中 | `aten::argmax` | greedy 采样 | 1 处，9.3 MB/step |
 | 🟢 低 | `aten::clamp` | position 计算 | 2+ 处 |
-| 🟢 低 | `aten::where` | last_loc 计算 | 1+ 处 |
+| 🟢 低 | `aten::where` | overlap future token 解析 / NaN 替换 | 1+ 处 |
 | 🟢 低 | `aten::arange` (device 参数) | position/start_loc 生成 | 3+ 处 |
 | 🟢 低 | `aten::neg` (int tensor) | future_indices 取反 | 1 处 |
 
@@ -1169,3 +1182,5 @@ decode_step:
 | `zeus_dev/zeus_adaptation_report.md` | 适配进度总结报告 |
 | `zeus_dev/demo_zeus_llm.py` | Zeus 推理端到端 demo |
 | `zeus_dev/demo_zeus_layer_compare.py` | 逐层数值对比工具 |
+| `zeus_dev/zeus_cpu_bounce_reduction_plan_20260423.md` | allocator / req_to_token / attention metadata CPU bounce 消除方案 |
+| `zeus_dev/zeus_if_zeus_cpu_bounce_audit_20260423.md` | 最新 `if_zeus` CPU bounce 审计 |

@@ -125,18 +125,23 @@ curl -s -m 300 -X POST http://127.0.0.1:38900/generate \
        "sampling_params": {"max_new_tokens": 8, "temperature": 0}}'
 ```
 
-On a CPU-fallback-heavy path (current state, 2026-04-15) expect ~6 s/token for
-Qwen2.5-0.5B. The request should return text that continues the prompt
+On older CPU-fallback-heavy paths we observed multi-second/token latency for
+Qwen2.5-0.5B. Recent Zeus updates removed the largest req_to_token metadata
+bounces, but performance is still sensitive to remaining fallback ops and
+kernel launch overhead. The request should return text that continues the prompt
 coherently, e.g. `" Paris. It is the largest city in"`.
 
 ## 5. Things that are slow / missing
 
-The first end-to-end zeus run goes through a lot of `[ZEUS Fallback]` messages
-for ops like `arange.start_out`, `scatter.src_out`, `add.Tensor`,
-`index.Tensor_out`, and `zenl_add_kernel`. These are correctness-correct but
-cost ~100x vs a native zeus implementation. The queue of zeus ops to upstream
-is tracked in `zeus_dev/update_log_20260415.md` under the "Known caveats"
-section.
+The first end-to-end zeus run may still print `[ZEUS Fallback]` or
+`[ZEUS FailFallback]` messages for residual ops such as `index.Tensor_out`,
+`argmax`, `where`, `clamp`, `arange`, and int `neg`. These are
+correctness-correct but slower than native Zeus implementations. The current
+operator and CPU-bounce status is tracked in:
+
+- `zeus_dev/sglang_zeus_manual.md`
+- `zeus_dev/zeus_if_zeus_cpu_bounce_audit_20260423.md`
+- `zeus_dev/zeus_cpu_bounce_reduction_plan_20260423.md`
 
 SGLang-side zeus compatibility is now complete enough to boot the server,
 warm up, and serve a generation request end to end. The remaining speedups

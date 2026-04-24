@@ -4,6 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
+# Keep this in sync with sglang/version.py. The release bump script updates
+# both files; sglang._version is intentionally not used.
 version = "0.5.6.post2"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
