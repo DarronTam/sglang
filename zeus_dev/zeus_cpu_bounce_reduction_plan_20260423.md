@@ -317,9 +317,42 @@ self.req_to_token[indices] = values
 
 原因：
 
-- 即使有 CPU mirror，metadata 仍然要在 CPU 上做 `cumsum + ragged gather + cat`
-- 这虽然避免了 device→CPU 的大拷贝，但 attention 前的 metadata 构建逻辑依旧在 CPU
+- 即使有 CPU mirror，metadata 仍然有 ragged gather 和 `cat` 在 CPU 上完成
+- `kv_indptr / qo_indptr` 的 `cumsum` 已可借助 torch_zeus 在 device 上完成
+- 这虽然避免了 device→CPU 的大拷贝，但 attention 前的 metadata 构建逻辑还没有完全 device 化
 - 如果未来想进一步减少 host 参与、靠近 CUDA 路径，`build_kv_metadata` 是最核心的下一步
+
+这里要特别区分两类问题：
+
+1. **不必要的 CPU bounce**
+   - 已经靠 `req_to_token_cpu mirror` 基本消掉了
+   - 也就是：不再为了读页表而把整张 `req_to_token` 从 device 临时拉回 CPU
+2. **仍在 CPU 上执行的 metadata 计算**
+   - 还包括 ragged gather、`cat`
+   - 这不一定伴随“大块 device→CPU 拷贝”，但仍意味着 host 参与
+
+所以当前主链路更准确的状态是：
+
+- **大块 bounce 已基本消除**
+- **`kv_indptr / qo_indptr` cumsum 已 device 化**
+- **ragged gather / cat 仍未 device 化**
+
+### 4.4 剩余 `cumsum` 调用点优先级表
+
+按当前代码状态，剩余值得关注的 `cumsum` 调用点可以分成三类：
+
+| 类别 | 代表位置 | 当前作用 | 建议优先级 | 说明 |
+|------|----------|----------|------------|------|
+| 主链路 | [zeus_backend.py:100](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:100), [zeus_backend.py:149](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:149), [zeus_backend.py:168](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:168) | 构 `kv_indptr / qo_indptr` | 已处理 | 已改为 Zeus device `torch.cumsum`；剩余问题转为 `kv_indices` 的 ragged gather |
+| Batch | [forward_batch_info.py:1081](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1081), [forward_batch_info.py:1118](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1118) | 构 `prefix_chunk_cu_seq_lens`、`kv_indptr` | 已处理 | 这两处是纯 `cumsum` CPU 绕路，已改为 Zeus device `torch.cumsum` |
+| Batch | [forward_batch_info.py:1258](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1258) | 构 `extend_start_loc` | 暂不处理 | 该分支还混合 CPU `arange/cat`，不只依赖 `cumsum` |
+| Logits | [logits_processor.py:420](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/logits_processor.py:420) | 构最后 token 的线性下标 | 暂不处理 | 该分支还依赖 gather / index 逻辑，先不只改 `cumsum` |
+
+因此这里对 `cumsum` 的定位应更新为：
+
+- **主链路 indptr 构建已经可以直接使用 device cumsum**
+- **纯 `cumsum` 的 batch 路径已处理**
+- **logits 和混合 batch 路径还依赖其他 CPU/index 能力，暂不单独修改**
 
 因此二阶段 kernel 优先级应改为：
 
@@ -506,6 +539,12 @@ extend_attention / decode_attention (device)
 2. 保留 allocator 的 CPU bookkeeping，不急着 device 化
 3. 把 `build_kv_metadata` 作为二阶段 Zeus 专用 kernel 重点
 4. `get_last_loc` / `write_req_to_token` 暂不优先
+
+补充说明：
+
+- 这套方案完成后，主链路上已经**基本没有不必要的大块 CPU bounce**
+- `kv_indptr / qo_indptr` 的 `cumsum` 已经可以在 Zeus device 上执行
+- Paged KV metadata 剩余的 host 工作主要是 `kv_indices` ragged gather
 
 **优先级总结：**
 

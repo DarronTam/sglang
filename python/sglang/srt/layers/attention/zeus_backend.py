@@ -89,21 +89,22 @@ class ZeusAttnBackend(AttentionBackend):
     ):
         """Build CSR kv_indptr / kv_indices and set forward_metadata.
 
-        This runs *outside* graph capture (before capture or before replay),
-        so CPU work is fine.
+        This runs *outside* graph capture (before capture or before replay).
+        Prefix sums now run on Zeus; only the ragged req_to_token mirror gather
+        stays on CPU.
         """
         seq_lens_cpu = seq_lens[:bs].cpu()
         req_pool_indices_cpu = req_pool_indices[:bs].cpu()
 
-        # kv_indptr — compute on CPU, copy into pre-allocated device buffer
-        kv_indptr_cpu = torch.zeros(bs + 1, dtype=torch.int32)
-        kv_indptr_cpu[1:] = torch.cumsum(seq_lens_cpu, dim=0).to(torch.int32)
-        self.cuda_graph_kv_indptr[: bs + 1].copy_(kv_indptr_cpu)
+        # kv_indptr — compute on Zeus now that torch_zeus supports cumsum.
+        kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=self.device)
+        kv_indptr[1:] = torch.cumsum(seq_lens[:bs], dim=0, dtype=torch.int32)
+        self.cuda_graph_kv_indptr[: bs + 1].copy_(kv_indptr)
 
         # kv_indices — gather from the CPU mirror, then copy into the
         # pre-allocated device buffer.
         req_to_token_cpu = self.req_to_token_pool.req_to_token_cpu
-        total_kv = int(kv_indptr_cpu[bs].item())
+        total_kv = int(seq_lens_cpu.sum().item())
         if total_kv > 0:
             kv_indices_cpu = torch.empty(total_kv, dtype=torch.int32)
             offset = 0
@@ -132,21 +133,21 @@ class ZeusAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Build kv_indptr, kv_indices (and qo_indptr for extend) from forward_batch.
 
-        All metadata is computed on CPU (avoiding Zeus ATen fallback for
-        cumsum/cat/indexing), then moved to the Zeus device at the end.
+        Prefix sums are computed on Zeus. The ragged req_to_token gather still
+        reads the CPU mirror until Zeus supports the remaining index-read path.
         """
         seq_lens = forward_batch.seq_lens
         batch_size = seq_lens.shape[0]
         req_pool_indices = forward_batch.req_pool_indices
 
-        # Pull inputs to CPU for metadata computation
+        # CPU mirror inputs are still used for ragged kv_indices construction.
         seq_lens_cpu = seq_lens.cpu()
         req_pool_indices_cpu = req_pool_indices.cpu()
         req_to_token_cpu = forward_batch.req_to_token_pool.req_to_token_cpu
 
-        # kv_indptr: [batch_size + 1], CSR prefix sum of seq_lens
-        kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32)
-        kv_indptr[1:] = torch.cumsum(seq_lens_cpu, dim=0).to(torch.int32)
+        # kv_indptr: [batch_size + 1], CSR prefix sum of seq_lens.
+        kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=self.device)
+        kv_indptr[1:] = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
 
         # kv_indices: concatenated absolute token positions for all sequences
         kv_indices_list = []
@@ -163,17 +164,20 @@ class ZeusAttnBackend(AttentionBackend):
         qo_indptr = None
         prefix_lens = None
         if forward_batch.extend_seq_lens is not None:
-            extend_seq_lens_cpu = forward_batch.extend_seq_lens.cpu()
-            qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32)
-            qo_indptr[1:] = torch.cumsum(extend_seq_lens_cpu, dim=0).to(torch.int32)
-            prefix_lens = forward_batch.extend_prefix_lens.cpu().to(torch.int32)
+            qo_indptr = torch.zeros(
+                batch_size + 1, dtype=torch.int32, device=self.device
+            )
+            qo_indptr[1:] = torch.cumsum(
+                forward_batch.extend_seq_lens, dim=0, dtype=torch.int32
+            )
+            prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
 
         # Move final tensors to Zeus device
         self.forward_metadata = ZeusAttnMetadata(
-            kv_indptr=kv_indptr.to(self.device),
+            kv_indptr=kv_indptr,
             kv_indices=kv_indices.to(self.device),
-            qo_indptr=qo_indptr.to(self.device) if qo_indptr is not None else None,
-            prefix_lens=prefix_lens.to(self.device) if prefix_lens is not None else None,
+            qo_indptr=qo_indptr,
+            prefix_lens=prefix_lens,
         )
 
     def forward_extend(
