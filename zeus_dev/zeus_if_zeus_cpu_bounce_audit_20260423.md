@@ -139,7 +139,283 @@
 
 本节只统计**最新代码里还存在**的项。
 
-## 4.1 主链路仍存在的问题
+## 4.0 主链路 vs Overlap / Scheduler：功能边界与调用流
+
+这两条路线虽然都会影响一次推理 step 的执行，但职责并不相同：
+
+- **主链路**：负责“真实 token 如何进入 KV cache，并被后续 attention 消费”
+- **Overlap / Scheduler 路线**：负责“在真实结果尚未完全落地前，如何用 future 占位把调度和前向重叠起来”
+
+换句话说：
+
+- 主链路偏 **模型状态推进 / cache 存取**
+- Overlap / Scheduler 偏 **异步调度 / 结果占位与回填**
+
+### 4.0.1 主链路在做什么
+
+主链路完成的是一次 decode / extend 中，和 paged KV cache 直接相关的工作：
+
+1. 根据当前请求长度，为新 token 分配 KV slot
+2. 把 `req -> token -> kv_slot` 写进 `req_to_token`
+3. 从 `req_to_token` 组装出 attention 所需的 `kv_indptr / kv_indices / qo_indptr`
+4. 让 paged attention kernel 依据这些 metadata 读取 KV cache
+
+它的核心目标是：
+
+- **让“这个 token 写到哪里、之后 attention 去哪里读”保持一致**
+
+### 4.0.2 主链路调用流图
+
+```text
+Decode / Extend Main Path
+
+ScheduleBatch
+   |
+   | seq_lens / req_pool_indices / reqs
+   v
+alloc_for_decode()                       [mem_cache/common.py]
+   |
+   | read last_loc from req_to_token_cpu mirror
+   v
+ZeusPagedTokenToKVPoolAllocator
+   |
+   | CPU bookkeeping:
+   | free_pages / release_pages / page alloc result
+   v
+out_cache_loc
+   |
+   | device index_put + CPU mirror sync
+   v
+ReqToTokenPool.write()                   [mem_cache/memory_pool.py]
+   |
+   | req_to_token[req, token_pos] = kv_slot
+   v
+ZeusTokenToKVPool.set_kv_buffer()
+   |
+   | store_kv_cache kernel writes K/V data
+   v
+Paged KV Cache
+   |
+   | build kv_indptr / kv_indices / qo_indptr
+   v
+ZeusAttnBackend.init_forward_metadata()  [layers/attention/zeus_backend.py]
+   |
+   | attention metadata
+   v
+extend_attention / decode_attention
+   |
+   v
+Paged attention reads KV cache
+```
+
+### 4.0.3 主链路模块说明
+
+| 模块 | 作用 | 典型数据 |
+|------|------|----------|
+| `alloc_for_decode()` | 组织 decode 分配前后的页表读写 | `seq_lens`、`req_pool_indices`、`last_loc` |
+| `ZeusPagedTokenToKVPoolAllocator` | 维护页级分配/回收 bookkeeping | `free_pages`、`release_pages`、`out_cache_loc` |
+| `ReqToTokenPool` | 维护请求到 KV slot 的页表 | `req_to_token`、`req_to_token_cpu` |
+| `ZeusTokenToKVPool` | 真正把 K/V 写进 paged KV cache | `out_cache_loc`、K/V tensors |
+| `ZeusAttnBackend` | 从页表构 attention metadata | `kv_indptr`、`kv_indices`、`qo_indptr` |
+| paged attention kernel | 按 metadata 读取 KV cache | `kv_indices` 指向的 cache pages |
+
+### 4.0.3.1 主链路流程图（带 CPU bounce 标注）
+
+```text
+Decode / Extend Main Path
+
+ScheduleBatch
+   |
+   | seq_lens / req_pool_indices / reqs
+   v
+alloc_for_decode()                       [mem_cache/common.py]
+   |
+   | read last_loc from req_to_token_cpu mirror
+   | [已优化] 不再做 req_to_token.device -> cpu 的行读取 bounce
+   v
+ZeusPagedTokenToKVPoolAllocator
+   |
+   | CPU bookkeeping:
+   | free_pages / release_pages / page alloc result
+   | [设计保留] 这是 CPU bookkeeping，不归类为“不必要 bounce”
+   v
+out_cache_loc
+   |
+   | device index_put + CPU mirror sync
+   | [已优化] 不再做 req_to_token 整表 cpu() -> 写 -> to(device)
+   v
+ReqToTokenPool.write()                   [mem_cache/memory_pool.py]
+   |
+   | req_to_token[req, token_pos] = kv_slot
+   v
+ZeusTokenToKVPool.set_kv_buffer()
+   |
+   | store_kv_cache kernel writes K/V data
+   | [device kernel] 无 CPU bounce
+   v
+Paged KV Cache
+   |
+   | build kv_indptr / kv_indices / qo_indptr
+   | [已优化] indptr prefix-sum runs on Zeus:
+   |   - cumsum(seq_lens)
+   |   - cumsum(extend_seq_lens)
+   | [仍存在] CPU mirror gather:
+   |   - seq_lens.cpu()
+   |   - req_pool_indices.cpu()
+   |   - ragged gather from req_to_token_cpu mirror
+   | [已优化] 不再有 req_to_token 整表 .cpu() bounce
+   v
+ZeusAttnBackend.init_forward_metadata()  [layers/attention/zeus_backend.py]
+   |
+   | attention metadata
+   v
+extend_attention / decode_attention
+   |
+   | [device kernel] paged attention reads KV cache
+   | [无 CPU bounce]
+   v
+Paged attention output
+```
+
+### 4.0.4 Overlap / Scheduler 路线在做什么
+
+Overlap / Scheduler 路线完成的是“先占位、后兑现”的异步调度：
+
+1. scheduler 先为当前 batch 申请一批 future slots
+2. 用负数 future index 暂时写进 `output_ids`
+3. forward 真正跑完后，把结果写入 `FutureMap`
+4. 后续谁要消费这些 token，就把负数占位符解引用成真实 token
+
+它的核心目标是：
+
+- **让调度准备、前向执行、结果消费尽量重叠，减少等待**
+
+这里它管理的不是 KV cache，而是：
+
+- “未来某一步会产生的 token / draft 结果”
+
+### 4.0.5 Overlap / Scheduler 调用流图
+
+```text
+Overlap / Scheduler Path
+
+Scheduler.run_batch()
+   |
+   | bs = len(model_worker_batch.seq_lens)
+   v
+FutureMap.alloc_future_indices(bs)      [managers/overlap_utils.py]
+   |
+   | allocate future slots: [f1, f2, ...]
+   v
+future_indices
+   |
+   | encode as negative placeholders
+   v
+(-future_indices.indices)               [managers/scheduler.py]
+   |
+   | write placeholder ids into batch state
+   v
+batch.output_ids / next-step inputs
+   |
+   | before forward: resolve old futures if input_ids contain negative refs
+   v
+FutureMap.resolve_future()
+   |
+   | where(ids < 0, future_buf[clamp(-ids)], ids)
+   v
+ModelWorker.forward_batch_generation()
+   |
+   | real next_token_ids / draft result produced
+   v
+GenerationBatchResult
+   |
+   | store real result into circular future buffer
+   v
+FutureMap.store_to_map()
+   |
+   v
+Later batch preparation / later consumer resolves future ids
+```
+
+### 4.0.6 Overlap / Scheduler 模块说明
+
+| 模块 | 作用 | 典型数据 |
+|------|------|----------|
+| `Scheduler` | 组织一次 batch 的调度、forward 与 future 占位 | `future_indices`、`output_ids` |
+| `FutureMap.alloc_future_indices()` | 给未来结果分配 circular buffer 槽位 | `indices = [start, ..., end)` |
+| `neg(int)` | 把 future slot 编码成负占位符 | `-future_indices` |
+| `FutureMap.resolve_future()` | 把负占位符解引用为真实 token | `where + clamp + index(read)` |
+| `FutureMap.store_to_map()` | forward 完成后把真实结果写回 future buffer | `next_token_ids` / eagle draft data |
+
+### 4.0.6.1 Overlap / Scheduler 流程图（带 CPU bounce 标注）
+
+```text
+Overlap / Scheduler Path
+
+Scheduler.run_batch()
+   |
+   | bs = len(model_worker_batch.seq_lens)
+   v
+FutureMap.alloc_future_indices(bs)      [managers/overlap_utils.py]
+   |
+   | allocate future slots: [f1, f2, ...]
+   | [仍存在小 bounce] arange 在 Zeus 下仍走历史 CPU 特判
+   v
+future_indices
+   |
+   | encode as negative placeholders
+   | [仍存在小 bounce] (-future_indices.indices.cpu()).to(device)
+   v
+(-future_indices.indices)               [managers/scheduler.py]
+   |
+   | write placeholder ids into batch state
+   v
+batch.output_ids / next-step inputs
+   |
+   | before forward: resolve old futures if input_ids contain negative refs
+   v
+FutureMap.resolve_future()
+   |
+   | where(ids < 0, future_buf[clamp(-ids)], ids)
+   | [仍存在小 bounce]
+   |   - input_ids.cpu()
+   |   - future_token_ids_map.cpu()
+   |   - CPU where / clamp / index(read)
+   v
+ModelWorker.forward_batch_generation()
+   |
+   | real next_token_ids / draft result produced
+   | [device forward] 本身不是 CPU bounce 点
+   v
+GenerationBatchResult
+   |
+   | store real result into circular future buffer
+   | [device write] 无 CPU bounce
+   v
+FutureMap.store_to_map()
+   |
+   v
+Later batch preparation / later consumer resolves future ids
+```
+
+### 4.0.7 两条路线的关系
+
+它们的关系可以概括为：
+
+1. **Overlap / Scheduler 决定“结果还没正式落地时，系统怎么继续往前走”**
+2. **主链路决定“结果一旦落地，这个 token 的 KV 写到哪里、attention 之后怎么读”**
+
+所以：
+
+- Overlap / Scheduler 主要解决 **流水线重叠**
+- 主链路主要解决 **cache 一致性与 attention 消费**
+
+也因此它们的 Zeus 改造重点不同：
+
+- 主链路最关心：`req_to_token` 读写、metadata 构建、KV page attention
+- Overlap / Scheduler 最关心：`where / clamp / arange / neg(int)` 这组小算子
+
+## 4.1 主链路状态更新
 
 ### A. `layers/attention/zeus_backend.py`
 
@@ -149,29 +425,24 @@
 - [zeus_backend.py:103](/root/workspace/sglang/python/sglang/srt/layers/attention/zeus_backend.py:103)
 - [zeus_backend.py:141](/root/workspace/sglang/python/sglang/srt/layers/attention/zeus_backend.py:141)
 
-当前仍存在：
+按当前代码，这里的结论应拆成两层：
 
-1. graph 路径里：
-   - `seq_lens[:bs].cpu()`
-   - `req_pool_indices[:bs].cpu()`
-   - `self.req_to_token.cpu()`
-2. non-graph 路径里：
-   - `cumsum(seq_lens_cpu)`
-   - `cumsum(extend_seq_lens_cpu)`
+1. **主链路上“不必要的大块 CPU bounce”已经基本清掉**
+   - graph / non-graph 两条 metadata 路径都已改为直接读 `req_to_token_cpu mirror`
+   - 已经不存在为了 `kv_metadata` 构建而额外执行整表 `req_to_token.cpu()` 的 bounce
+2. **attention metadata 的 CPU 计算范围进一步缩小**
+   - `kv_indptr / qo_indptr` 的 `cumsum` 已回到 Zeus device
+   - 仍在 CPU 上的是 `seq_lens / req_pool_indices` 小张量读取，以及基于 `req_to_token_cpu mirror` 的 ragged gather
 
-为什么还在：
+为什么还要关注：
 
-- graph 路径仍直接从 device `req_to_token` 读
-- `cumsum` 缺失
+- 如果目标只是消除主链路上的明显 CPU bounce：这一阶段已经基本完成
+- 如果目标是进一步减少 host 参与、靠近 CUDA 路径：仍需要 `build_kv_metadata` kernel，或补齐 `index(read)` 后把 ragged gather 搬回 device
 
-能否直接删：
+怎么继续优化：
 
-- **不能整体直接删**
-
-怎么消除：
-
-- 短期：graph 路径也改读 `req_to_token_cpu mirror`
-- 中期：补 `build_kv_metadata` Zeus 专用 kernel 或补 `cumsum + index(read)`
+- 二阶段：补 `build_kv_metadata`
+- 或者分步补齐 `index(read)`，逐步把 metadata 组装从 CPU 挪走
 
 ### B. `mem_cache/common.py`
 
@@ -264,14 +535,13 @@
 
 - `self.extend_prefix_lens = (self.seq_lens.cpu() - 1).to(device)`
 - `torch.arange(...).to(device)`
-- `prefix_chunk_seq_lens_cuda.cpu().cumsum(...)`
-- `torch.cumsum(self.seq_lens.cpu(), dim=0).to(...)`
 - `compute_position_torch()` 里的 CPU `arange + cumsum`
 - `clamp_position()` 里的 CPU `clamp`
 
 为什么还在：
 
-- `cumsum`、`arange(device)`、`clamp` 缺失
+- `arange(device)`、`clamp` 缺失
+- `compute_position_torch()` 仍混合 CPU `arange/cat`，不只依赖 `cumsum`
 
 能否直接删：
 
@@ -279,9 +549,11 @@
 
 怎么消除：
 
-- 先补 `cumsum`
-- 再补 `arange`
-- 再补 `clamp`
+- 已处理纯 `cumsum` 路径：
+  - `prefix_chunk_cu_seq_lens`
+  - `fetch_mha_one_shot_kv_indices()` 中的 `kv_indptr`
+- 后续再补 `arange`
+- 后续再补 `clamp`
 
 ---
 
@@ -333,9 +605,9 @@
 
 为什么还在：
 
-- `cumsum` 缺失
 - `index(read)` 缺失
 - `arange` 缺失
+- 虽然 `cumsum` 已支持，但该分支还依赖后续 gather / index 逻辑，所以暂不单独修改
 
 能否直接删：
 
@@ -405,21 +677,39 @@
 
 这些项不依赖新 kernel，最容易清掉。
 
-### P1：继续优化主链路
+### P1：主链路第二阶段优化
 
-1. `zeus_backend.py` graph 路径改读 `req_to_token_cpu mirror`
+1. 继续减少 attention metadata 的 host 计算
 2. 视情况清理 `common.py` 里 `locs = seq_lens.cpu().to(device)` 这种轻量残留
 
-### P2：补缺失算子
+### P2：补缺失算子 / 应用已支持算子
 
 建议顺序：
 
-1. `cumsum`
-2. `index(read)` / gather
-3. `arange`
-4. `where`
-5. `clamp`
-6. `neg(int)`
+1. `index(read)` / gather
+2. `arange`
+3. `where`
+4. `clamp`
+5. `neg(int)`
+6. 将已支持的 `cumsum` 继续应用到 batch / logits 路径
+
+## 6.1 剩余 `cumsum` 调用点优先级表
+
+这里把当前 Zeus 还值得关注的 `cumsum` 调用点，按 `主链路 / batch / logits` 三类重新整理如下。
+
+| 类别 | 代表位置 | 当前作用 | 优先级 | 原因 |
+|------|----------|----------|--------|------|
+| 主链路 | [zeus_backend.py:100](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:100), [zeus_backend.py:149](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:149), [zeus_backend.py:168](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:168) | 构 `kv_indptr / qo_indptr` | 已处理 | 已改为 Zeus device `torch.cumsum`；剩余问题转为 `kv_indices` 的 ragged gather |
+| Batch | [forward_batch_info.py:1081](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1081), [forward_batch_info.py:1118](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1118) | 构 `prefix_chunk_cu_seq_lens`、`kv_indptr` | 已处理 | 这两处是纯 `cumsum` CPU 绕路，已改为 Zeus device `torch.cumsum` |
+| Batch | [forward_batch_info.py:1258](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1258) | 构 `extend_start_loc` | 暂不处理 | 该分支还混合 CPU `arange/cat`，不只依赖 `cumsum` |
+| Logits | [logits_processor.py:420](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/logits_processor.py:420) | 构最后 token 的线性下标 | 暂不处理 | 该分支还依赖 gather / index 逻辑，先不只改 `cumsum` |
+
+补充说明：
+
+- 主链路里的 `cumsum` 已经回到 Zeus device 上执行
+- 纯 `cumsum` 的 batch 路径已处理
+- logits 和混合 batch 路径还依赖其他 CPU/index 能力，暂不单独修改
+- Paged KV metadata 的剩余 host 工作，核心已经变成 `kv_indices` 的 ragged gather
 
 ---
 
@@ -427,5 +717,5 @@
 
 这份文档按最新代码重排后，最重要的变化是：
 
-> `req_to_token` 读写相关的主链路大块 CPU bounce 已经被解决，不应再继续作为“当前未解决问题”统计。  
-> 现在还真正残留的热点，主要是 `cumsum`、`index(read)` 驱动的 metadata / batch / logits 路径，以及 overlap 上的 `clamp/where/arange/neg` 小算子分支。
+> `req_to_token` 读写和 `kv_metadata` 相关的主链路大块 CPU bounce 已经被解决，不应再继续作为“当前未解决问题”统计。  
+> 现在更准确的说法是：主链路上已基本没有“不必要的大块 CPU bounce”，`kv_indptr / qo_indptr` 的 `cumsum` 也已 device 化；Paged KV metadata 剩余的 host 工作主要是 `kv_indices` ragged gather。此外真正残留的热点，主要是 batch / logits 上的 `cumsum`、`index(read)` 路径，以及 overlap 上的 `clamp/where/arange/neg` 小算子分支。

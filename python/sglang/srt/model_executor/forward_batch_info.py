@@ -1077,14 +1077,9 @@ class ForwardBatch:
             device=device,
             dtype=torch.int32,
         )
-        if _is_zeus:
-            self.prefix_chunk_cu_seq_lens[:, 1:] = prefix_chunk_seq_lens_cuda.cpu().cumsum(
-                dim=1
-            ).to(torch.int32).to(device)
-        else:
-            self.prefix_chunk_cu_seq_lens[:, 1:] = prefix_chunk_seq_lens_cuda.cumsum(
-                dim=1
-            ).to(torch.int32)
+        self.prefix_chunk_cu_seq_lens[:, 1:] = prefix_chunk_seq_lens_cuda.cumsum(
+            dim=1, dtype=torch.int32
+        )
         self.prefix_chunk_max_seq_lens = prefix_chunk_seq_lens_cpu.max(
             dim=1
         ).values.tolist()
@@ -1114,10 +1109,7 @@ class ForwardBatch:
             dtype=torch.int32,
             device=self.req_pool_indices.device,
         )
-        if _is_zeus:
-            kv_indptr[1:] = torch.cumsum(self.seq_lens.cpu(), dim=0).to(kv_indptr.device)
-        else:
-            kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
+        kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0, dtype=torch.int32)
         create_flashinfer_kv_indices_triton[(self.batch_size,)](
             self.req_to_token_pool.req_to_token,
             self.req_pool_indices,
