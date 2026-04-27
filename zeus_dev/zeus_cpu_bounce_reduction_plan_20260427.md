@@ -1,13 +1,13 @@
 # Zeus 主链路 CPU Bounce 重新评估与实现方案
 
-> 日期：2026-04-23  
+> 日期：2026-04-27  
 > 前提更新：`torch_zeus` 已支持 `aten::index_put`  
 > 目标：重新评估 `allocator + req_to_token 读写 + attention metadata + kv page attention` 这条链路上的 CPU bounce，并给出在当前前提下的最佳实现方案。
 
 ---
 
 ## 1. 结论先行
-
+  
 在 `torch_zeus` 已支持 `aten::index_put` 的前提下，**最优的近期方案不是先补 3 个 Zeus 专用 kernel**，而是：
 
 1. 在 `ReqToTokenPool` 中为 Zeus 维护一份 **CPU mirror**：`req_to_token_cpu`
@@ -94,6 +94,15 @@ self.req_to_token[indices] = values
 
 ## 3.1 模块结构图：主链路里的调用关系
 
+`allocator + req_to_token + attention metadata + kv page attention`
+在 Zeus 分支里是一条完整链路：
+
+1. `allocator` 决定新 token 该落到哪个 KV page / slot。
+2. `req_to_token` 是请求级页表，记录 `req_idx -> token_pos -> kv_slot` 的映射。
+3. `attention metadata` 把这张页表压成 paged attention kernel 可直接消费的 CSR 形式：
+   `kv_indptr` 表示每个请求的段边界，`kv_indices` 表示实际需要读的 KV slot 列表。
+4. `kv page attention` 内核再按 `kv_indices` 去读 paged KV cache。
+   
 下面这张图强调的是“模块之间怎么调用”，不是时序细节。
 
 ```text
@@ -280,47 +289,80 @@ attention kernel 也已经在 Zeus device 上：
 
 ---
 
-## 5. 重新评估 3 个 Zeus 专用 kernel
+## 5. 重新评估 `attention metadata` Zeus 专用 kernel
 
-原先候选是：
+`attention metadata`，也就是把页表压成 paged attention kernel 直接消费的 CSR metadata：
 
-1. `get_last_loc(req_to_token, req_pool_indices, seq_lens)`
-2. `write_req_to_token(req_to_token, req_pool_indices, locs, out_cache_loc)`
-3. `build_kv_metadata(req_to_token, req_pool_indices, seq_lens, extend_seq_lens)`
+- `kv_indptr`
+- `kv_indices`
+- extend 路径的 `qo_indptr / prefix_lens`
 
-在 `index_put` 已支持后，优先级应改成：
-
-### 4.1 `write_req_to_token`：从 P0 降到 P2
-
-因为现在可以直接：
+在这个边界下，原先 3 个候选 kernel 中只有：
 
 ```python
-self.req_to_token[indices] = values
+build_kv_metadata(req_to_token, req_pool_indices, seq_lens, extend_seq_lens)
 ```
 
-所以 `write_req_to_token` 专用 kernel 不再是必须项。  
-除非后续为了进一步优化非常高频的小 scatter，否则不建议优先投入。
+### 5.1 当前第 3 步还在 CPU 上做什么
 
-### 4.2 `get_last_loc`：仍然有价值，但排第二阶段
+当前 `ZeusAttnBackend.init_forward_metadata()` 的状态是：
 
-它可以进一步去掉 decode 前的 CPU row-gather。  
-但如果已经有 `req_to_token_cpu` mirror，则 decode 前读取 `last_loc` 不需要再从 device 拷回。
+- `kv_indptr`：已经在 Zeus device 上用 `torch.cumsum(seq_lens)` 构建
+- `qo_indptr`：已经在 Zeus device 上用 `torch.cumsum(extend_seq_lens)` 构建
+- `prefix_lens`：直接使用 device tensor 转 int32
+- `kv_indices`：仍然通过 CPU mirror 做 ragged gather，再拷回 device
 
-所以：
+参考 [zeus_backend.py:143](/root/workspace/sglang/python/sglang/srt/layers/attention/zeus_backend.py:143)：
 
-- 没有 mirror 时：`get_last_loc` 很重要
-- 有 mirror 后：`get_last_loc` 收益下降
+```python
+seq_lens_cpu = seq_lens.cpu()
+req_pool_indices_cpu = req_pool_indices.cpu()
+req_to_token_cpu = forward_batch.req_to_token_pool.req_to_token_cpu
 
-### 4.3 `build_kv_metadata`：仍然是最值得做的专用 kernel
+kv_indices_list = []
+for b in range(batch_size):
+    req_idx = req_pool_indices_cpu[b]
+    kv_indices_list.append(
+        req_to_token_cpu[req_idx, : seq_lens_cpu[b]].to(torch.int32)
+    )
+kv_indices = torch.cat(kv_indices_list)
+```
 
-这是唯一仍然强烈值得保留在第二阶段的 Zeus 专用 kernel。
+所以现在第 3 步的 CPU 残留不是 `indptr` prefix sum，而是：
 
-原因：
+1. `seq_lens.cpu()` / `req_pool_indices.cpu()` 用来驱动 Python 变长切片
+2. 从 `req_to_token_cpu` mirror 做每个 request 的变长 row gather
+3. Python for-loop 管理每个 request 的 offset 和 slice 长度
+4. 最终 `kv_indices.to(device)` 把拼好的 compact CSR indices 搬回 Zeus
 
-- 即使有 CPU mirror，metadata 仍然有 ragged gather 和 `cat` 在 CPU 上完成
-- `kv_indptr / qo_indptr` 的 `cumsum` 已可借助 torch_zeus 在 device 上完成
-- 这虽然避免了 device→CPU 的大拷贝，但 attention 前的 metadata 构建逻辑还没有完全 device 化
-- 如果未来想进一步减少 host 参与、靠近 CUDA 路径，`build_kv_metadata` 是最核心的下一步
+### 5.2 `cat` 已有 device aten 后
+ 
+如果每个 per-request slice 已经是 device tensor，那么 `torch.cat(kv_indices_list)`
+可以在 Zeus device 上完成。
+
+但这并不自动让 `kv_indices` 构建完全 device 化，因为当前困难点变成了：
+
+- 每个 request 的 slice 长度 `seq_lens[b]` 是动态的
+- Python slice `:seq_lens[b]` 需要 CPU 可见的边界
+- compact CSR 输出需要按 `kv_indptr[b]` 写到连续区间
+- 仅靠 device `cat` 仍需要先得到一组合法的变长 device slice
+
+因此，在 `cat` 已支持 device 的前提下，可以把方案分成两级：
+
+| 方案 | 做法 | CPU 残留 | 评价 |
+|------|------|----------|------|
+| A. 最小 Python 改造 | 从 device `req_to_token` 取每行 slice，然后 device `cat` | 仍需要 CPU `seq_lens` 控制 Python slice；可能仍有逐行同步 | 只适合作为验证，不建议作为最终优化 |
+| B. `build_kv_metadata` 专用 kernel | device 端按 `kv_indptr` 把 `req_to_token[req_idx, 0:seq_len]` 直接 scatter 到 `kv_indices` | 基本无 CPU 参与 | 推荐方案 |
+
+真正要 device 化第 3 步，关键仍然是：
+
+```text
+kv_indices[kv_indptr[b] + j] = req_to_token[req_pool_indices[b], j]
+```
+
+这个变长二维 gather 到 compact 一维 CSR buffer 的过程。
+
+### 5.3 只处理第 3 步时的推荐优先级
 
 这里要特别区分两类问题：
 
@@ -328,16 +370,23 @@ self.req_to_token[indices] = values
    - 已经靠 `req_to_token_cpu mirror` 基本消掉了
    - 也就是：不再为了读页表而把整张 `req_to_token` 从 device 临时拉回 CPU
 2. **仍在 CPU 上执行的 metadata 计算**
-   - 还包括 ragged gather、`cat`
+   - 还包括 ragged gather、Python 变长切片、offset 管理
    - 这不一定伴随“大块 device→CPU 拷贝”，但仍意味着 host 参与
 
 所以当前主链路更准确的状态是：
 
 - **大块 bounce 已基本消除**
 - **`kv_indptr / qo_indptr` cumsum 已 device 化**
-- **ragged gather / cat 仍未 device 化**
+- **`cat` 已具备 device 化条件**
+- **`kv_indices` ragged gather 仍未真正 device 化**
 
-### 4.4 剩余 `cumsum` 调用点优先级表
+因此只处理步骤 3 时，优先级应改为：
+
+1. P1：实现 `build_kv_metadata` Zeus 专用 kernel，重点只放在 `kv_indices` ragged gather
+2. P2：把 graph/eager 两条路径统一到同一个 device metadata builder
+
+
+### 5.4 剩余 `cumsum` 调用点优先级表
 
 按当前代码状态，剩余值得关注的 `cumsum` 调用点可以分成三类：
 
@@ -345,7 +394,7 @@ self.req_to_token[indices] = values
 |------|----------|----------|------------|------|
 | 主链路 | [zeus_backend.py:100](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:100), [zeus_backend.py:149](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:149), [zeus_backend.py:168](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:168) | 构 `kv_indptr / qo_indptr` | 已处理 | 已改为 Zeus device `torch.cumsum`；剩余问题转为 `kv_indices` 的 ragged gather |
 | Batch | [forward_batch_info.py:1081](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1081), [forward_batch_info.py:1118](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1118) | 构 `prefix_chunk_cu_seq_lens`、`kv_indptr` | 已处理 | 这两处是纯 `cumsum` CPU 绕路，已改为 Zeus device `torch.cumsum` |
-| Batch | [forward_batch_info.py:1258](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1258) | 构 `extend_start_loc` | 暂不处理 | 该分支还混合 CPU `arange/cat`，不只依赖 `cumsum` |
+| Batch | [forward_batch_info.py:1258](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1258) | 构 `extend_start_loc` | 暂不处理 | 该分支还混合动态 `arange`、变长拼接和索引逻辑，不只依赖 `cumsum` |
 | Logits | [logits_processor.py:420](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/logits_processor.py:420) | 构最后 token 的线性下标 | 暂不处理 | 该分支还依赖 gather / index 逻辑，先不只改 `cumsum` |
 
 因此这里对 `cumsum` 的定位应更新为：
@@ -353,12 +402,6 @@ self.req_to_token[indices] = values
 - **主链路 indptr 构建已经可以直接使用 device cumsum**
 - **纯 `cumsum` 的 batch 路径已处理**
 - **logits 和混合 batch 路径还依赖其他 CPU/index 能力，暂不单独修改**
-
-因此二阶段 kernel 优先级应改为：
-
-1. `build_kv_metadata`
-2. `get_last_loc`
-3. `write_req_to_token`
 
 ---
 
@@ -456,7 +499,8 @@ Zeus KV store_kv_cache (device)
 ZeusAttnBackend.init_forward_metadata
    |
    | 直接读 req_to_token_cpu
-   | CPU 上做 kv_indptr / kv_indices / qo_indptr
+   | device 上做 kv_indptr / qo_indptr cumsum
+   | CPU mirror 上做 kv_indices ragged gather
    v
 extend_attention / decode_attention (device)
 ```
@@ -502,13 +546,16 @@ extend_attention / decode_attention (device)
 
 ## 8. 第二阶段建议
 
-如果 Phase 1 完成后还要继续推进，可以按下面顺序做。
+如果 Phase 1 完成后继续推进，并且本轮明确只处理图中的第 3 步
+`attention metadata`，建议按下面顺序做。
 
 ### 7.1 P1：`build_kv_metadata` Zeus 专用 kernel
 
 目标：
 
-- 把 `kv_indptr / kv_indices / qo_indptr` 从 CPU metadata 构建搬到 device
+- 保持 `kv_indptr / qo_indptr` 继续使用 device `torch.cumsum`
+- 把 `kv_indices` 的 ragged gather 从 CPU mirror + Python for-loop 搬到 device
+- graph/eager 路径复用同一个 metadata builder，只是输出 buffer 不同
 
 价值：
 
@@ -516,20 +563,46 @@ extend_attention / decode_attention (device)
 - 让 Zeus attention 前处理更接近 CUDA 路径
 - graph capture/replay 也更容易统一
 
-### 7.2 P2：`get_last_loc` Zeus 专用 kernel
+建议 kernel 语义：
+
+```text
+for b in batch:
+    req_idx = req_pool_indices[b]
+    start = kv_indptr[b]
+    len = seq_lens[b]
+    for j in range(len):
+        kv_indices[start + j] = req_to_token[req_idx, j]
+```
+
+输入：
+
+- `req_to_token`
+- `req_pool_indices`
+- `seq_lens`
+- `kv_indptr`
+
+输出：
+
+- `kv_indices`
+
+说明：
+
+- `cat` 已有 Zeus device aten 后，不需要把 `cat` 本身视为 blocker
+- 但变长 slice 的边界和 compact CSR 写入仍然需要 device 端处理
+- 因此推荐做专用 kernel，而不是仅靠 Python list + device `cat`
+
+### 7.2 P2：Python-level device `cat` 过渡版本
 
 前提：
 
-- 如果 mirror 方案已经落地，它的边际收益会下降
+- 仅用于快速验证 device `cat` 和 device row gather 的可行性
+- 不作为最终性能方案
 
-### 7.3 P2：`write_req_to_token` Zeus 专用 kernel
+原因：
 
-前提：
-
-- 只有在实测证明 `index_put` 仍是明显热点时才值得做
-- 否则不建议优先投入
-
----
+- 即使 `cat` 在 device 上，Python 仍然需要逐 request 决定 slice 长度
+- 动态 slice 很可能继续依赖 CPU scalar 或触发同步
+- 对大 batch / 长上下文，Python for-loop 本身也会变成调度开销
 
 ## 9. 最终建议
 
@@ -537,23 +610,23 @@ extend_attention / decode_attention (device)
 
 1. **立即实现 CPU mirror + 直接 device index_put**
 2. 保留 allocator 的 CPU bookkeeping，不急着 device 化
-3. 把 `build_kv_metadata` 作为二阶段 Zeus 专用 kernel 重点
-4. `get_last_loc` / `write_req_to_token` 暂不优先
+3. 在只优化步骤 3 的前提下，把 `build_kv_metadata` 收敛为 `kv_indices` device ragged gather kernel
+4. `get_last_loc` / `write_req_to_token` 属于步骤 1/2，本轮不纳入
 
 补充说明：
 
 - 这套方案完成后，主链路上已经**基本没有不必要的大块 CPU bounce**
 - `kv_indptr / qo_indptr` 的 `cumsum` 已经可以在 Zeus device 上执行
-- Paged KV metadata 剩余的 host 工作主要是 `kv_indices` ragged gather
+- `cat` 已具备 device aten 实现，不再是第 3 步的核心 blocker
+- Paged KV metadata 剩余的 host 工作主要是 `kv_indices` ragged gather 和 Python 变长 slice 管理
 
 **优先级总结：**
 
 - 🔴 P0：`ReqToTokenPool` CPU mirror + 统一 device `index_put`
 - 🔴 P0：`alloc_for_decode()` 改读 mirror
 - 🔴 P0：`zeus_backend.init_forward_metadata()` 改读 mirror
-- 🟡 P1：`build_kv_metadata` Zeus 专用 kernel
-- 🟢 P2：`get_last_loc`
-- 🟢 P2：`write_req_to_token`
+- 🟡 P1：步骤 3 专用 `build_kv_metadata`，重点是 device `kv_indices` ragged gather
+- 🟢 P2：Python-level device `cat` 过渡验证
 
 ---
 

@@ -464,7 +464,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             sl_cpu = batch.seq_lens.cpu()
             r2t_rows_cpu = batch.req_to_token_pool.req_to_token_cpu[rpi_cpu]
             last_loc = r2t_rows_cpu[torch.arange(bs), sl_cpu - 1].to(device)
-            seq_lens_next = (sl_cpu + token_per_req).to(device)
+            seq_lens_next = batch.seq_lens + token_per_req
         else:
             last_loc = batch.req_to_token_pool.req_to_token[
                 batch.req_pool_indices, batch.seq_lens - 1
