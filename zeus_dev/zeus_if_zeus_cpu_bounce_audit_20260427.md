@@ -1,7 +1,8 @@
 # torch_zeus 已支持算子与 SGLang `_is_zeus` CPU bounce 审计
 
-> 日期：2026-04-23  
+> 日期：2026-04-27  
 > 本次更新：按**当前代码**重新整理，只统计**仍然存在**的 CPU bounce；已被最新代码修复的项不再列为现存问题。
+> 前提更新：`torch_zeus` 已支持 `aten::cumsum` 和 `aten::index_put / index_put_`。
 
 ---
 
@@ -16,8 +17,8 @@
    - greedy `argmax` 不再有 Zeus 专门的 CPU workaround
 
 2. **仍存在的 CPU bounce**
-   - 这些分支背后依赖的算子当前仍缺失
-   - 典型：`cumsum`、`index` 读取、`clamp`、`where`、`arange`、`neg(int)`
+   - 这些分支背后依赖的能力当前仍缺失，或代码里还保留历史 CPU workaround
+   - 典型：`index` 读取、`clamp`、`where`、`arange`、`neg(int)`
 
 3. **设计上保留的 CPU bookkeeping**
    - 这些不是“不必要 bounce”
@@ -26,7 +27,7 @@
 
 一句话：
 
-> 当前主链路最明显的 `req_to_token` 读写 bounce 已经被新代码消掉了；现在更值得继续关注的是 `cumsum / index(read)` 驱动的 metadata、batch 处理和 overlap 小算子路径。
+> 当前主链路最明显的 `req_to_token` 读写 bounce 已经被新代码消掉了；`cumsum` / `index_put` 也已具备 Zeus aten 实现。现在更值得继续关注的是 `index(read)` 驱动的 metadata、batch 处理，以及 overlap 上的 `clamp / where / arange / neg(int)` 小算子路径。
 
 ---
 
@@ -46,22 +47,60 @@
 | 拼接 | `cat`, `cat.out` | ✅ 原生 |
 | 算术 | `add`, `sub`, `mul` | ✅ 原生 |
 | 归约 | `sum`, `mean`, `norm` | ✅ 原生 |
+| 前缀和 | `cumsum` | ✅ 原生 |
 | GEMM | `mm`, `addmm`, `linear` | ✅ 原生 |
 | 索引写入 | `index_put_`, `index_put` | ✅ 原生 |
 | greedy 归约 | `argmax` | ✅ 当前代码已直接使用 |
 
-### 2.2 仍缺失、并且仍影响当前代码的关键算子
+### 2.2 `sgl_kernel_zeus` 已支持 / 已接入的自定义 kernel
+
+这里和上一节的 `torch_zeus` aten 算子区分开：`torch_zeus` 负责
+PyTorch ATen dispatch，`sgl_kernel_zeus` 则是 SGLang 在 Zeus 上使用的
+硬件专用融合 kernel / attention kernel。
+
+依据：
+
+- [sglang_zeus_manual.md](/root/workspace/sglang/zeus_dev/sglang_zeus_manual.md:407)
+- [zeus_graph_integration_plan.md](/root/workspace/sglang/zeus_dev/zeus_graph_integration_plan.md:476)
+- 当前 Python 代码中的 `from sgl_kernel_zeus import ...` 调用点
+
+| 类别 | Kernel | 用途 | 主要调用位置 / 状态 |
+|------|--------|------|--------------------|
+| Attention | `extend_attention` | Prefill / extend paged attention | `zeus_backend.py:forward_extend` |
+| Attention | `decode_attention` | Decode paged attention | `zeus_backend.py:forward_decode` |
+| KV Cache | `store_kv_cache` | 写入 Zeus tiled KV cache | `zeus_memory_pool.py:set_kv_buffer` |
+| Position | `rotary_embedding` | RoPE 位置编码 | `rotary_embedding.py:forward_zeus` |
+| Norm | `rmsnorm` | RMSNorm | `layernorm.py:forward_zeus` |
+| Norm | `fused_add_rmsnorm` | residual add + RMSNorm 融合 | `layernorm.py:forward_zeus` |
+| Activation | `silu_and_mul` | SiLU + gate 乘法融合 | `activation.py:forward_zeus` |
+| Embedding | `embedding` | LocalMem 转置布局下的 embedding gather | 本地 Zeus manual 列出；当前代码需按实际接入情况确认 |
+| Sampling | `sampling_from_logits` | fused sampling from logits | `sampler.py` Zeus 分支 |
+| Sampling | `top_k_renorm_prob` | top-k 后概率重归一化 | `sampler.py` Zeus 分支 |
+| Sampling | `top_p_renorm_prob` | top-p 后概率重归一化 | `sampler.py` Zeus 分支 |
+| Sampling | `top_k_top_p_sampling_from_probs` | top-k + top-p 采样 | `sampler.py` Zeus 分支 |
+| Sampling | `min_p_sampling_from_probs` | min-p 采样 | `sampler.py` Zeus 分支 |
+
+补充说明：
+
+- `zeus_graph_integration_plan.md` 中已经验证过 7 个核心 decode graph 相关 op：
+  `rmsnorm`、`fused_add_rmsnorm`、`silu_and_mul`、`rotary_embedding`、
+  `store_kv_cache`、`decode_attention`、`embedding`。
+- 本地旧文档有“14 个算子”的口径，但展开表格显式列出的条目是上面这些。
+  当前 audit 以显式 kernel 名称和 SGLang 调用点为准。
+- `argmax` 当前走 `torch.argmax` / `torch_zeus` aten 路径，不再作为
+  `sgl_kernel_zeus` CPU bounce workaround 统计。
+
+### 2.3 仍缺失、并且仍影响当前代码的关键算子
 
 | 算子 | 当前影响 |
 |---|---|
-| `cumsum` | attention metadata、forward_batch_info、logits_processor |
 | `index.Tensor_out` / `tensor[indices]` | graph metadata、schedule_batch.filter、logits gather |
 | `clamp` | overlap、position |
 | `where` | overlap、NaN 替换 |
 | `arange(device=zeus)` | overlap、forward_batch_info |
 | `neg(int)` | overlap future index 标记 |
 
-### 2.3 关于 `argmax`
+### 2.4 关于 `argmax`
 
 本地旧文档存在时间差，但**当前代码现状**是：
 
@@ -448,23 +487,43 @@ Later batch preparation / later consumer resolves future ids
 
 参考：
 
+- [common.py:461](/root/workspace/sglang/python/sglang/srt/mem_cache/common.py:461)
+- [common.py:467](/root/workspace/sglang/python/sglang/srt/mem_cache/common.py:467)
 - [common.py:485](/root/workspace/sglang/python/sglang/srt/mem_cache/common.py:485)
 
 当前仍存在：
 
-- `locs = batch.seq_lens.cpu().to(batch.seq_lens.device)`
+- Zeus 分支仍通过 `req_to_token_cpu` mirror 读取 `last_loc`
+- 因为普通路径里的 `req_to_token[req_pool_indices, seq_lens - 1]` 依赖 `index(read)` / gather
+
+当前已清理：
+
+- `seq_lens_next` 不再走 `(sl_cpu + token_per_req).to(device)`
+- 已统一为 `seq_lens_next = batch.seq_lens + token_per_req`
+- `locs` 已经是 `batch.seq_lens.clone()`，不再有旧的 `seq_lens.cpu().to(device)` 写法
 
 为什么还在：
 
-- 这不是大头，但当前写法仍保留了 Zeus 特判
+- `aten::index_put` 只解决 `req_to_token` 写入，不解决这里的高级索引读取
+- 在 `index(read)` / gather 没确认可用前，直接删除整个 Zeus 分支会让 `last_loc` 回到 device 高级索引路径，风险较高
 
 能否直接删：
 
-- **可能可以**
+- **不能整段直接删**
+- 可以继续清理纯 `add/sub/clone` 这类小算术残留；目前本节相关的 `seq_lens_next` 已处理
 
 怎么消除：
 
-- 如果验证 `locs = batch.seq_lens.clone()` 在 Zeus 下已无问题，可直接统一到普通路径
+- 等 `index(read)` / gather 可用并验证后，把 `last_loc` 也统一到普通路径：
+
+```python
+last_loc = batch.req_to_token_pool.req_to_token[
+    batch.req_pool_indices, batch.seq_lens - 1
+]
+seq_lens_next = batch.seq_lens + token_per_req
+```
+
+- 或者补一个 Zeus 专用 `get_last_loc` kernel，只把 `last_loc` 读取搬到 device
 
 ---
 
@@ -535,13 +594,13 @@ Later batch preparation / later consumer resolves future ids
 
 - `self.extend_prefix_lens = (self.seq_lens.cpu() - 1).to(device)`
 - `torch.arange(...).to(device)`
-- `compute_position_torch()` 里的 CPU `arange + cumsum`
+- `compute_position_torch()` 里的 CPU `arange + 变长拼接`
 - `clamp_position()` 里的 CPU `clamp`
 
 为什么还在：
 
 - `arange(device)`、`clamp` 缺失
-- `compute_position_torch()` 仍混合 CPU `arange/cat`，不只依赖 `cumsum`
+- `compute_position_torch()` 仍混合动态 `arange`、变长拼接和 Python 循环；虽然 `cumsum` / `cat` 已支持，但该分支还不是纯 device tensor 表达
 
 能否直接删：
 
@@ -599,7 +658,6 @@ Later batch preparation / later consumer resolves future ids
 当前仍存在：
 
 - `seq_lens_cpu = ...cpu()`
-- `torch.cumsum(seq_lens_cpu, dim=0)`
 - `torch.arange(len(seq_lens_cpu))`
 - 用 Python `for` 循环逐行 `copy_(hidden[idx])`
 
@@ -607,7 +665,7 @@ Later batch preparation / later consumer resolves future ids
 
 - `index(read)` 缺失
 - `arange` 缺失
-- 虽然 `cumsum` 已支持，但该分支还依赖后续 gather / index 逻辑，所以暂不单独修改
+- 虽然 `cumsum` 已支持，但该分支当前把 prefix sum、`arange`、gather/index 逻辑混在 CPU 控制流里，所以不能只靠替换一行 `cumsum` 完成 device 化
 
 能否直接删：
 
@@ -615,9 +673,9 @@ Later batch preparation / later consumer resolves future ids
 
 怎么消除：
 
-- 补 `cumsum`
 - 补 `index(read)` / gather
 - `arange` 配套解决
+- 再把 prefix sum 留在 Zeus device 上，与 gather/index 路径一起重写
 
 ---
 
@@ -673,14 +731,14 @@ Later batch preparation / later consumer resolves future ids
 
 1. `radix_cache.py` 里的 `_cat_zeus()`
 2. `schedule_batch.py` 里的 `cat` CPU 分支
-3. `schedule_batch.py` / `common.py` 里仅依赖 `add/sub` 的小算术 Zeus 分支
+3. `schedule_batch.py` 里仅依赖 `add/sub` 的小算术 Zeus 分支
 
 这些项不依赖新 kernel，最容易清掉。
 
 ### P1：主链路第二阶段优化
 
 1. 继续减少 attention metadata 的 host 计算
-2. 视情况清理 `common.py` 里 `locs = seq_lens.cpu().to(device)` 这种轻量残留
+2. 等 `index(read)` / gather 可用后，再考虑删除 `common.py` 里的 `last_loc` mirror 读取分支
 
 ### P2：补缺失算子 / 应用已支持算子
 
@@ -691,24 +749,26 @@ Later batch preparation / later consumer resolves future ids
 3. `where`
 4. `clamp`
 5. `neg(int)`
-6. 将已支持的 `cumsum` 继续应用到 batch / logits 路径
+6. 清理仍停留在历史 CPU workaround 中的 `cumsum` 使用点
 
 ## 6.1 剩余 `cumsum` 调用点优先级表
 
-这里把当前 Zeus 还值得关注的 `cumsum` 调用点，按 `主链路 / batch / logits` 三类重新整理如下。
+`aten::cumsum` 已由 `torch_zeus` 支持。这里不再把 `cumsum` 当作缺失算子，
+而是把代码中仍值得关注的历史 CPU workaround 按 `主链路 / batch / logits`
+三类重新整理如下。
 
 | 类别 | 代表位置 | 当前作用 | 优先级 | 原因 |
 |------|----------|----------|--------|------|
 | 主链路 | [zeus_backend.py:100](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:100), [zeus_backend.py:149](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:149), [zeus_backend.py:168](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:168) | 构 `kv_indptr / qo_indptr` | 已处理 | 已改为 Zeus device `torch.cumsum`；剩余问题转为 `kv_indices` 的 ragged gather |
 | Batch | [forward_batch_info.py:1081](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1081), [forward_batch_info.py:1118](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1118) | 构 `prefix_chunk_cu_seq_lens`、`kv_indptr` | 已处理 | 这两处是纯 `cumsum` CPU 绕路，已改为 Zeus device `torch.cumsum` |
-| Batch | [forward_batch_info.py:1258](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1258) | 构 `extend_start_loc` | 暂不处理 | 该分支还混合 CPU `arange/cat`，不只依赖 `cumsum` |
+| Batch | [forward_batch_info.py:1258](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1258) | 构 `extend_start_loc` | 暂不处理 | 该分支还混合动态 `arange`、变长拼接和索引逻辑，不只依赖 `cumsum` |
 | Logits | [logits_processor.py:420](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/logits_processor.py:420) | 构最后 token 的线性下标 | 暂不处理 | 该分支还依赖 gather / index 逻辑，先不只改 `cumsum` |
 
 补充说明：
 
 - 主链路里的 `cumsum` 已经回到 Zeus device 上执行
 - 纯 `cumsum` 的 batch 路径已处理
-- logits 和混合 batch 路径还依赖其他 CPU/index 能力，暂不单独修改
+- logits 和混合 batch 路径还依赖其他 CPU/index 能力，不能只替换 `cumsum`
 - Paged KV metadata 的剩余 host 工作，核心已经变成 `kv_indices` 的 ragged gather
 
 ---
@@ -718,4 +778,4 @@ Later batch preparation / later consumer resolves future ids
 这份文档按最新代码重排后，最重要的变化是：
 
 > `req_to_token` 读写和 `kv_metadata` 相关的主链路大块 CPU bounce 已经被解决，不应再继续作为“当前未解决问题”统计。  
-> 现在更准确的说法是：主链路上已基本没有“不必要的大块 CPU bounce”，`kv_indptr / qo_indptr` 的 `cumsum` 也已 device 化；Paged KV metadata 剩余的 host 工作主要是 `kv_indices` ragged gather。此外真正残留的热点，主要是 batch / logits 上的 `cumsum`、`index(read)` 路径，以及 overlap 上的 `clamp/where/arange/neg` 小算子分支。
+> 现在更准确的说法是：主链路上已基本没有“不必要的大块 CPU bounce”，`kv_indptr / qo_indptr` 的 `cumsum` 也已 device 化；Paged KV metadata 剩余的 host 工作主要是 `kv_indices` ragged gather。此外真正残留的热点，主要是 batch / logits 上的 `index(read)` / gather 路径，以及 overlap 上的 `clamp/where/arange/neg` 小算子分支。
