@@ -48,6 +48,45 @@ if is_npu():
     NPU_ROTARY_MUL_MAX_HEAD_SIZE = 896
 
 
+# Process-lifetime contiguous mirrors used by `forward_zeus` to dodge the
+# graph-pool transient pitfall when materialising q/k from a strided split
+# view. Keyed by (id(rotary_module), "q"|"k", shape, dtype, device) — all
+# layers that share a single RotaryEmbedding instance reuse the same buffer,
+# which is safe because each layer fully consumes its rotary output (KV
+# cache write + attention) before the next layer overwrites the buffer.
+_ZEUS_ROTARY_QK_BUFS: dict = {}
+
+
+def _zeus_stable_contiguous(src: torch.Tensor, key_tag) -> torch.Tensor:
+    """Return a process-lifetime contiguous mirror of ``src``.
+
+    Fast path: ``src`` already contiguous → return it unchanged. Otherwise
+    cache a contiguous buffer keyed by (key_tag, shape, dtype, device) and
+    refresh its content from ``src`` via a *stride-aware add* — NOT
+    ``copy_``. Reason: Zeus's `copy_(non_contig_src)` falls into a CPU-bounce
+    path that is not recorded into a graph capture, so the stable buffer
+    would hold capture-time stale data at replay. `add_` on Zeus dispatches
+    through `TensorIteratorBridge` and is captured, so each replay refreshes
+    the buffer from the live strided source.
+    """
+    if src.is_contiguous():
+        return src
+    cache_key = (key_tag, tuple(src.shape), src.dtype, src.device)
+    buf = _ZEUS_ROTARY_QK_BUFS.get(cache_key)
+    if buf is None:
+        # First-time alloc lives outside graph capture (lazy-init at first
+        # forward, which is during a warmup step before capture starts).
+        buf = torch.zeros(src.shape, dtype=src.dtype, device=src.device)
+        _ZEUS_ROTARY_QK_BUFS[cache_key] = buf
+    # `buf.zero_(); buf.add_(src)` — both ops go through Zeus's
+    # TensorIterator dispatch and are captured, so replay refreshes buf from
+    # the *current* src content. zero_ on bf16 is a normal kernel (the int /
+    # bool fill_ workaround does not apply here).
+    buf.zero_()
+    buf.add_(src, alpha=1.0)
+    return buf
+
+
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
@@ -242,8 +281,23 @@ class RotaryEmbedding(CustomOp):
             positions = positions + offsets
 
         from sgl_kernel_zeus import rotary_embedding
-        query = query.contiguous()
-        key = key.contiguous()
+        # qkv_proj output is split with `torch.split` along the last dim, so
+        # the `query` / `key` we receive are strided views (non-contiguous in
+        # the last dim). Calling `.contiguous()` on Zeus dispatches into
+        # `copy_` which — for a same-device non-contiguous source — falls
+        # into a synchronous CPU-bounce path that is *not* recorded into the
+        # captured graph. Under graph capture that means the contiguous mirror
+        # ends up holding capture-time stale K/V data on every replay (the
+        # rotary kernel reads from the baked transient address; the eventual
+        # set_kv_buffer write therefore stamps stale K/V into the persistent
+        # KV cache, decode logits collapse, and output gets stuck on a single
+        # repeated token). Route through a process-lifetime stable buffer
+        # whose content is refreshed via stride-aware `add_` (captured into
+        # the graph because Zeus add goes through TensorIteratorBridge),
+        # so the captured rotary kernel reads from a stable address whose
+        # content updates every replay.
+        query = _zeus_stable_contiguous(query, (id(self), "q"))
+        key = _zeus_stable_contiguous(key, (id(self), "k"))
         rotary_embedding(
             positions.flatten(),
             query,

@@ -963,7 +963,13 @@ class LogitsProcessor(nn.Module):
 
         if logits_metadata.next_token_logits_buffer is not None:
             logits_buffer = logits_metadata.next_token_logits_buffer
-            assert logits_buffer.dtype == torch.float
+            # On Zeus the buffer matches the model dtype (bf16) so the
+            # captured `copy_` stays on the dtype-matching device-side fast
+            # path; other backends keep the historical float32 buffer.
+            assert logits_buffer.dtype in (torch.float, logits.dtype), (
+                f"next_token_logits_buffer dtype {logits_buffer.dtype} "
+                f"is incompatible with logits dtype {logits.dtype}"
+            )
             logits_buffer.copy_(logits[:, : self.config.vocab_size])
             logits = logits_buffer
         else:

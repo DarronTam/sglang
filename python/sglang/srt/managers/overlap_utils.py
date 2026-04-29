@@ -66,8 +66,13 @@ class FutureMap:
         self.buf_initialized = False
 
         if self.spec_algo.is_none():
+            # Zeus chip rule: no int64 device-side. token_ids_buf and the
+            # future_indices it pairs with must share dtype because
+            # _resolve_future_token_ids does torch.where(ids<0, buf[...], ids)
+            # which requires matching dtypes between branches.
+            buf_dtype = torch.int32 if _is_zeus else torch.int64
             self.token_ids_buf = torch.empty(
-                (self.future_buffer_len,), dtype=torch.int64, device=self.device
+                (self.future_buffer_len,), dtype=buf_dtype, device=self.device
             )
 
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
@@ -116,7 +121,10 @@ class FutureMap:
         start = cur_future_ct + 1
         end = cur_future_ct + 1 + bs
         if _is_zeus:
-            indices = torch.arange(start, end, dtype=torch.int64).to(self.device)
+            # Match token_ids_buf dtype (int32) — the negation of these
+            # indices ends up in batch.output_ids → batch.input_ids on the
+            # next decode step, which Zeus requires as int32 device-side.
+            indices = torch.arange(start, end, dtype=torch.int32).to(self.device)
         else:
             indices = torch.arange(start, end, dtype=torch.int64, device=self.device)
         return FutureIndices(indices=indices, interval=slice(start, end))

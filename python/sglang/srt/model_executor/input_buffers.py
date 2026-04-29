@@ -101,8 +101,20 @@ class GraphInputBuffers:
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
     ) -> "GraphInputBuffers":
+        # Zeus chip cannot operate on int64 / fp64 device-side. The
+        # graph-mode rotary/embedding bindings rely on int32 indices on the
+        # fast path; an int64→int32 `copy_` inside graph capture goes through
+        # synchronous CPU bounce on Zeus (TensorOps.cpp:copy_) which is *not*
+        # recorded into the graph, so replay would read stale capture-time
+        # values and decode silently produces garbage. Allocate index buffers
+        # as int32 here so the per-replay populate happens *outside* the
+        # captured graph and the bindings see int32 with no cast.
+        indices_dtype = (
+            torch.int32 if torch.device(device).type == "zeus" else torch.int64
+        )
+
         with torch.device(device):
-            input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
+            input_ids = torch.zeros((max_num_token,), dtype=indices_dtype)
             input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int32)
             seq_lens = create_filled_tensor(
@@ -112,8 +124,8 @@ class GraphInputBuffers:
                 device=device,
             )
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
-            positions = torch.zeros((max_num_token,), dtype=torch.int64)
-            mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
+            positions = torch.zeros((max_num_token,), dtype=indices_dtype)
+            mrope_positions = torch.zeros((3, max_num_token), dtype=indices_dtype)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
             custom_mask = create_filled_tensor(
                 (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
@@ -123,7 +135,15 @@ class GraphInputBuffers:
             )
             next_token_logits_buffer = torch.zeros(
                 (max_num_token, vocab_size),
-                dtype=torch.float,
+                # Zeus chip rule: a `copy_` writing logits (bf16, from
+                # lm_head) into a float32 buffer crosses dtypes and falls
+                # into the synchronous CPU-bounce path, which is *not*
+                # recorded into the captured graph. The buffer would then
+                # hold capture-time logits at every replay, decode logits
+                # collapse to a fixed token. Match the model dtype on Zeus
+                # so the copy stays on the dtype-matching D2D fast path
+                # (zenlMemcpy, captured). Other backends keep float32.
+                dtype=dtype if torch.device(device).type == "zeus" else torch.float,
             )
 
             if pp_size > 1:

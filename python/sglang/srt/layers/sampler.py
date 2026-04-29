@@ -237,6 +237,19 @@ class Sampler(nn.Module):
                 group=self.tp_sync_group,
             )
 
+        # Zeus chip rule: no int64 device-side. argmax / multinomial /
+        # gather-based sampling all return int64 by default; on Zeus this
+        # would land in `batch.output_ids`, get reassigned to
+        # `self.input_ids = self.output_ids` for the next decode step, and
+        # trip ZeusGraphRunner's int32 guard at replay. Cast at the sampler
+        # boundary instead. Token IDs trivially fit in int32 (vocab size <
+        # 2^31), so no value loss.
+        if (
+            batch_next_token_ids.device.type == "zeus"
+            and batch_next_token_ids.dtype != torch.int32
+        ):
+            batch_next_token_ids = batch_next_token_ids.to(torch.int32)
+
         return batch_next_token_ids
 
     def compute_logprobs_only(

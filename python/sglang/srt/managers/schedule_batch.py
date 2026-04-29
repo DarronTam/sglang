@@ -78,6 +78,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    zeus_index_dtype,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -1293,23 +1294,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             pt += req.extend_input_len
 
         # Reassign
-        self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int64).to(
+        idx_dtype = zeus_index_dtype(self.device)
+        self.input_ids = torch.tensor(sum(input_ids, []), dtype=idx_dtype).to(
             self.device, non_blocking=True
         )
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64).to(
+        self.seq_lens = torch.tensor(seq_lens, dtype=idx_dtype).to(
             self.device, non_blocking=True
         )
         self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
 
         if not decoder_out_cache_loc:
-            self.out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
+            self.out_cache_loc = torch.zeros(0, dtype=idx_dtype).to(
                 self.device, non_blocking=True
             )
         else:
             self.out_cache_loc = torch.cat(decoder_out_cache_loc)
 
         if not encoder_out_cache_loc:
-            self.encoder_out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
+            self.encoder_out_cache_loc = torch.zeros(0, dtype=idx_dtype).to(
                 self.device, non_blocking=True
             )
         else:
@@ -1348,10 +1350,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             r.token_type_ids for r in reqs if r.token_type_ids is not None
         ]
 
+        idx_dtype = zeus_index_dtype(self.device)
         input_ids_tensor = torch.tensor(
-            list(chain.from_iterable(input_ids)), dtype=torch.int64
+            list(chain.from_iterable(input_ids)), dtype=idx_dtype
         ).to(self.device, non_blocking=True)
-        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(
+        seq_lens_tensor = torch.tensor(seq_lens, dtype=idx_dtype).to(
             self.device, non_blocking=True
         )
         seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
@@ -1701,11 +1704,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_idle(self):
         self.forward_mode = ForwardMode.IDLE
-        self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
+        idx_dtype = zeus_index_dtype(self.device)
+        self.input_ids = torch.empty(0, dtype=idx_dtype, device=self.device)
+        self.seq_lens = torch.empty(0, dtype=idx_dtype, device=self.device)
         self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
         self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
-        self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.out_cache_loc = torch.empty(0, dtype=idx_dtype, device=self.device)
         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0

@@ -19,6 +19,63 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
 
+# ---------------------------------------------------------------------------
+# Stable per-(layer, role, shape) contiguous buffers for set_kv_buffer.
+#
+# qkv_proj produces a single output tensor that is split with `torch.split`
+# along the last dim into (q, k, v); the resulting k / v are *strided views*
+# (non-contiguous along the last dim). store_kv_cache requires contiguous
+# input, so we used to call `.contiguous()` inside set_kv_buffer — but under
+# graph capture that allocation lands in the graph private pool, gets baked
+# into the captured kernel's args, then released back to the pool when
+# set_kv_buffer returns. The next captured kernel reuses that memory and
+# overwrites the K/V data; on replay the captured store_kv_cache reads the
+# overwritten transient and writes garbage into the persistent KV cache —
+# attention then always sees its capture-time (zeroed/warmup) state, decode
+# logits become stable, and output collapses to a single repeated token.
+#
+# Fix mirrors the rotary / embedding stable-buffer pattern: cache one
+# process-lifetime contiguous buffer per (layer_id, "k"/"v", tuple(shape)),
+# and copy the strided source into it. The captured store_kv_cache kernel
+# reads from the stable address; replay updates that buffer in-place via
+# the captured copy_, so the K/V data flowing into KV cache is always fresh.
+# ---------------------------------------------------------------------------
+_KV_CONTIG_BUFS: dict = {}
+
+
+def _stable_contiguous(src: torch.Tensor, key_tag) -> torch.Tensor:
+    """Return a process-lifetime contiguous mirror of ``src``.
+
+    No-op fast path when ``src`` is already contiguous (avoids the wasted
+    copy and keeps eager mode at zero overhead). When a copy is needed, the
+    destination buffer is reused across calls keyed by
+    ``(layer_id, "k"/"v", shape, dtype, device)`` so its data_ptr is stable
+    across capture and replay. The buffer is refreshed via stride-aware
+    `add_` (captured into the graph through TensorIteratorBridge dispatch),
+    NOT via `copy_` — Zeus's `copy_(non_contig_src)` falls into a CPU-bounce
+    path that is not recorded into the capture, so a copy_-based mirror
+    would hold capture-time stale K/V data at replay (decode logits collapse,
+    output sticks on a single repeated token).
+    """
+    if src.is_contiguous():
+        return src
+    cache_key = (key_tag, tuple(src.shape), src.dtype, src.device)
+    buf = _KV_CONTIG_BUFS.get(cache_key)
+    if buf is None:
+        # First-time alloc lives outside graph capture (lazy-init at first
+        # forward). Use zeros so the first add_ produces correct content.
+        buf = torch.zeros(src.shape, dtype=src.dtype, device=src.device)
+        _KV_CONTIG_BUFS[cache_key] = buf
+    # `buf.zero_(); buf.add_(src)` — both go through Zeus's TensorIterator
+    # dispatch and are captured into the graph, so replay refreshes buf from
+    # the *current* strided src content rather than reading capture-time stale
+    # data. zero_ on bf16 is a normal kernel (the int/bool fill_ workaround
+    # does not apply to bf16).
+    buf.zero_()
+    buf.add_(src, alpha=1.0)
+    return buf
+
+
 class ZeusTokenToKVPool(MHATokenToKVPool):
     """KV cache pool for Zeus NPU with paged tiled memory layout.
 
@@ -90,8 +147,8 @@ class ZeusTokenToKVPool(MHATokenToKVPool):
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 
-        cache_k = cache_k.contiguous()
-        cache_v = cache_v.contiguous()
+        cache_k = _stable_contiguous(cache_k, (layer_id, "k"))
+        cache_v = _stable_contiguous(cache_v, (layer_id, "v"))
 
         store_kv_cache(
             self.k_buffer[layer_id - self.start_layer],

@@ -479,8 +479,15 @@ class VocabParallelEmbedding(torch.nn.Module):
         # Zeus: embedding weight stays in GDG, standard (N,K) row-major.
         # ATen aten::embedding dispatch handles it via zenl_embedding.
         # Get the embeddings.
+        # Zeus chip rule: int32 indices only. The legacy `.long()` cast below
+        # was ATen-convention defensive coding; on Zeus it would force int32
+        # input_ids back to int64 → trip the embedding-internal capture guard.
+        # Skip the cast on Zeus and let the dispatch consume int32 directly.
+        embed_input = (
+            masked_input if masked_input.device.type == "zeus" else masked_input.long()
+        )
         with use_symmetric_memory(get_tp_group(), disabled=not self.enable_tp):
-            output_parallel = self.quant_method.embedding(self, masked_input.long())
+            output_parallel = self.quant_method.embedding(self, embed_input)
 
         if self.tp_size > 1:
             # Mask the output embedding.

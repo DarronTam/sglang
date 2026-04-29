@@ -130,7 +130,10 @@ class ZeusPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             out_pages[:, None] * self.page_size
             + torch.arange(self.page_size)
         ).reshape(-1)
-        return out_indices.to(self._zeus_device)
+        # Zeus chip rule: no int64 device-side. KV-cache slot index trivially
+        # fits in int32 (max_total_num_tokens << 2^31). CPU-side dtype cast
+        # before H2D keeps the device-side copy_ on the same-dtype fast path.
+        return out_indices.to(torch.int32).to(self._zeus_device)
 
     def alloc_extend(
         self,
@@ -160,7 +163,8 @@ class ZeusPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         _alloc_extend_naive(pl, sl, ll, self.free_pages, out_indices, self.page_size)
 
         self.free_pages = self.free_pages[num_new_pages:]
-        return out_indices.to(self._zeus_device)
+        # Zeus int32 collapse — see alloc() for rationale.
+        return out_indices.to(torch.int32).to(self._zeus_device)
 
     def alloc_decode(
         self,
@@ -192,7 +196,8 @@ class ZeusPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             ] * self.page_size * need_new_pages
 
         self.free_pages = self.free_pages[num_new_pages:]
-        return out_indices.to(self._zeus_device)
+        # Zeus int32 collapse — see alloc() for rationale.
+        return out_indices.to(torch.int32).to(self._zeus_device)
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:

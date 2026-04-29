@@ -69,6 +69,28 @@ if TYPE_CHECKING:
 _is_npu = is_npu()
 
 
+def zeus_index_dtype(
+    device: torch.device | str | None = None,
+    default: torch.dtype = torch.int64,
+) -> torch.dtype:
+    """Index/position-tensor dtype for the given device.
+
+    Zeus chip cannot operate on int64 / fp64 device-side. Constructing index
+    tensors as int64 on Zeus forces every downstream binding to either
+    CPU-bounce (`copy_` dtype-converting path) or hit a stable-buffer
+    fallback that is *not* recorded into a captured graph — both lose
+    correctness or perf at replay time. Use int32 throughout instead.
+
+    Pass `device=None` to query the global Zeus mode (cheap; uses
+    `SGLANG_DEVICE` / `torch_zeus` import). Pass an explicit device when the
+    construction site knows where the tensor will land — that path also works
+    when the env-var fallback is wrong (e.g. test rigs that switch backends).
+    """
+    if device is not None:
+        return torch.int32 if torch.device(device).type == "zeus" else default
+    return torch.int32 if _is_zeus else default
+
+
 class ForwardMode(IntEnum):
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
     # It is also called "prefill" in common terminology.
@@ -466,7 +488,9 @@ class ForwardBatch:
             ).to(device, non_blocking=True)
 
         if ret.forward_mode.is_idle():
-            ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+            ret.positions = torch.empty(
+                (0,), dtype=zeus_index_dtype(device), device=device
+            )
             return ret
 
         # Override the positions with diffusion LLM or spec_info
@@ -608,6 +632,7 @@ class ForwardBatch:
         # TODO support batched deltas
         batch_size = self.seq_lens.shape[0]
         device = model_runner.device
+        idx_dtype = zeus_index_dtype(device)
         mm_inputs = batch.multimodal_inputs
 
         if batch.forward_mode.is_draft_extend():  # draft_extend_after_decode
@@ -617,11 +642,11 @@ class ForwardBatch:
                 extend_seq_len = batch.extend_seq_lens[batch_idx]
                 extend_lens.append(extend_seq_len)
                 mrope_delta = (
-                    torch.zeros(1, dtype=torch.int64)
+                    torch.zeros(1, dtype=idx_dtype)
                     if mm_inputs[batch_idx] is None
                     else mm_inputs[batch_idx].mrope_position_delta.squeeze(0)
                 )
-                mrope_deltas.append(mrope_delta.to(device=device))
+                mrope_deltas.append(mrope_delta.to(device=device, dtype=idx_dtype))
             position_chunks = torch.split(batch.spec_info.positions, extend_lens)
             mrope_positions_list = [
                 pos_chunk + delta
@@ -635,18 +660,20 @@ class ForwardBatch:
             seq_positions = batch.spec_info.positions.view(batch_size, -1)
             mrope_deltas = [
                 (
-                    torch.tensor([0], dtype=torch.int64)
+                    torch.tensor([0], dtype=idx_dtype)
                     if mm_inputs[i] is None
                     else mm_inputs[i].mrope_position_delta.squeeze(0)
                 )
                 for i in range(batch_size)
             ]
-            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(
+                device=device, dtype=idx_dtype
+            )
             next_input_positions = (
                 (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
             )
 
-        self.mrope_positions = next_input_positions
+        self.mrope_positions = next_input_positions.to(dtype=idx_dtype, device=device)
 
     def _expand_mrope_from_input(
         self,
@@ -665,7 +692,7 @@ class ForwardBatch:
         mrope_positions = (
             (mrope_position_deltas + seq_len - 1).unsqueeze(0).repeat(3, 1)
         )
-        return mrope_positions
+        return mrope_positions.to(dtype=zeus_index_dtype(device), device=device)
 
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
@@ -681,7 +708,7 @@ class ForwardBatch:
                     mrope_positions_list[batch_idx] = torch.full(
                         (3, 1),
                         self.seq_lens[batch_idx] - 1,
-                        dtype=torch.int64,
+                        dtype=zeus_index_dtype(model_runner.device),
                         device=model_runner.device,
                     )
                 else:
@@ -706,7 +733,8 @@ class ForwardBatch:
                                 )
                             ]
                         ]
-                        * 3
+                        * 3,
+                        dtype=zeus_index_dtype(model_runner.device),
                     )
                 else:
                     mrope_positions = mm_input.mrope_positions[
@@ -722,7 +750,7 @@ class ForwardBatch:
         self.mrope_positions = torch.cat(
             [pos.to(device=model_runner.device) for pos in mrope_positions_list],
             dim=1,
-        ).to(dtype=torch.int64, device=model_runner.device)
+        ).to(dtype=zeus_index_dtype(model_runner.device), device=model_runner.device)
 
     def get_max_chunk_capacity(self):
         # Maximum number of tokens in each chunk
@@ -1248,7 +1276,9 @@ def compute_position_torch(
         )
         extend_start_loc = torch.zeros_like(s_cpu)
         extend_start_loc[1:] = torch.cumsum(s_cpu[:-1], dim=0)
-        return positions.to(torch.int64).to(device), extend_start_loc.to(device)
+        # Zeus chip rule: no int64 device-side. Cast on CPU first, then a
+        # single dtype-matching H2D transfer (no CPU bounce on the device).
+        return positions.to(torch.int32).to(device), extend_start_loc.to(device)
     positions = torch.cat(
         [
             torch.arange(
@@ -1267,7 +1297,9 @@ def compute_position_torch(
 def clamp_position(seq_lens):
     if _is_zeus:
         device = seq_lens.device
-        return torch.clamp((seq_lens.cpu() - 1), min=0).to(torch.int64).to(device)
+        # Zeus chip rule: no int64 device-side. Cast to int32 on CPU
+        # before the H2D transfer so the result is int32 on Zeus.
+        return torch.clamp((seq_lens.cpu() - 1), min=0).to(torch.int32).to(device)
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 
 

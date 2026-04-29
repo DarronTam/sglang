@@ -428,9 +428,11 @@ class TpModelWorker(BaseTpWorker):
             if model_worker_batch.is_prefill_only:
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens
+                # Match the input_ids dtype so the dummy survives Zeus's int32
+                # rule (input_ids is int32 on Zeus, int64 elsewhere).
                 batch_result.next_token_ids = torch.zeros(
                     len(model_worker_batch.seq_lens),
-                    dtype=torch.long,
+                    dtype=model_worker_batch.input_ids.dtype,
                     device=model_worker_batch.input_ids.device,
                 )
                 if (
