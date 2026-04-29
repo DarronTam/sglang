@@ -1,97 +1,325 @@
 # SGLang on Zeus — Install & Launch Guide
 
-This document describes how to install and run SGLang on a pure-Zeus (no CUDA)
-box. It is the zeus counterpart of the AMD (`srt_hip`) / NPU (`srt_npu`) flows
-documented in `python/pyproject_other.toml`.
+This document is the **pure-Zeus (no CUDA)** install path for SGLang. It is the
+zeus counterpart of the AMD (`srt_hip`) / NPU (`srt_npu`) flows defined in
+`python/pyproject_other.toml`.
 
-## 1. Prerequisites
+The flow below has been **smoke-tested end-to-end** on a clean Python 3.13
+miniconda environment — every step includes the exact command that worked,
+plus the gotchas it took to discover them. Follow it top-to-bottom on a fresh
+box and you should land on a working zeus install without surprises.
 
-Zeus support depends on two internal packages that are currently **in
-development** and **not published to PyPI or any public index**:
+> **Pinned versions known to work together (2026-04-28)**
+> | Package | Version |
+> | --- | --- |
+> | python | 3.13.x |
+> | torch | `2.9.0+cpu` (PyTorch CPU index) |
+> | torchvision | `0.24.0+cpu` (PyTorch CPU index) |
+> | triton | `3.6.0` (PyPI, OK for documented launch flags) |
+> | sglang | `0.5.6.post2` (editable, `srt_zeus` extra) |
+> | torch_zeus + sgl_kernel_zeus | local source |
 
-| Package            | Provides                                               | Where it lives              |
-| ------------------ | ------------------------------------------------------ | --------------------------- |
-| `torch_zeus`       | the `torch.zeus` device, CPU-fallback shim, pack_weights | internal source tree        |
-| `sgl_kernel_zeus`  | fused rmsnorm / silu_and_mul / store_kv_cache / etc.   | internal source tree        |
+## Quick start
 
-Until these are released, they must be installed **from their local source
-trees** before you install the SGLang extra. A canonical working layout on the
-dev box is:
-
-```
-/root/project/
-├── torch_zeus/                 # torch_zeus source
-│   └── sgl-kernel-zeus/python/ # sgl_kernel_zeus source
-└── sglang/                     # this repo
-```
-
-### Installing `torch_zeus` and `sgl_kernel_zeus`
+If you already have `torch_zeus` and `sgl_kernel_zeus` installed from their
+source trees and a Python 3.13 venv active (see §0–§1 if not), the SGLang side
+is one script:
 
 ```bash
-# 1. torch_zeus (provides torch.zeus device)
-cd /root/project/torch_zeus
+bash zeus_dev/setup_zeus_dev.sh
+```
+
+That script mirrors the AMD / Ascend-NPU install flow upstream documents in
+`docs/platforms/amd_gpu.md` / `docs/platforms/ascend_npu.md` — it `rm + mv`s
+`python/pyproject.toml` aside, then runs `pip install -e "python[srt_zeus]"`.
+After it succeeds you still need §2a (repair torch/torchvision) and §3 (HF
+cache). Sections §0–§7 below walk through the same steps manually with full
+explanations.
+
+To return to upstream-clean state before pulling new sglang commits:
+```bash
+git checkout python/pyproject.toml python/pyproject_other.toml
+```
+
+## 0. Prerequisites and box layout
+
+Pick a project root that holds all the source trees. The rest of this doc
+assumes you have exported `ZEUS_ROOT` to point at it, plus an `HF_CACHE_DIR`
+on a writable data partition:
+
+```bash
+export ZEUS_ROOT=/path/to/your/zeus_workspace
+export HF_CACHE_DIR=/path/to/your/hf_cache
+```
+
+Expected layout under `$ZEUS_ROOT`:
+
+```
+$ZEUS_ROOT/
+├── torch_zeus/                  # torch_zeus source (provides torch.zeus)
+│   └── sgl-kernel-zeus/python/  # sgl_kernel_zeus source (fused kernels)
+├── sglang/                      # this repo (pyproject_other.toml lives here)
+└── triton_qmnpu/                # optional: custom triton 3.4.x source
+```
+
+You also need:
+
+- **Rust toolchain** (for building `outlines_core==0.1.26` from sdist; no cp313
+  wheel is published). If `~/.cargo/bin/rustup` already exists but no toolchain
+  is installed, just run `rustup toolchain install stable`. Otherwise install
+  rustup with the standard one-liner from <https://rustup.rs>:
+  ```bash
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+  export PATH="$HOME/.cargo/bin:$PATH"
+  ```
+  Verify with `cargo --version` (should print `cargo 1.95.x` or newer).
+  > Why: `outlines==0.1.11` (pinned by `runtime_common`) hard-pins
+  > `outlines_core==0.1.26`, and 0.1.26 ships an sdist that requires a Rust
+  > compiler to build. Newer `outlines_core` (0.2.x) has cp313 wheels but
+  > `outlines==0.1.11` won't accept them.
+
+- **Network reachability** for `huggingface.co`, `pypi.org`,
+  `download.pytorch.org`, and `static.rust-lang.org`. Test with
+  `curl -m 8 -sI <url>` before starting.
+
+## 1. Install `torch_zeus` and `sgl_kernel_zeus` (must come first)
+
+These two packages are unreleased internal packages — they are NOT on PyPI
+and the `srt_zeus` extra deliberately does **not** reference them, so they
+must be installed from source before the SGLang extra:
+
+```bash
+# 1a. torch_zeus (provides the torch.zeus device + CPU-fallback shim + pack_weights)
+cd "$ZEUS_ROOT/torch_zeus"
 pip install -e .
 
-# 2. sgl_kernel_zeus (fused kernels)
-cd /root/project/torch_zeus/sgl-kernel-zeus/python
+# 1b. sgl_kernel_zeus (fused rmsnorm / silu_and_mul / store_kv_cache / etc.)
+cd "$ZEUS_ROOT/torch_zeus/sgl-kernel-zeus/python"
 pip install -e .
 ```
 
-Smoke-test them in isolation before moving on:
+Smoke-test in isolation:
 
 ```bash
 python -c "
 import torch_zeus, torch_zeus._C
 import sgl_kernel_zeus
 import torch
+print('torch:', torch.__version__)
 print('torch.zeus.is_available:', torch.zeus.is_available())
 print('zeus device count:', torch.zeus.device_count())
 "
 ```
 
-Both imports must succeed without a circular-import warning. If you see
+Expected:
+
+```
+torch: 2.9.0+cpu
+torch.zeus.is_available: True
+zeus device count: 1
+```
+
+If you see
 `Failed to import C++ extension: cannot import name '_C' from partially
-initialized module 'torch_zeus'`, re-pull `torch_zeus` — that circular import
+initialized module 'torch_zeus'`, re-pull `torch_zeus` — the circular import
 was fixed upstream on 2026-04-15.
+
+> **Critical**: note the exact `torch.__version__` printed here. `torch_zeus._C`
+> and `sgl_kernel_zeus` are C++ extensions compiled against this specific
+> torch ABI. The next step (installing SGLang) will try to upgrade torch and
+> break that ABI — we'll roll it back manually.
 
 ## 2. Install SGLang with the `srt_zeus` extra
 
 SGLang ships two pyproject files:
 
-- `python/pyproject.toml` — the default **CUDA** build. Pulls in
-  `cuda-python`, `flashinfer_python`, `sgl-kernel`, `nvidia-*`,
-  `torch_memory_saver`. **Do not use this on zeus.**
-- `python/pyproject_other.toml` — the "other hardware" build. Contains
-  `srt_hip` / `srt_npu` / `srt_hpu` and, as of 2026-04-15, `srt_zeus`.
+- `python/pyproject.toml` — default **CUDA** build. Pulls in `cuda-python`,
+  `flashinfer_python`, `sgl-kernel`, `nvidia-*`, `torch_memory_saver`. **Do not
+  use this on zeus.**
+- `python/pyproject_other.toml` — non-CUDA hardware. Defines `srt_hip`,
+  `srt_npu`, `srt_hpu`, and (since 2026-04-15) `srt_zeus`.
 
-Install with:
-
-```bash
-cd /root/project/sglang
-ln -sf pyproject_other.toml python/pyproject.toml   # switch pyproject
-pip install -e "python[srt_zeus]"
-```
-
-Or, if you prefer to keep `pyproject.toml` pointing at the CUDA build, use the
-`--config-settings` trick:
+Swap them — same pattern upstream uses for AMD (`docs/platforms/amd_gpu.md:57`)
+and Ascend-NPU (`docs/platforms/ascend_npu.md:96`):
 
 ```bash
-cd /root/project/sglang/python
-pip install -e . \
-  --config-settings editable_mode=compat \
-  --config-settings pyproject=pyproject_other.toml
-# then manually trigger the extra:
-pip install "sglang[srt_zeus] @ ."
+cd "$ZEUS_ROOT/sglang"
+rm -rf python/pyproject.toml
+mv python/pyproject_other.toml python/pyproject.toml
 ```
 
-The `srt_zeus` extra deliberately only lists `runtime_common` + `torch`. It
-does **not** try to pin `torch_zeus` or `sgl_kernel_zeus`, because those are
-unreleased — you must install them from source first (step 1).
+Verify:
+```bash
+ls -l python/pyproject.toml
+# regular file ~4.2 KB, head should show "[project] name = \"sglang\"" with
+# the srt_hip/srt_npu/srt_hpu/srt_zeus extras visible
+head -20 python/pyproject.toml
+```
 
-## 3. Launch the server
+Then install:
 
-Set `SGLANG_DEVICE=zeus` so SGLang's internal `is_cuda()` / `is_zeus()`
-dispatch picks the zeus branch even on a box where CUDA is also available:
+```bash
+pip install -e "python[srt_zeus]" --no-build-isolation
+```
+
+This will compile `outlines_core==0.1.26` from sdist (~1–2 min with Rust
+available) and install ~80 packages. Expect output ending with
+`Successfully installed ... sglang-0.5.6.post2 ...`.
+
+> **Going back to upstream-clean state** (e.g. before `git pull` to grab new
+> sglang commits): `git checkout python/pyproject.toml python/pyproject_other.toml`.
+> Then re-run the swap + pip install above to land back in zeus mode. This is
+> the same workflow AMD / NPU users follow on every upstream rebase.
+
+### 2a. Repair: torch and torchvision get clobbered
+
+`srt_zeus = ["sglang[runtime_common]", "torch"]` does **not** pin torch, and
+`runtime_common`'s `torchao==0.9.0` chain-pulls `torchvision` plus the full
+`nvidia-*-cu13` / `cuda-toolkit` / `cuda-bindings` stack. The result on a
+zeus box is:
+
+| Package | Before step 2 | After step 2 (broken) |
+| --- | --- | --- |
+| torch | `2.9.0+cpu` | `2.11.0+cu130` |
+| torchvision | _not installed_ | `0.26.0` (cu13) |
+| triton | `3.4.0+git657efd5d` (custom, if you had it) | `3.6.0` (PyPI) |
+
+The new torch breaks `torch_zeus._C` with
+`undefined symbol: _ZN3c104impl12PyObjectSlotD1Ev`. You **must** roll torch
+back. Run these three commands immediately after step 2:
+
+```bash
+# Drop the cu13 torchvision (will reinstall the cpu wheel below)
+pip uninstall -y torchvision
+
+# Force-reinstall torch 2.9.0+cpu without re-resolving deps
+pip install --force-reinstall --no-deps \
+  torch==2.9.0+cpu \
+  --index-url https://download.pytorch.org/whl/cpu
+
+# Reinstall a cpu-paired torchvision (REQUIRED — see note below)
+pip install --no-deps \
+  torchvision==0.24.0 \
+  --index-url https://download.pytorch.org/whl/cpu
+```
+
+> **Why torchvision is required**: SGLang's import chain unconditionally hits
+> `import torchvision.transforms as T` from
+> `python/sglang/srt/multimodal/internvl_utils.py`, which is loaded eagerly
+> via `sglang/srt/configs/__init__.py → nano_nemotron_vl.py`. Skipping
+> torchvision will make `import sglang` fail with `ModuleNotFoundError: No
+> module named 'torchvision'`. Pin to `0.24.0+cpu` because that wheel is
+> built against `torch 2.9.0` and won't drag torch back to 2.11.
+
+### 2b. Verify after repair
+
+```bash
+python -c "
+import torch, torchvision, torch_zeus, torch_zeus._C, sgl_kernel_zeus
+print('torch:', torch.__version__)
+print('torchvision:', torchvision.__version__)
+print('torch.zeus.is_available:', torch.zeus.is_available())
+print('zeus device count:', torch.zeus.device_count())
+import sglang.srt
+import sglang
+print('sglang:', sglang.__version__)
+print('OK')
+"
+```
+
+Expected:
+```
+torch: 2.9.0+cpu
+torchvision: 0.24.0+cpu
+torch.zeus.is_available: True
+zeus device count: 1
+sglang: 0.5.6.post2
+OK
+```
+
+### 2c. Things left over but harmless
+
+- **`triton 3.6.0` (PyPI)** replaces any custom `triton 3.4.x` that may have
+  been built from `$ZEUS_ROOT/triton_qmnpu`. This is **OK** for the documented
+  launch flags (`--attention-backend torch_native --sampling-backend pytorch
+  --disable-cuda-graph`) and for `demo_zeus_layer_compare.py` (all 13 stages
+  PASS with stock triton). Rebuild the custom triton only if you later need
+  a triton-backed code path:
+  ```bash
+  cd "$ZEUS_ROOT/triton_qmnpu/python"
+  pip install -e .   # 20–60 min LLVM/C++ build
+  ```
+- **`nvidia-cublas-cu13`, `nvidia-cudnn-cu13`, `nvidia-nccl-cu13`,
+  `cuda-toolkit`, `cuda-bindings`, etc.** were pulled in by torchao /
+  torchvision dep chains. They sit on disk (~2 GB) but the zeus path never
+  loads them. Safe to ignore, or run
+  `pip uninstall -y nvidia-cublas-cu13 nvidia-cudnn-cu13 nvidia-nccl-cu13
+  nvidia-cusparselt-cu13 nvidia-curand-cu13 nvidia-cusolver-cu13
+  nvidia-cusparse-cu13 nvidia-cufft-cu13 nvidia-cufile-cu13
+  nvidia-cuda-runtime-cu13 nvidia-cuda-nvrtc-cu13 nvidia-cuda-cupti-cu13
+  nvidia-nvjitlink-cu13 nvidia-nvtx-cu13 nvidia-nvshmem-cu13 cuda-toolkit
+  cuda-bindings cuda-pathfinder` if you want the disk back.
+
+## 3. HuggingFace cache location
+
+Point HF cache at a writable data partition (do **not** use
+`~/.cache/huggingface` if home is on a small volume):
+
+```bash
+mkdir -p "$HF_CACHE_DIR"
+export HF_HOME="$HF_CACHE_DIR"
+export HF_HUB_ENABLE_HF_TRANSFER=1   # optional, faster downloads
+```
+
+Add `HF_HOME` (and optionally `HF_HUB_ENABLE_HF_TRANSFER`) to your shell rc
+(`~/.bashrc` / `~/.zshrc`) so future sessions inherit them.
+
+## 4. Smoke-test: `demo_zeus_layer_compare.py`
+
+This is the canonical layer-by-layer correctness test for Qwen2.5-0.5B. It
+loads the HF model, runs each component on CPU (golden reference) and on
+zeus, and prints per-stage `PASS`/`DIFF`.
+
+```bash
+cd "$ZEUS_ROOT/sglang/zeus_dev"
+python demo_zeus_layer_compare.py
+```
+
+A clean run produces 13 PASSes ending with:
+
+```
+============================================================
+Summary
+============================================================
+  embedding            : PASS
+  rmsnorm              : PASS
+  silu_and_mul         : PASS
+  rope                 : PASS
+  qkv_proj             : PASS
+  o_proj               : PASS
+  mlp                  : PASS
+  store_kv_cache       : PASS
+  extend_attention     : PASS
+  decode_attention     : PASS
+  transformer_block    : PASS
+  lm_head              : PASS
+  full_model           : PASS
+============================================================
+```
+
+The full-model stage feeds `"Hello, this is a test for Zeus device
+comparison."` through 24 transformer layers and the LM head; greedy token
+should match between CPU and zeus (token 358 = `" I"`, top-5 overlap 5/5).
+
+Expected harmless warnings:
+- `[ZEUS Fallback] Operator 'aten::arange.start_out'` — known fallback,
+  see §6.
+- `Only CUDA support GGUF/AWQ quantization currently` — module-load
+  warnings; the demo doesn't use these paths.
+- `Zeus does not fully support inductor yet, using eager` — torch.compile
+  falls back to eager on zeus.
+
+## 5. Launch the SGLang server
 
 ```bash
 SGLANG_DEVICE=zeus python -m sglang.launch_server \
@@ -107,16 +335,19 @@ SGLANG_DEVICE=zeus python -m sglang.launch_server \
   --host 127.0.0.1 --port 38900
 ```
 
-Key flags, and why:
+Why each non-default flag:
 
+- `SGLANG_DEVICE=zeus` — forces SGLang's internal `is_cuda()` / `is_zeus()`
+  dispatch onto the zeus branch even on a box where CUDA might also be
+  visible.
 - `--device zeus` — explicit device selection.
 - `--disable-cuda-graph` — there is no cuda graph capture on zeus.
 - `--attention-backend torch_native` — the only attention backend currently
-  wired up with zeus fallbacks (see `torch_native_backend.py::_sdpa`). Do not
-  use `flashinfer`, `triton`, or `fa3` — they all require CUDA.
+  wired up with zeus fallbacks (see `torch_native_backend.py::_sdpa`). Do
+  not use `flashinfer`, `triton`, or `fa3` — they all require CUDA.
 - `--sampling-backend pytorch` — bypass `sgl_kernel` sampling ops.
 
-## 4. Smoke-test a generation request
+Send a request:
 
 ```bash
 curl -s -m 300 -X POST http://127.0.0.1:38900/generate \
@@ -125,25 +356,77 @@ curl -s -m 300 -X POST http://127.0.0.1:38900/generate \
        "sampling_params": {"max_new_tokens": 8, "temperature": 0}}'
 ```
 
-On older CPU-fallback-heavy paths we observed multi-second/token latency for
-Qwen2.5-0.5B. Recent Zeus updates removed the largest req_to_token metadata
-bounces, but performance is still sensitive to remaining fallback ops and
-kernel launch overhead. The request should return text that continues the prompt
-coherently, e.g. `" Paris. It is the largest city in"`.
+Should return text continuing the prompt coherently, e.g.
+`" Paris. It is the largest city in"`.
 
-## 5. Things that are slow / missing
+## 6. Things that are slow / missing
 
-The first end-to-end zeus run may still print `[ZEUS Fallback]` or
-`[ZEUS FailFallback]` messages for residual ops such as `index.Tensor_out`,
-`argmax`, `where`, `clamp`, `arange`, and int `neg`. These are
-correctness-correct but slower than native Zeus implementations. The current
-operator and CPU-bounce status is tracked in:
+The first end-to-end zeus run will still print `[ZEUS Fallback]` or
+`[ZEUS FailFallback]` messages for residual ops such as
+`index.Tensor_out`, `argmax`, `where`, `clamp`, `arange`, and int `neg`.
+These are correctness-correct but slower than native zeus implementations.
+The current operator and CPU-bounce status is tracked in:
 
 - `zeus_dev/sglang_zeus_manual.md`
-- `zeus_dev/zeus_if_zeus_cpu_bounce_audit_20260423.md`
-- `zeus_dev/zeus_cpu_bounce_reduction_plan_20260423.md`
+- `zeus_dev/zeus_if_zeus_cpu_bounce_audit_20260427.md`
+- `zeus_dev/zeus_cpu_bounce_reduction_plan_20260427.md`
 
-SGLang-side zeus compatibility is now complete enough to boot the server,
-warm up, and serve a generation request end to end. The remaining speedups
-are expected to come from `torch_zeus` / `sgl_kernel_zeus` closing their
-fallback list — not from further SGLang patches.
+SGLang-side zeus compatibility is now complete enough to:
+- Pass all 13 stages of `demo_zeus_layer_compare.py` against Qwen2.5-0.5B.
+- Boot the launch_server, warm up, and serve a generation request end to
+  end with documented launch flags.
+
+Remaining speedups are expected to come from `torch_zeus` /
+`sgl_kernel_zeus` closing their fallback list — not from further SGLang
+patches.
+
+## 7. Quick reference — copy-paste install script
+
+For a fresh box, the full sequence is (set the two env vars at the top to
+match your environment):
+
+```bash
+# 0a. Workspace paths — EDIT THESE
+export ZEUS_ROOT=/path/to/your/zeus_workspace
+export HF_CACHE_DIR=/path/to/your/hf_cache
+
+# 0b. Rust (skip if rustup already present with a stable toolchain)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# 1. torch_zeus + sgl_kernel_zeus from source
+cd "$ZEUS_ROOT/torch_zeus" && pip install -e .
+cd "$ZEUS_ROOT/torch_zeus/sgl-kernel-zeus/python" && pip install -e .
+
+# 2. SGLang via srt_zeus extra (mirrors upstream amd_gpu/ascend_npu)
+cd "$ZEUS_ROOT/sglang"
+rm -rf python/pyproject.toml
+mv python/pyproject_other.toml python/pyproject.toml
+pip install -e "python[srt_zeus]" --no-build-isolation
+
+# 2a. Repair torch + torchvision (the srt_zeus extra clobbers them)
+pip uninstall -y torchvision
+pip install --force-reinstall --no-deps torch==2.9.0+cpu --index-url https://download.pytorch.org/whl/cpu
+pip install --no-deps torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cpu
+
+# 3. HF cache
+mkdir -p "$HF_CACHE_DIR"
+export HF_HOME="$HF_CACHE_DIR"
+export HF_HUB_ENABLE_HF_TRANSFER=1
+
+# 4. Verify
+python -c "
+import torch, torchvision, torch_zeus, torch_zeus._C, sgl_kernel_zeus, sglang
+assert torch.__version__ == '2.9.0+cpu', torch.__version__
+assert torch.zeus.is_available()
+print('install OK | torch', torch.__version__, '| sglang', sglang.__version__)
+"
+
+# 5. Layer-by-layer smoke test
+cd "$ZEUS_ROOT/sglang/zeus_dev"
+python demo_zeus_layer_compare.py
+```
+
+If the verify line at step 4 prints `install OK | torch 2.9.0+cpu | sglang
+0.5.6.post2` and step 5 ends with 13 `PASS` lines, your zeus install is
+ready.

@@ -2446,7 +2446,11 @@ class ModelRunner:
             token_to_kv_pool=self.token_to_kv_pool,
             attn_backend=self.attn_backend,
             out_cache_loc=buffers.out_cache_loc,
-            seq_lens_sum=buffers.seq_lens.sum().item(),
+            # seq_lens_cpu is the canonical CPU mirror; sum on CPU avoids
+            # a device→host sync and dodges backends that lack an int64
+            # reduce kernel (e.g. zeus zenlReduce). See cuda_graph_runner
+            # seq_lens_sum for the parallel rationale.
+            seq_lens_sum=buffers.seq_lens_cpu.sum().item(),
             encoder_lens=buffers.encoder_lens,
             return_logprob=False,
             positions=buffers.positions,

@@ -252,3 +252,7 @@ outputs/
 
 # Eval Cache
 .longbench_cache/
+
+# vcs-versioning auto-generates this on every build; per its own header
+# "don't change, don't track in version control".
+python/sglang/_version.py

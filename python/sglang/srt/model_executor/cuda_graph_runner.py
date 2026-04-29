@@ -630,7 +630,13 @@ class CudaGraphRunner:
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=attn_backend,
             out_cache_loc=out_cache_loc,
-            seq_lens_sum=seq_lens.sum().item(),
+            # seq_lens_cpu is the canonical CPU mirror of seq_lens — sum on
+            # CPU avoids a device→host sync per graph capture and skirts
+            # backends that do not yet have an int64 reduce kernel (e.g.
+            # zenlReduce only ships fp32/bf16/int8/fp8e4m3 today, so an
+            # int64 seq_lens.sum() would otherwise CPU-fallback under graph
+            # capture and stall the capture stream).
+            seq_lens_sum=seq_lens_cpu.sum().item(),
             encoder_lens=encoder_lens,
             return_logprob=False,
             positions=positions,
