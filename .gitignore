@@ -248,6 +248,7 @@ lmms-eval
 
 **/.claude/
 **/.serena/
+.codex
 ctags/
 outputs/
 
