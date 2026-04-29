@@ -9,6 +9,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+python/.zeus_editable/
 develop-eggs/
 dist/
 downloads/
