@@ -65,7 +65,11 @@ def register(name):
 def run_test(name, code):
     """Run test code in a subprocess; return (passed, output)."""
     full_code = textwrap.dedent(f"""\
-        import os, sys, torch
+        import ctypes, os, sys
+        _libstdcxx = os.path.join(sys.prefix, "lib", "libstdc++.so.6")
+        if os.path.exists(_libstdcxx):
+            ctypes.CDLL(_libstdcxx, mode=ctypes.RTLD_GLOBAL)
+        import torch
         sys.stdout.reconfigure(line_buffering=True)
         sys.stderr.reconfigure(line_buffering=True)
         os.environ["SGLANG_DEVICE"] = "zeus"

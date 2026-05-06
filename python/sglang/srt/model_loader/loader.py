@@ -188,62 +188,51 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
 logger = logging.getLogger(__name__)
 
 
-def _zeus_init_lm_head_from_embed(model, lm_head_cls, embed_cls, zeus_lm_head_loaded=False):
-    """Copy embed_tokens weight to lm_head when the checkpoint has no lm_head.
+def _zeus_synthesize_lm_head_weight_from_embed(model, weights):
+    """Yield a second host-side lm_head.weight load from embed_tokens.weight.
 
     When a checkpoint was trained with tie_word_embeddings=True but Zeus
     overrides it to False, the checkpoint has no ``lm_head.weight`` entry.
-    After ``load_weights``, lm_head keeps its random-init values.  This
-    function detects that case and copies embed_tokens.weight → lm_head.weight
-    so the model produces correct logits.
-
-    If the checkpoint already contains a separate lm_head.weight (i.e. was
-    trained with tie=False), lm_head is already loaded correctly — no-op.
-
-    Detection: check the safetensors/checkpoint index for ``lm_head.weight``.
-    If not present, the checkpoint was tied and we need to copy.
+    Do not fix that after loading with ``lm_head.weight.copy_(embed.weight)``:
+    on Zeus that becomes a device-to-device memcpy. Instead, feed the same
+    host checkpoint tensor to the model loader twice.
     """
-    lm_head = embed = None
-    for _, module in model.named_modules():
-        if isinstance(module, lm_head_cls):
-            lm_head = module
-        elif isinstance(module, embed_cls) and not isinstance(module, lm_head_cls):
-            embed = module
-
-    if lm_head is None or embed is None:
-        return
-    if not hasattr(lm_head, 'weight') or not hasattr(embed, 'weight'):
+    params_dict = dict(model.named_parameters())
+    if "lm_head.weight" not in params_dict:
+        yield from weights
         return
 
-    lm_w = lm_head.weight.data
-    em_w = embed.weight.data
+    embed_weight = None
+    lm_head_loaded = False
+    for name, tensor in weights:
+        if name.endswith("lm_head.weight"):
+            lm_head_loaded = True
+        elif name == "model.embed_tokens.weight":
+            embed_weight = tensor
+        yield name, tensor
 
-    if lm_w.shape != em_w.shape:
+    if lm_head_loaded:
+        logger.info("Zeus: lm_head.weight loaded from checkpoint; keeping as-is.")
+        return
+    if embed_weight is None:
         logger.warning(
-            f"Zeus: lm_head.weight shape {list(lm_w.shape)} != "
-            f"embed_tokens.weight shape {list(em_w.shape)}; "
-            f"skipping weight copy."
+            "Zeus: lm_head.weight not in checkpoint and "
+            "model.embed_tokens.weight was not seen; lm_head remains initialized."
+        )
+        return
+    if tuple(embed_weight.shape) != tuple(params_dict["lm_head.weight"].shape):
+        logger.warning(
+            f"Zeus: lm_head.weight shape {list(params_dict['lm_head.weight'].shape)} "
+            f"!= model.embed_tokens.weight shape {list(embed_weight.shape)}; "
+            "skipping synthesized lm_head load."
         )
         return
 
-    # Already identical (same storage).
-    if lm_w.data_ptr() == em_w.data_ptr():
-        return
-
-    # Check if lm_head.weight was actually loaded from checkpoint.
-    # Use _zeus_lm_head_loaded flag set by the weights iterator wrapper,
-    # or fall back to a heuristic: random-init weights (torch.empty on Zeus)
-    # tend to have near-zero or garbage values with very different statistics
-    # from pretrained embeddings.
-    if zeus_lm_head_loaded:
-        logger.info("Zeus: lm_head.weight loaded from checkpoint; keeping as-is.")
-        return
-
     logger.info(
-        "Zeus: lm_head.weight not in checkpoint (tie_word_embeddings "
-        "override); copying from embed_tokens.weight."
+        "Zeus: lm_head.weight not in checkpoint (tie_word_embeddings override); "
+        "loading lm_head.weight from host embed_tokens.weight."
     )
-    lm_w.copy_(em_w)
+    yield "lm_head.weight", embed_weight
 
 
 def _zeus_decouple_tied_lm_head(model, lm_head_cls, embed_cls):
@@ -732,17 +721,8 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
-        zeus_lm_head_loaded = False
         if _is_zeus:
-            # Track whether lm_head.weight is present in the checkpoint so
-            # _zeus_init_lm_head_from_embed knows whether to copy from embed.
-            def _tracking_iter(it):
-                nonlocal zeus_lm_head_loaded
-                for name, tensor in it:
-                    if name.endswith('lm_head.weight'):
-                        zeus_lm_head_loaded = True
-                    yield name, tensor
-            weights = _tracking_iter(weights)
+            weights = _zeus_synthesize_lm_head_weight_from_embed(model, weights)
         model.load_weights(weights)
 
         for _, module in model.named_modules():
@@ -795,10 +775,6 @@ class DefaultModelLoader(BaseModelLoader):
             # small memory cost (one extra vocab×hidden bf16 copy) buys us a
             # fully native zeus logits path with no CPU fallback. Inference
             # never trains the embedding, so decoupling is safe.
-            _zeus_init_lm_head_from_embed(
-                model, ParallelLMHead, VocabParallelEmbedding,
-                zeus_lm_head_loaded,
-            )
             _zeus_decouple_tied_lm_head(
                 model, ParallelLMHead, VocabParallelEmbedding,
             )
