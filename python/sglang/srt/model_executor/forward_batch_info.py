@@ -866,17 +866,11 @@ class ForwardBatch:
                 self.forward_mode = ForwardMode.EXTEND
                 self.extend_num_tokens = bs
                 self.extend_seq_lens = torch.full_like(self.seq_lens, 1)
-                if _is_zeus:
-                    device = self.seq_lens.device
-                    self.extend_prefix_lens = (self.seq_lens.cpu() - 1).to(device)
-                    self.extend_start_loc = torch.arange(
-                        bs, dtype=torch.int32
-                    ).to(device)
-                else:
-                    self.extend_prefix_lens = self.seq_lens - 1
-                    self.extend_start_loc = torch.arange(
-                        bs, dtype=torch.int32, device=self.seq_lens.device
-                    )
+                # sub/arange(int32) now run natively on Zeus device
+                self.extend_prefix_lens = self.seq_lens - 1
+                self.extend_start_loc = torch.arange(
+                    bs, dtype=torch.int32, device=self.seq_lens.device
+                )
                 self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu()
                 self.extend_seq_lens_cpu = self.extend_seq_lens.cpu()
                 self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
@@ -1269,16 +1263,18 @@ def compute_position_torch(
         s_cpu = extend_seq_lens.cpu()
         positions = torch.cat(
             [
-                torch.arange(p, p + s)
+                torch.arange(p, p + s, dtype=torch.int32, device=device)
                 for p, s in zip(p_cpu, s_cpu)
             ],
             axis=0,
         )
-        extend_start_loc = torch.zeros_like(s_cpu)
-        extend_start_loc[1:] = torch.cumsum(s_cpu[:-1], dim=0)
-        # Zeus chip rule: no int64 device-side. Cast on CPU first, then a
-        # single dtype-matching H2D transfer (no CPU bounce on the device).
-        return positions.to(torch.int32).to(device), extend_start_loc.to(device)
+        extend_start_loc = torch.zeros(
+            len(s_cpu), dtype=torch.int32, device=device
+        )
+        extend_start_loc[1:] = torch.cumsum(
+            extend_seq_lens.to(torch.int32)[:-1], dim=0
+        )
+        return positions, extend_start_loc
     positions = torch.cat(
         [
             torch.arange(
@@ -1296,10 +1292,8 @@ def compute_position_torch(
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def clamp_position(seq_lens):
     if _is_zeus:
-        device = seq_lens.device
-        # Zeus chip rule: no int64 device-side. Cast to int32 on CPU
-        # before the H2D transfer so the result is int32 on Zeus.
-        return torch.clamp((seq_lens.cpu() - 1), min=0).to(torch.int32).to(device)
+        # clamp/sub now run natively on Zeus; Zeus tensors stay in int32
+        return torch.clamp((seq_lens - 1), min=0)
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 
 

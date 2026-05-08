@@ -19,10 +19,11 @@ if TYPE_CHECKING:
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _resolve_future_token_ids(input_ids, future_token_ids_map):
     if _is_zeus:
-        ids = input_ids.cpu()
+        # where/clamp/neg now run on Zeus; index(read) still needs CPU gather
+        gather_indices = torch.clamp(-input_ids, min=0)
         buf = future_token_ids_map.cpu()
-        resolved = torch.where(ids < 0, buf[torch.clamp(-ids, min=0)], ids)
-        input_ids[:] = resolved.to(input_ids.device)
+        looked_up = buf[gather_indices.cpu()].to(input_ids.device)
+        input_ids[:] = torch.where(input_ids < 0, looked_up, input_ids)
         return
     input_ids[:] = torch.where(
         input_ids < 0,
@@ -121,10 +122,8 @@ class FutureMap:
         start = cur_future_ct + 1
         end = cur_future_ct + 1 + bs
         if _is_zeus:
-            # Match token_ids_buf dtype (int32) — the negation of these
-            # indices ends up in batch.output_ids → batch.input_ids on the
-            # next decode step, which Zeus requires as int32 device-side.
-            indices = torch.arange(start, end, dtype=torch.int32).to(self.device)
+            # arange(int32) now runs natively on Zeus device
+            indices = torch.arange(start, end, dtype=torch.int32, device=self.device)
         else:
             indices = torch.arange(start, end, dtype=torch.int64, device=self.device)
         return FutureIndices(indices=indices, interval=slice(start, end))
