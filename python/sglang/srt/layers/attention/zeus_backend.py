@@ -9,6 +9,8 @@ Triton is not supported (Zeus tensors are not accessible from Triton kernels).
 
 from __future__ import annotations
 
+import logging
+import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -21,6 +23,29 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Probe sgl_kernel_zeus.build_kv_indices availability at import time.
+# When the symbol is missing (e.g. sgl-kernel-zeus not yet rebuilt), every
+# call to _build_kv_indices_device will raise and the CPU mirror fallback
+# emits a one-time WARNING so the operator notices without flooding logs.
+# ---------------------------------------------------------------------------
+try:
+    from sgl_kernel_zeus import build_kv_indices as _sgl_build_kv_indices  # noqa: F401
+    HAS_DEVICE_BUILD_KV_INDICES: bool = True
+except (ImportError, AttributeError):
+    HAS_DEVICE_BUILD_KV_INDICES = False
+    warnings.warn(
+        "sgl_kernel_zeus.build_kv_indices is not available "
+        "(sgl-kernel-zeus may need to be rebuilt). "
+        "ZeusAttnBackend will fall back to CPU mirror gather for kv_indices, "
+        "which introduces a device→host→device round-trip on every forward step. "
+        "Run `pip install -e sgl-kernel-zeus/ --no-build-isolation` to enable the device kernel.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 
 @dataclass
@@ -98,23 +123,21 @@ class ZeusAttnBackend(AttentionBackend):
         kv_indptr[1:] = torch.cumsum(seq_lens[:bs], dim=0, dtype=torch.int32)
         self.cuda_graph_kv_indptr[: bs + 1].copy_(kv_indptr)
 
-        # kv_indices — prefer Zeus device ragged gather, with CPU mirror
-        # fallback for environments that have not rebuilt sgl-kernel-zeus yet.
-        try:
+        # kv_indices — use Zeus device ragged gather when available; fall back
+        # to CPU mirror gather otherwise (emits a runtime warning once).
+        if HAS_DEVICE_BUILD_KV_INDICES:
             self._build_kv_indices_device(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 kv_indptr,
                 self.cuda_graph_kv_indices,
             )
-        except (ImportError, RuntimeError, AttributeError):
-            kv_indices_cpu = self._build_kv_indices_cpu(
+        else:
+            self._build_kv_indices_cpu_with_warning(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
+                self.cuda_graph_kv_indices,
             )
-            total_kv = kv_indices_cpu.numel()
-            if total_kv > 0:
-                self.cuda_graph_kv_indices[:total_kv].copy_(kv_indices_cpu)
 
         # Use the full pre-allocated kv_indices buffer (not a slice).
         # Graph capture records tensor shape; the kernel uses kv_indptr to
@@ -144,20 +167,22 @@ class ZeusAttnBackend(AttentionBackend):
         kv_indptr[1:] = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
 
         # kv_indices: concatenated absolute token positions for all sequences.
-        try:
-            kv_indices = torch.empty(
-                forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
-            )
+        total_kv = forward_batch.seq_lens_sum
+        if HAS_DEVICE_BUILD_KV_INDICES:
+            kv_indices = torch.empty(total_kv, dtype=torch.int32, device=self.device)
             self._build_kv_indices_device(
                 req_pool_indices,
                 seq_lens,
                 kv_indptr,
                 kv_indices,
             )
-        except (ImportError, RuntimeError, AttributeError):
-            kv_indices = self._build_kv_indices_cpu(req_pool_indices, seq_lens).to(
-                self.device
+        else:
+            kv_indices_cpu = self._build_kv_indices_cpu_with_warning(
+                req_pool_indices,
+                seq_lens,
+                None,
             )
+            kv_indices = kv_indices_cpu.to(self.device)
 
         # Extend-specific metadata
         qo_indptr = None
@@ -186,7 +211,17 @@ class ZeusAttnBackend(AttentionBackend):
         kv_indptr: torch.Tensor,
         kv_indices: torch.Tensor,
     ):
+        """Ragged gather on Zeus device via sgl_kernel_zeus.build_kv_indices.
+
+        SGLang stores req_pool_indices / seq_lens as int64 on device;
+        cast to int32 before passing to Zeus kernel (no int64 vector support).
+        """
         from sgl_kernel_zeus import build_kv_indices
+
+        if req_pool_indices.dtype == torch.int64:
+            req_pool_indices = req_pool_indices.to(torch.int32)
+        if seq_lens.dtype == torch.int64:
+            seq_lens = seq_lens.to(torch.int32)
 
         build_kv_indices(
             self.req_to_token,
@@ -195,6 +230,37 @@ class ZeusAttnBackend(AttentionBackend):
             kv_indptr,
             kv_indices,
         )
+
+    # One-time warning flag; per-instance so multi-worker setups each warn once.
+    _cpu_fallback_warned: bool = False
+
+    def _build_kv_indices_cpu_with_warning(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        out_buffer: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """CPU mirror gather fallback; emits a WARNING on first call.
+
+        When *out_buffer* is not None the result is copied into it in-place
+        (graph-capture path). Returns a CPU int32 tensor of kv_indices.
+        """
+        if not self._cpu_fallback_warned:
+            logger.warning(
+                "ZeusAttnBackend: sgl_kernel_zeus.build_kv_indices is unavailable — "
+                "falling back to CPU mirror gather for kv_indices. "
+                "This introduces a device→host→device round-trip on every forward step. "
+                "To eliminate this overhead, rebuild sgl-kernel-zeus: "
+                "`pip install -e sgl-kernel-zeus/ --no-build-isolation`."
+            )
+            self._cpu_fallback_warned = True
+
+        kv_indices_cpu = self._build_kv_indices_cpu(req_pool_indices, seq_lens)
+        if out_buffer is not None:
+            total_kv = kv_indices_cpu.numel()
+            if total_kv > 0:
+                out_buffer[:total_kv].copy_(kv_indices_cpu)
+        return kv_indices_cpu
 
     def _build_kv_indices_cpu(
         self,

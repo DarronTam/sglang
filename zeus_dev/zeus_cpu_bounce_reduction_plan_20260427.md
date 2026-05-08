@@ -1,8 +1,9 @@
 # Zeus 主链路 CPU Bounce 重新评估与实现方案
 
-> 创建日期：2026-04-27 | 最后更新：2026-05-08  
+> 创建日期：2026-04-27 | 最后更新：2026-05-08（2）  
 > 前提更新（04-27）：`torch_zeus` 已支持 `aten::index_put`  
 > 前提更新（05-08）：`torch_zeus` `neg / clamp / where / arange` 均已新增 `int32` dtype 支持  
+> 前提更新（05-08②）：`sgl_kernel_zeus.build_kv_indices` 五件套已实现（triton 参考 + sim.c + host cpp + Python API + tests + docs）；`zeus_backend.py` 已切换到 device kernel 路径，CPU fallback 改为 `logger.warning` 一次性提示。  
 > 目标：重新评估 `allocator + req_to_token 读写 + attention metadata + kv page attention` 这条链路上的 CPU bounce，并给出在当前前提下的最佳实现方案。
 
 ---
@@ -33,7 +34,7 @@
 | CPU mirror + device `index_put` | `memory_pool.py` | `ReqToTokenPool.write()` 同步写 device 和 mirror |
 | `alloc_for_decode` 读 mirror | `common.py:465` | decode 每步不再从 device 拉行 |
 | `zeus_backend` 读 mirror | `zeus_backend.py` | 消掉整表 `.cpu()` |
-| `build_kv_indices` device kernel | `sgl_kernel_zeus` + `zeus_backend.py` | `kv_indices` ragged gather 可在 Zeus device 上执行（有 fallback CPU mirror 路径）|
+| `build_kv_indices` device kernel | `sgl_kernel_zeus` + `zeus_backend.py` | `kv_indices` ragged gather 完整五件套已落地（triton + sim.c + host + Python API + tests + docs）；`zeus_backend.py` 已切换为 `HAS_DEVICE_BUILD_KV_INDICES` flag 判断，CPU fallback 降为一次性 `logger.warning` |
 | `neg/clamp/where/arange` int32 支持 | `torch_zeus` 全 4 层 | ATen 层 → host → sim → triton 均已适配 |
 | `scheduler.py` neg 去 CPU bounce | `scheduler.py:2062` | `-future_indices.indices` 直接在 Zeus 上执行 |
 | `overlap_utils.py` clamp/where/neg 去 bounce | `overlap_utils.py` | `clamp(-input_ids)` + `where` 原生 Zeus；仅 `buf[...]` index read 仍需 CPU |
@@ -45,7 +46,7 @@
 |---|---|---|
 | `_resolve_future_token_ids` index(read) | `overlap_utils.py:24-25` | `buf[gather_indices]` 需要 `aten::index_select` / gather，Zeus 尚不支持 |
 | `logits_processor.py` gather loop | `logits_processor.py:420` | CPU arange + index gather loop，依赖 index(read) |
-| `build_kv_indices` CPU mirror 回退路径 | `zeus_backend._build_kv_indices_cpu` | 当 `sgl_kernel_zeus.build_kv_indices` 不可用时的兜底 |
+| `build_kv_indices` CPU mirror 回退路径 | `zeus_backend._build_kv_indices_cpu_with_warning` | 当 `sgl_kernel_zeus` 未重建时自动降级；会发出一次性 `logger.warning` 提示重建命令 |
 
 ---
 

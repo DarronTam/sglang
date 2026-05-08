@@ -1,9 +1,10 @@
 # torch_zeus 已支持算子与 SGLang `_is_zeus` CPU bounce 审计
 
-> 创建日期：2026-04-27 | 最后更新：2026-05-08  
+> 创建日期：2026-04-27 | 最后更新：2026-05-08②  
 > 本次更新：按**当前代码**重新整理，只统计**仍然存在**的 CPU bounce；已被最新代码修复的项不再列为现存问题。
 > 前提更新（04-27）：`torch_zeus` 已支持 `aten::cumsum` 和 `aten::index_put / index_put_`。
 > 前提更新（05-08）：`torch_zeus` `neg / clamp / where / arange` 均已支持。
+> 前提更新（05-08②）：`sgl_kernel_zeus.build_kv_indices` 五件套已落地；`zeus_backend.py` 已切换到 device kernel 路径，CPU fallback 改为一次性 `logger.warning`。
 
 ---
 
@@ -76,6 +77,7 @@ PyTorch ATen dispatch，`sgl_kernel_zeus` 则是 SGLang 在 Zeus 上使用的
 
 | 类别 | Kernel | 用途 | 主要调用位置 / 状态 |
 |------|--------|------|--------------------|
+| Attention | `build_kv_indices` | 页表 ragged gather → compact CSR kv_indices | `zeus_backend.py:_build_kv_indices_device`；五件套于 05-08② 落地 |
 | Attention | `extend_attention` | Prefill / extend paged attention | `zeus_backend.py:forward_extend` |
 | Attention | `decode_attention` | Decode paged attention | `zeus_backend.py:forward_decode` |
 | KV Cache | `store_kv_cache` | 写入 Zeus tiled KV cache | `zeus_memory_pool.py:set_kv_buffer` |
@@ -106,14 +108,15 @@ PyTorch ATen dispatch，`sgl_kernel_zeus` 则是 SGLang 在 Zeus 上使用的
 |---|---|
 | `index.Tensor_out` / `tensor[indices]` | graph metadata、schedule_batch.filter、logits gather |
 
-以下算子已于 2026-05-08 支持，相关 bounce 已消减：
+以下算子已于 2026-05-08 / 05-08② 支持，相关 bounce 已消减：
 
-| 算子 | 完整支持 dtype（05-08 后） | 已修复的影响位置 |
+| 算子 / kernel | 完整支持 dtype / 状态 | 已修复的影响位置 |
 |---|---|---|
 | `clamp(int32)` | fp32, bf16, int8, int32, fp8_e4m3fn | `overlap_utils.py` clamp(-input_ids)、`forward_batch_info.py` clamp_position ✅ |
 | `where(int32)` | fp32, bf16, int8, int32, fp8_e4m3fn | `overlap_utils.py` torch.where(ids<0, ...) ✅ |
 | `arange(int32)` | fp32, bf16, int8, int32, fp8_e4m3fn | `overlap_utils.py` alloc_future_indices、`forward_batch_info.py` extend_start_loc ✅ |
 | `neg(int32)` | fp32, bf16, int8, int32, fp8_e4m3fn | `scheduler.py` -future_indices.indices、`overlap_utils.py` -input_ids ✅ |
+| `sgl_kernel_zeus.build_kv_indices` | int32 ragged gather（五件套落地） | `zeus_backend.py` kv_indices 构建：CPU mirror gather → device kernel ✅ |
 
 ### 2.4 关于 `argmax`
 
@@ -827,4 +830,4 @@ seq_lens_next = batch.seq_lens + token_per_req
 这份文档按最新代码重排后，最重要的变化是：
 
 > `req_to_token` 读写和 `kv_metadata` 相关的主链路大块 CPU bounce 已经被解决，不应再继续作为“当前未解决问题”统计。  
-> 现在更准确的说法是：主链路上已基本没有"不必要的大块 CPU bounce"；`neg / clamp / where / arange(int32)` 于 2026-05-08 完成 torch_zeus int32 支持，overlap / scheduler / forward_batch_info 相关 CPU bounce 已消减。当前真正残留的热点，主要集中在 `index(read)` / `aten::index_select` 缺失导致的 `buf[gather_indices]` gather（overlap_utils）、logits gather loop（logits_processor），以及 `kv_indices` ragged gather（可由 `build_kv_indices` device kernel 替代）。
+> 现在更准确的说法是：主链路上已基本没有"不必要的大块 CPU bounce"；`neg / clamp / where / arange(int32)` 于 2026-05-08 完成 torch_zeus int32 支持，overlap / scheduler / forward_batch_info 相关 CPU bounce 已消减。`build_kv_indices` device kernel（五件套 + `zeus_backend.py` 切换）已于 2026-05-08② 落地，`kv_indices` ragged gather 可在 Zeus device 上执行，CPU fallback 路径保留并改为一次性 `logger.warning` 提示。当前真正残留的热点，主要集中在 `index(read)` / `aten::index_select` 缺失导致的 `buf[gather_indices]` gather（overlap_utils）和 logits gather loop（logits_processor）。
