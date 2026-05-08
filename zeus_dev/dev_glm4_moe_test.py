@@ -33,7 +33,6 @@ Stage:
 
 import argparse
 import json
-import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -49,25 +48,6 @@ sglang.srt.server_args.get_global_server_args = lambda *a, **kw: _dummy_args
 
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
-
-
-# def _resolve_ref_device():
-#     # Allow overriding reference device via environment variable:
-#     #   REF_DEVICE=zeus|cuda|cpu
-#     env = os.getenv("REF_DEVICE")
-#     if env:
-#         req = env.strip().lower()
-#         if req in ("zeus", "cuda", "cpu"):
-#             if req == "cuda" and not torch.cuda.is_available():
-#                 print("[warn] REF_DEVICE=cuda but CUDA is unavailable, fallback to cpu")
-#                 return "cpu"
-#             return req
-#         print(f"[warn] Unknown REF_DEVICE={env!r}, fallback to auto")
-#     return "cuda" if torch.cuda.is_available() else "cpu"
-
-
-# REF_DEVICE = _resolve_ref_device()
-
 REF_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 def load_glm4_config():
