@@ -47,12 +47,12 @@ _dummy_args.rl_on_policy_target = None
 sglang.srt.server_args.get_global_server_args = lambda *a, **kw: _dummy_args
 
 
-CONFIG_PATH = Path(__file__).parent / "config.json"
+DEFAULT_CONFIG_PATH = Path(__file__).parent / "config_glm4.json"
 REF_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def load_glm4_config():
-    cfg = json.loads(CONFIG_PATH.read_text())
+def load_glm4_config(path):
+    cfg = json.loads(path.read_text())
     return SimpleNamespace(**cfg)
 
 
@@ -952,9 +952,11 @@ def main():
     )
     parser.add_argument("--num-tokens", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     args = parser.parse_args()
 
-    cfg = load_glm4_config()
+    cfg = load_glm4_config(args.config)
+    print(f"Config path: {args.config}")
     print(f"GLM-4.7 config: H={cfg.hidden_size}  E={cfg.n_routed_experts}"
           f"  top_k={cfg.num_experts_per_tok}  mI={cfg.moe_intermediate_size}")
     print(f"Reference device: {REF_DEVICE}")

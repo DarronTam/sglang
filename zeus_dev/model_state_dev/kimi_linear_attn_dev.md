@@ -69,17 +69,17 @@ Kimi-Linear 的权威配置来自 HuggingFace checkpoint（`Kimi-Linear-48B-A3B`
 |---|---|---|---|---|---|
 | 0 | `input_layernorm`（fused add + rmsnorm） | 两路共享 | `[T,H]` | `sgl_kernel.fused_add_rmsnorm` | ✅ `sgl_kernel_zeus.fused_add_rmsnorm` |
 | 1 | q / k / v / b / f_a / f_b / g_a / g_b Linear | 两路共享 | 各 GEMM | GEMM | ✅ `linear_zeus`（复用 qwen 已验证） |
-| 2a-single | q / k / v causal conv1d — decode（单 projection，三次调用） | single-step | `[N, C]` + conv_state `[N, C, K-1]`，C=`H_qkv` | `causal_conv1d_update`（`mamba/causal_conv1d_triton.py:973`） | ✅ `sgl_kernel_zeus.causal_conv1d_update`（`csrc/mamba/causal_conv1d_update_{kernel.py,zeus.cpp}`，26 tests PASS） |
+| 2a-single | q / k / v causal conv1d — decode（单 projection，三次调用） | single-step | `[N, C]` + conv_state `[N, C, K-1]`，C=`H_qkv` | `causal_conv1d_update`（`mamba/causal_conv1d_triton.py:973`） | ✅ `sgl_kernel_zeus.causal_conv1d_update`（紧凑 state，26 tests PASS）+ ✅ **`causal_conv1d_update_indexed`**（直接对全局 `[N_pool, C, K-1]` 池按 `cache_indices [N]` slot 寻址，省 host gather/scatter；38 tests PASS，含 strict parity 与 untouched-slots bit-exact 验证；`csrc/mamba/causal_conv1d_update_indexed_{kernel.py,zeus.cpp,sim.c}`） |
 | 2a-fused | q / k / v causal conv1d — decode（Q/K/V 一次 launch 融合） | single-step | 同 2a-single，三份独立 weight/bias/state | — （CUDA 侧三次独立 `causal_conv1d_update`） | ✅ `sgl_kernel_zeus.causal_conv1d_update_qkv`（`csrc/mamba/causal_conv1d_update_qkv_{kernel.py,zeus.cpp}`，要求 C%CORE_NUM=2==0；省 2 次 launch + concat 拷贝） |
 | 2b | q / k / v causal conv1d — extend | varlen full | `[H_qkv, T]` + cu_seqlens | `causal_conv1d_fn`（`mamba/causal_conv1d_triton.py:378`） | ❌ TODO: `sgl_kernel_zeus.causal_conv1d_fn` |
 | 3 | `beta = sigmoid(b_proj(x).float())` | 两路共享 | `[T, num_heads]` | GEMM + sigmoid | ✅ 复用 `linear_zeus` + `sigmoid`（elementwise） |
 | 4 | `fused_kda_gate(g, A_log, head_dim, g_bias=dt_bias)` | 两路共享 | `[T, H_qkv]` → `[T, num_heads, head_dim]` | Triton `kda_gate_fwd_kernel`（`fla/kda.py:1244`） | ✅ `sgl_kernel_zeus.fused_kda_gate`（`csrc/mamba/fused_kda_gate_{kernel.py,zeus.cpp}`，19 tests PASS；stable softplus = max(z,0)+log(1+exp(−\|z\|))，无 tl.where） |
-| 5 | q / k L2 norm（fused in kernel） | 两路共享 | `[1, T, num_heads, head_dim]` | `l2norm_fwd`（`fla/l2norm.py`）；`use_qk_l2norm_in_kernel=True` 时融进下一步 | ❌ TODO: 作为 step 6 / 7 的 fused sub-kernel 或独立 zeus `l2norm` |
-| 6 | **decode core**：`fused_recurrent_kda` | recurrent | `q/k/v/g: [1,T,H,K]`, `beta: [1,T,H]`, `initial_state: [N,H,K,V]` | Triton `fused_recurrent_gated_delta_rule_fwd_kernel`（`fla/fused_recurrent.py`，`IS_KDA=True`） | ❌ TODO: `sgl_kernel_zeus.fused_recurrent_kda` |
+| 5 | q / k L2 norm（fused in kernel） | 两路共享 | `[1, T, num_heads, head_dim]` | `l2norm_fwd`（`fla/l2norm.py`）；`use_qk_l2norm_in_kernel=True` 时融进下一步 | ✅ `sgl_kernel_zeus.l2norm`（`csrc/mamba/l2norm_{kernel.py,zeus.cpp}`，21 tests PASS；CORE_NUM 沿 N 维 ceiling 分 core；单 tile per-row reduce BLOCK_D=128；无 N%2 约束；接受任意 `[*,D]` shape） |
+| 6 | **decode core**：`fused_recurrent_kda` | recurrent | `q/k/v/g: [1,T,H,K]`, `beta: [1,T,H]`, `initial_state: [N,H,K,V]` | Triton `fused_recurrent_gated_delta_rule_fwd_kernel`（`fla/fused_recurrent.py`，`IS_KDA=True`） | ✅ **生产默认**：`sgl_kernel_zeus.fused_recurrent_kda_Sdecay`（21 tests PASS；S 先 decay 再 readout，与 CUDA fla 同形态、ops 更少）+ ✅ **生产融合默认**：`fused_recurrent_kda_Sdecay_indexed`（直接对全局 `[N_pool,H,K,V]` 池按 `cache_indices [N]` slot 寻址，省 host gather/scatter；17 tests PASS，含 strict parity；`csrc/mamba/fused_recurrent_kda_Sdecay_indexed_{kernel.py,zeus.cpp,sim.c}`）+ ✅ **Tensor Core 实验**：`fused_recurrent_kda`（18 tests PASS；decay 折进 k → `tl.dot` 走矩阵引擎、weight/share 双 memory tier 调度）。三版数学严格等价（S_new、o[t] 一致）。v1 要求 K==V==128。|
 | 7 | **extend core**：`chunk_kda` | chunked O(T·BT) | 同 6；chunk_size=64 | 多 triton kernel 串联（`fla/kda.py:1141 chunk_kda_fwd`：cumsum → scaled_dot_kkt → solve_tril → recompute_w_u → chunk_delta_h → chunk_gla_o_gk） | ❌ TODO: `sgl_kernel_zeus.chunk_kda`（7 个子 kernel 组装） |
-| 8 | `o_norm` —— `FusedRMSNormGated(out, g_gate, activation="sigmoid")` | 两路共享 | `[T, H_qkv]`, g=sigmoid | Triton `layer_norm_gated_fwd_kernel`（`fla/kda.py:159,239`） | ❌ TODO: `sgl_kernel_zeus.rms_norm_gated`（或扩展现有 rmsnorm） |
+| 8 | `o_norm` —— `FusedRMSNormGated(out, g_gate, activation="sigmoid")` | 两路共享 | `[T, H_qkv]`, g=sigmoid | Triton `layer_norm_gated_fwd_kernel`（`fla/kda.py:159,239`） | ✅ `sgl_kernel_zeus.rms_norm_gated`（`csrc/mamba/rms_norm_gated_{kernel.py,zeus.cpp}`，24 tests PASS；两遍多 tile reduce 适配 H_qkv=2048；mean(x²) 而非 sum；activation=sigmoid；weight=1 固定）|
 | 9 | `o_proj` | 两路共享 | `[T, H_qkv] → [T, H]` | GEMM | ✅ `linear_zeus` |
-| 10 | cache update（conv_state / ssm_states） | 两路共享 | in-place | pointer scatter | ⚠️ 需要对齐 `req_to_token_pool.mamba2_layer_cache`（Zeus 侧内存池兼容性未验证） |
+| 10 | cache update（conv_state / ssm_states） | 两路共享 | in-place | pointer scatter | ✅ `sgl_kernel_zeus.cache_index_gather` / `cache_index_scatter`（独立 row-level DMA，48 tests PASS；行内 contiguous + 行间 indirected）+ **生产路径已不再需要**：conv_state pool 由 `causal_conv1d_update_indexed` 内嵌寻址；ssm_state pool 由 `fused_recurrent_kda_Sdecay_indexed` 内嵌寻址。两个独立算子保留作为 conv1d_update_qkv / chunk_kda 等待融合 kernel 的 fallback + 通用工具。 |
 
 **不在本文档 scope**：
 - full-attn layer（走 `DeepseekV2AttentionMLA` / MLA 路径，是另一条完全不同的
@@ -127,37 +127,42 @@ q/k/v_proj_states│           │                   │                        
      │           │           │                                             │
      │           │           │                                      g [T,Nh,D] fp32
      │           │           │
-     │ ← conv_state_q/k/v [B,Hp,K-1] bf16  (from cache；Zeus 不需转置)
+     │ ← conv_state_q/k/v_pool [N_pool,Hp,K-1] bf16  (full pool；Zeus indexed
+     │   kernel 内部按 cache_indices[n] 寻址、in-place 更新对应 slot)
      │           │           │
      └───────────┴───────────┘
                  │
      ┌───────────────────────────────────────────────────────────────────┐
-(2a) │  causal_conv1d_update × 3（q / k / v 各调一次）                  │
+(2a) │  causal_conv1d_update_indexed × 3（q / k / v 各调一次）          │
      │  (sgl_kernel_zeus)                                                │
-     │  silu(Σ_k [state; x_c][k] * w[c,k] + bias[c])                  │
-     │  conv_state 原位左移：[state[1..K-1], x_c] → state[0..K-1]      │
+     │  对每 batch 元素 n： slot = cache_indices[n]                     │
+     │  silu(Σ_k [pool[slot,:,k]; x_c][k] * w[c,k] + bias[c])           │
+     │  pool[slot] 原位左移 + 追加 x_c；其它 slot 保持不变             │
      └───────────────────────────────────────────────────────────────────┘
                  │
   q [T,Hp] bf16    k [T,Hp] bf16    v [T,Hp] bf16
                  │
           rearrange  "n (h d) → 1 n h d"
                  │
-  q / k / v  [1,T,Nh,D] bf16
+  q / k / v   [1,T,Nh,D] bf16
   g           [1,T,Nh,D] fp32    ← unsqueeze(0)
   beta        [1,T,Nh]   fp32    ← unsqueeze(0)
-  initial_state [B,Nh,D,D] fp32  ← ssm_states[cache_indices]
+  ssm_state_pool [N_pool,Nh,D,D] fp32  ← 直接传全局池（不做 gather）
+  cache_indices  [B] i32                ← 散点 slot id
                  │
                  ▼
      ┌───────────────────────────────────────────────────────────────────┐
-(6)  │  fused_recurrent_kda  (sgl_kernel_zeus)                          │
+(6)  │  fused_recurrent_kda_Sdecay_indexed  (sgl_kernel_zeus)           │
      │  k̂_t = l2norm(k_t),  q̂_t = l2norm(q_t)       ← (5) fused      │
-     │  S_t  = exp(g_t) · S_{t-1}                                       │
-     │         + β_t · (v_t − S_{t-1} k̂_t) ⊗ k̂_t                     │
-     │  o_t  = S_t q̂_t                                                  │
+     │  per request n: slot = cache_indices[n]                          │
+     │     S = pool[slot, :]    （load 一次）                            │
+     │     S ← exp(g_t) · S                                             │
+     │           + β_t · (v_t − S k̂_t) ⊗ k̂_t                          │
+     │     o_t = S q̂_t                                                  │
+     │     pool[slot, :] = S    （store 一次）                           │
      └───────────────────────────┬───────────────────────────────────────┘
                                  │  core_attn_out [1,T,Nh,D] bf16
-                                 │  final_state   [B,Nh,D,D] fp32
-                                 │     └──→ ssm_states[cache_indices]      (10)
+                                 │  pool[cache_indices] 已被原地更新 (10)
                                  │
   x →(1)g_a_proj→[T,D]→(1)g_b_proj→[T,Hp]→rearrange→ g_gate [T,Nh,D] bf16
                                  │                                      │
@@ -316,7 +321,21 @@ projection（q/k/v/b/f_a/f_b/g_a/g_b）复用 `linear_zeus`（qwen demo 已验�
    的等价性检查。
 5. `fused_recurrent_kda` —— **decode core**。recurrent 形态，单步/多步
    （cu_seqlens 展平 batch）；输出 `[1, T, num_heads, head_dim]` + 更新后
-   `final_state`。Zeus 侧是 v1 最小闭环，不追求 autotune。
+   `final_state`。Zeus 侧是 v1 最小闭环，不追求 autotune。**已落地**两版：
+   - **生产默认** (`fused_recurrent_kda_Sdecay`)：S 先 decay → 用未折叠 k 做 v̂
+     readout → outer-update。**与 CUDA fla 参考同形态**（`fla/fused_recurrent.py`
+     的 `fused_recurrent_gated_delta_rule_fwd_kernel` 即此顺序），少一次
+     `k_eff = k · decay` 的 K 维向量乘，寄存器路径直观。生产 decode 链路与
+     端到端 stage（`kimi_delta_attn_decode`）默认调用此版本。
+   - **Tensor Core GEMV 实验** (`fused_recurrent_kda`)：decay 折进 k → v̂ readout
+     → outer-update → S 末尾衰减；v̂ 与 o_t 都用 `tl.dot([1,K] bf16, [K,V] bf16)
+     → [1,V] fp32` 走 Zeus 矩阵引擎，state 经 `memory_type='weight'` 落 weight 内存层、
+     9b 之前的 element-wise S·decay 显式再 load 一份到 share 层。作真核
+     Tensor Core 路径的精度 / 调度验证，**不是生产入口**。
+   - 两版**数学严格等价**：`Σ_k (S[k,:]·decay[k]) · k̂[k] ≡ Σ_k S[k,:] · (k̂[k]·decay[k])`，
+     S_new 与 o[t] 完全一致；当前两版 sim.c 算法体一致，dev parity max_diff = 0；
+     真核 porting 后预期 parity 落入 ~1 ULP（baseline 的 `k_eff` 多 1 次 bf16 RNE）。
+     详见 `sgl-kernel-zeus/docs/fused_recurrent_kda_Sdecay.md`。
 6. `chunk_kda` —— **extend core**。7-sub-kernel 流水线，先拼对 "单个短
    seq" 再试 cu_seqlens varlen。建议 Zeus 侧按
    `cumsum → scaled_dot_kkt → solve_tril → recompute_w_u → chunk_delta_h →
@@ -335,7 +354,18 @@ stage 8/9 是**分别独立**的，和 MoE 端到端 `moe_block_full` 的关系�
 它们不共享 REF 实现（REF 侧 decode 用 recurrent torch loop，extend 用
 chunk-wise torch loop），需要各自单独拼装。
 
+### 2026-04-24 · l2norm 落地
+
+- 交付：五件套全部完成 + docs/l2norm.md + docs/l2norm_slides.html，21 个 pytest PASS。
+- Zeus 侧接口：`sgl_kernel_zeus.l2norm(x, eps=1e-6, scale=None, out=None)`。
+  - 输入接受任意 `[*, D]` bf16，Python API 内部 `reshape(-1, D)`，kernel 看到 `[N, D]`，返回前 reshape 回原 shape。
+  - CORE_NUM=2 沿 N（行）维 **ceiling division**：`N_per_core = ceil(N / CORE_NUM)`，无 `N % 2 == 0` 约束，边界行由 `boundary_check` 自动掩码。
+  - per-row reduce 在单个 `[BLOCK_T, BLOCK_D]` tile 内完成：`tl.sum(x*x, axis=1)` + `tl.sqrt` + `/ norm[:, None]`；BLOCK_D=128 覆盖 KDA head_dim=128。
+  - OOB D 列补零不影响 sum_sq（0²=0）；OOB 行的 store 被 boundary_check 掩码，不写入输出。
+  - `scale=None` 通过 `HAS_SCALE=False` constexpr 分支在编译期消除乘法（与 `scale=1.0` 不同，后者仍执行一次向量乘）。
+
 ## 开发日志
+
 
 ### 2026-04-23 · 起点
 
@@ -708,3 +738,100 @@ Decode 阶段（每 req 1 token）：
   是为了适配 triton kernel 的内存排布（`[H_qkv, K-1]` vs `[K-1, H_qkv]`）。
   Zeus 侧 porting 时要先决定内部 layout，再在 host wrapper 中处理转置/视图，
   **不要**把转置代价下沉进 kernel 热路径。
+
+## 开发日志
+
+### 2026-04-24 — stage #5 l2norm 完成
+
+- **交付**：`sgl_kernel_zeus.l2norm`，五件套 + docs/l2norm.md + docs/l2norm_slides.html。
+- **关键决策**：CORE_NUM ceiling division over N 行，无 N%2 约束；单 tile per-row reduce（BLOCK_D≥D，适用于 KDA head_dim=128）；OOB 零填充不影响 sum_sq（0²=0）；HAS_SCALE 消除 scale=None 时的额外乘法。
+- **测试**：21 tests PASS（多种形状 + 3D/4D multi-dim + unit-norm 验证 + scale=None/1.0 等价 + preallocated out + 4 rejection tests）。
+
+### 2026-04-24 — stage #8 rms_norm_gated 完成
+
+- **交付**：`sgl_kernel_zeus.rms_norm_gated`，五件套 + docs/rms_norm_gated.md + docs/rms_norm_gated_slides.html。
+- **关键决策**：两遍多 tile reduce（Phase 1 累加 sum_sq，Phase 2 normalize+gate）适配 H_qkv=2048（D_blocks=16）；mean(x²) 而非 sum(x²)；activation=sigmoid（非 swish）；weight=1 固定（无可学习 γ）；CORE_NUM ceiling division over N，无整除约束。
+- **sim.c**：两遍 for 循环，fp32 累加，`1/(1+expf(-gv))` sigmoid，RNE round 写 bf16。
+- **测试**：24 tests PASS（11 种形状 + KDA 生产 shape [4,2048] + 3D/4D + preallocated + large_g/zero_g 语义验证 + 7 rejection tests）；原有 94 tests（causal_conv1d×26 + qkv + fused_kda_gate×19 + l2norm×21）全部 regression 通过。
+
+### 2026-04-27 — stage #6 fused_recurrent_kda 两版落地（生产默认 = Sdecay）
+
+- **角色分配**：
+  - **生产默认** = `sgl_kernel_zeus.fused_recurrent_kda_Sdecay`（21 tests PASS）。S 先 decay 再 readout，**与 CUDA fla 参考严格同形态**，operations 比 baseline 少一次 K 维向量乘（`k_eff = k · decay`）；寄存器路径与 sim.c / 数学公式一一对应。生产 decode 链路、端到端 stage `kimi_delta_attn_decode`、未来集成到 `KimiLinearAttnBackend.forward_decode` 时**默认调用此版本**。
+  - **Tensor Core GEMV 实验** = `sgl_kernel_zeus.fused_recurrent_kda`（18 tests PASS）。decay 折进 k 形态，v̂ 与 o_t 都用 `tl.dot([1,K] bf16, [K,V] bf16) → [1,V] fp32` 走 Zeus 矩阵引擎；state 经 `memory_type='weight'` 落 weight 内存层、9b 之前显式再 load 一份到 share 层。作真核 Tensor Core 路径的精度 / 调度验证用，**不是生产入口**。
+- **共 39 tests PASS**（生产默认 21 + TC 实验 18），dev stage `fused_recurrent_kda_Sdecay` / `fused_recurrent_kda` 均 PASS（vs pure-torch REF + 互比 parity）。
+- **Zeus 侧接口**（两 op 入参完全相同）：
+  - `sgl_kernel_zeus.fused_recurrent_kda_Sdecay(q, k, v, g, beta, initial_state, cu_seqlens, scale=None, eps=1e-6, use_qk_l2norm_in_kernel=True, output_final_state=True, inplace_final_state=True, o=None)` ← **默认调这个**
+  - `sgl_kernel_zeus.fused_recurrent_kda(...)` ← TC 实验，签名同上
+  - 两者都 in-place 更新 `initial_state` 为 final_state；返回 `(o, final_state_alias)`。
+- **数学等价依据**：`Σ_k (S[k,:]·decay[k]) · k̂[k] ≡ Σ_k S[k,:] · (k̂[k]·decay[k])`（K 维分配律展开同表达式）。两版的 S_new 与 o[t] 完全一致；当前 sim 路径互比 max_diff = 0，真核 porting 后预期 parity 落入 ~1 ULP（来自 baseline 的 `k_eff` 多 1 次 bf16 RNE）。
+- **关键决策**（TC 实验版 baseline kernel）：
+  - 三层循环（request→head→token），CORE_NUM=2 沿 head 切 ceiling division。
+  - state 经 2D `make_block_ptr` `[N*H*BLOCK_K, BLOCK_V]` 暴露，load 直出 `[BLOCK_K, BLOCK_V]` 不 reshape；v1 host enforce K==V==128。
+  - S 在 token loop 内全程 **bf16 register working copy**；fp32 算术在操作数处 `.to(fp32)` cast，编译器折叠到张量计算流水。
+  - **矩阵引擎路径**：步骤 7 v̂ 与步骤 10 o_t 都用 `tl.dot([1,K] bf16, [K,V] bf16) → [1,V] fp32`，对齐 Zeus 的 PE 原生 bf16×bf16→fp32 路径。
+  - **双 memory tier 调度**：
+    - `memory_type='weight'`：初始 S load、10pre 的 store→load round-trip、final state store —— feed 矩阵引擎。
+    - **9b 之前显式再 load** 一次 S 到 share-mem（不带 memory_type），feed 向量引擎做 element-wise decay 乘法。
+    - 同一份 DRAM 内容两 tier 同步，避免向量引擎跨网络读 weight tier。
+  - **每 token 1 次 bf16 RNE**：发生在 10pre 的 `S_new_fp32.to(bf16) → store(weight-mem)` 处；store 同时把 in-loop final state 写回 DRAM，pair 末尾的 final store 主要兜底零 token 边界。
+- **生产默认（Sdecay）的关键决策**：保持 broadcast-multiply + `tl.sum` 形态（VP 路径），S 全程 fp32 register working；与 simple kernel 同形态，跨 token 无寄存器层 RNE，靠每 pair 末尾一次 fp32→bf16 RNE 写回 DRAM。
+- **sim.c**：fp32 标量循环（两个 sim 文件算法体一致，仅入口符号不同），与 dev_doc 公式一一对应；现在两版 sim 一致让 dev 互比 parity 完全为 0。真核 porting 后预期 parity 落入 ~1 ULP 范围。
+- **dev script**：新增 `_make_kda_inputs` 生成函数让两 stage 共用同一份输入；`fused_recurrent_kda_Sdecay` stage 同时验证 vs REF 与 vs baseline parity（atol/rtol=1e-2）。两个 stage 都覆盖 cfg.head_dim 用 v1 生产值 D=128。STAGES dispatch 把 Sdecay 放在 baseline 前面，`--stage all` 优先跑生产默认。
+
+### 2026-04-28 — stage #2a causal_conv1d_update_indexed 落地（融合 conv_state pool 寻址）
+
+- **交付**：五件套 + docs/causal_conv1d_update_indexed.md，38 tests PASS（28 vs REF 含 has_bias × use_silu 全组合 + 4 strict parity vs `gather → update → scatter` + 1 sequential decode + 1 preallocated + 4 rejection）；全量 mamba regression **293 PASS**。
+- **融合定位**：`causal_conv1d_update` 的 indexed-pool 变体——直接吃全局 `conv_state [N_pool, C, K-1]` bf16 + `cache_indices [N] i32`，省掉调用者侧 `cache_index_gather → update → cache_index_scatter` 的 2 次额外 launch + 1 次 `B×C×(K-1)×2B` DRAM 来回（KDA 典型: B=8, C=4096, K=4 → 192 KB / launch；q/k/v 三份 → **576 KB / layer / step**）。conv1d_update 的外层 batch 循环天然就是"进新 batch 元素 → load state → 跑 → store state"，gather/scatter 的紧凑中间布局对 kernel 内部毫无价值。
+- **与非 indexed 版的全部差异**：仅外层 batch 循环开头多 1 行 `slot = cache_indices[n_block]` + conv_state advance 首维从 `n_start` 改为 `slot`。中间 7 步（state cols accumulate + fused left-shift + x·w_last + activation + store out + store last col）一字未改。sim.c 与非 indexed 同构，只是 state 行偏移用 `slot * C * Ks + ...` 替原 `n * C * Ks + ...`。
+- **BLOCK_N 强制为 1**：indexed 路径下 `[BLOCK_N, *]` tile 内的 n 们各落不同 slot，无法用 contiguous block_ptr advance；BLOCK_N=1 让每个 outer 迭代处理 1 个 batch 元素，slot 在 C 循环内为常量。N 通常 ≤ 32，外层串行不是瓶颈，C 维 tile 才是真正并行轴。
+- **Zeus 接口**：`sgl_kernel_zeus.causal_conv1d_update_indexed(x, conv_state, cache_indices, weight, bias=None, activation=None, out=None)`；返回 `out`，pool 已原地更新。
+- **Strict parity 验收**：同输入分别走 `gather → update → scatter` 三步链 vs `_indexed` 一步直达，output 与最终 pool **bit-exact 相等**（atol=rtol=0），4 组随机 shape × scattered indices 全 PASS。
+- **正确性验收**：7 组 (N, C, K, indices, N_pool) 组合 × `(has_bias, use_silu)` 4 组 = 28 vs pure-torch REF；同时验证 pool 中"未被命中"的 slot **bit-exact 不变**（in-place 副作用边界）。
+- **与 CUDA 形态对齐**：CUDA `_causal_conv1d_update_kernel` 本来就有 `IS_CONTINUOUS_BATCHING` + `conv_state_indices_ptr` 分支；本变体 = Zeus 上的形态对齐。
+- **后续可融**：`causal_conv1d_update_qkv` 的 indexed 形态（三份 conv_state 共享同一组 cache_indices）；`causal_conv1d_fn` (extend) 也走同款融合，CUDA 已是这种形态。
+- 详见 `sgl-kernel-zeus/docs/causal_conv1d_update_indexed.md`。
+
+### 2026-04-28 — stage #6 fused_recurrent_kda_Sdecay_indexed 落地（融合 ssm pool 寻址）
+
+- **交付**：五件套 + docs/fused_recurrent_kda_Sdecay_indexed.md，17 tests PASS（8 vs REF + 4 strict parity vs `gather → Sdecay → scatter` + 1 preallocated + 4 rejection）；全量 mamba regression 255 PASS。
+- **融合定位**：`fused_recurrent_kda_Sdecay` 的 indexed-pool 变体——直接吃全局 `ssm_states [N_pool, H, K, V]` fp32 + `cache_indices [N] i32`，省掉调用者侧 `cache_index_gather → Sdecay → cache_index_scatter` 的 2 次额外 launch + 1 次 `B×H×K×V×4B` DRAM 来回（`B=8, H=32, K=V=128` → 16 MB / layer / step）。recurrent kernel 的请求外循环天然就是 "进新 request → load S → 跑 → store S"，gather/scatter 提供的紧凑中间布局对 kernel 内部没有任何价值，indexed advance 一处即可消掉两次 IO。
+- **与 _Sdecay 的全部差异**：仅请求循环开头多 1 行 `slot = cache_indices[n_idx]` + pair_idx 公式从 `n_idx*H+h` 改为 `slot*H+h`。token loop 内部所有 12 步（decay → S·decay → v_hat → δ → outer-update → o readout → store）一字未改。sim.c 与 _Sdecay 同款，只是 state 行偏移 `(slot * H + h) * K * V` 替原 `(n * H + h) * K * V`。
+- **Zeus 接口**：`sgl_kernel_zeus.fused_recurrent_kda_Sdecay_indexed(q, k, v, g, beta, state_pool, cache_indices, cu_seqlens, ...)`；不返回 final_state（pool 已经原地更新，调用者按 slot 自取）。
+- **Strict parity 验收**：同一份输入分别走 `gather → Sdecay → scatter` 三步链 vs `Sdecay_indexed` 一步直达，`o` 与最终 pool **bit-exact 相等**（atol=rtol=0）—— 同 sim 算法 + 同标量算术顺序 → 必然位级一致；4 组随机 shape × scattered indices 全 PASS。
+- **正确性验收**：8 组 (seq_lens, H, indices, N_pool) 组合 vs pure-torch REF（atol/rtol=2e-2）；同时验证 pool 中"未被命中"的 slot **bit-exact 不变**（in-place 副作用边界）。
+- **与 CUDA 形态对齐**：CUDA fla `fused_recurrent_gated_delta_rule_fwd_kernel` 本来就是直接对全局池做 indexed 寻址（stride trick），不会先 gather；本变体 = Zeus 上的形态对齐。
+- **后续可融**：把 indices 加进 `chunk_kda` (extend core, 待 porting) 时一开始就支持 indexed 形态；conv1d 类 kernel 加 `conv_state_indices` 是更进一步方向（性价比看 v2 perf profiling）。
+- 详见 `sgl-kernel-zeus/docs/fused_recurrent_kda_Sdecay_indexed.md`。
+
+### 2026-04-28 — stage #10 cache_index_gather / cache_index_scatter 落地
+
+- **交付**：双算子五件套全部完成 + docs/cache_index_gather_scatter.md，48 个 pytest PASS（24 gather + 24 scatter）；既有 90 个 mamba 测试 regression 通过。
+- **算子定位**：解决 KDA backend 与全局 state pool 之间的 row-level gather / scatter。Linear / Mamba 状态 cache 与传统 KV cache 的关键差异在于"不连续维度只在 slot 维（pool 首维）"——每请求占 1 个固定大小 slot，但 continuous batching 让活跃 batch 的 B 个 slot id 散点（如 `[3, 17, 42, 5]`）。pool 行内是 contiguous 的，故算子主体是 B 次 row-level DMA + 行间按 indices 跳转，**不是** element-level scatter。
+- **Zeus 侧接口（v1 bf16 only）**：
+  - `sgl_kernel_zeus.cache_index_gather(pool, indices, out=None)`：返回 `[B, *trailing]` bf16
+  - `sgl_kernel_zeus.cache_index_scatter(pool, src, indices)`：pool in-place，无返回值
+  - 任意 trailing 维由 Python API flatten 成 R；kernel 看到 `[N_pool, R]` / `[B, R]` 二维。indices 固定 int32。
+- **关键决策**：
+  - **CORE_NUM=2 沿 R 维 ceiling division**（不约束 B，与 l2norm / rms_norm_gated 同款）；R % CORE_NUM 不要求整除，OOB 列由 boundary_check 掩码。
+  - **三组 block_ptr 模板**（pool / src-or-out / indices）：indices 也走 `[1, B]` 2-D block_ptr 形态再 reshape 到 scalar，避免 1-D / raw-pointer load 路径下降弱。
+  - 双层 for：外层 `R_blocks` 列 tile，内层 `B` 次 indirected row DMA。每次 row 内是大块 contiguous DMA（默认 BLOCK_R=2048 bf16 = 4KB / DMA），落在 Zeus 片上 DMA 引擎舒适区。
+  - **纯数据搬运、无算术**：bf16 进 bf16 出，不升 fp32 / 不 RNE，与 l2norm 等带 reduce 的算子有明显差异；测试用 `atol=rtol=0` 严格逐 bit 比对。
+  - host 不做 indices 越界 elementwise 检查（生产路径每请求独占 slot，不会越界；查界开销留给上层）。
+- **sim.c**：单线程逐 b 行 `memcpy(R * sizeof(uint16_t))`；bf16 数据透传，与 triton 输出位级一致。
+- **v2 follow-up**：fp32 变体（用于 ssm_states，CUDA 上 fp32）；可选地把 indexed indirection 内嵌进 `causal_conv1d_update` / `fused_recurrent_kda` 以省一次 launch + 一次 pool 行的 DRAM 来回（CUDA 形态对齐）。
+- 详见 `sgl-kernel-zeus/docs/cache_index_gather_scatter.md`。
+
+### 2026-04-28 — stage #8 kimi_delta_attn_decode 端到端跑通（indexed 链路）
+
+- **交付**：`zeus_dev/dev_kimi_linear_attn_test.py::test_kimi_delta_attn_decode` 由"REF-only 骨架 + zeus_todo"升级为完整的 REF-vs-Zeus 对照；用 **indexed 版本** 的 `causal_conv1d_update_indexed` + `fused_recurrent_kda_Sdecay_indexed` 直接对全局 state 池做 slot 寻址，**无需** host 侧 `cache_index_gather`/`cache_index_scatter`。
+- **形状（dev proxy）**：N=2 decode batch、N_pool=16、cache_indices=[3, 5]（散点）、H=512 / Hh=8 / Hd=128（v1 强制 K=V=128）/ Hq=1024 / K=4。
+- **比对锚点（17 个）全 PASS**：
+  - 中间产物：conv_q/k/v_out（max_diff ≈ 1e-3）、g (kda_gate, max_diff ≈ 2e-7)、core_attn_out (max_diff ≈ 1.5e-5)、normed_out (max_diff ≈ 4e-3)、output (o_proj, max_diff ≈ 7.8e-3，e2e 容差 1e-2)
+  - touched pool slots（`indices=[3, 5]`）：conv_q/k/v_pool、ssm_pool 共 8 项与 REF 一致（conv pool max_diff=0；ssm pool max_diff ≈ 5e-4，fp32 累积层级）
+  - **untouched pool slots：14 slots × 4 pools = 56 项 bit-exact 不变**（`torch.equal` 严格相等，验证 indexed kernel 的 in-place 副作用边界）
+- **REF 路径**：CPU 上手动 `pool[indices]` gather → 非 indexed REF kernel chain → `pool[indices] = ...` scatter（与 CUDA backend `forward_decode` 形态一致）。
+- **Zeus 路径**：indexed kernel 一步直达——所有 conv_state / ssm_state pool 直接全量传入 kernel，kernel 内部按 `cache_indices[n]` 寻址 → 一次 launch 同时完成 read state + 计算 + 写回 state。
+- **跳过 projection**：与各 sub-stage 同款策略，直接从 post-projection 张量起步（`q/k/v_proj_states`、`b_proj_states`、`f_b_states`、`g_b_states`），让两条路径面对的 bf16 bits 完全相同，对比聚焦在 indexed kernel 链路本身。
+- **o_proj 收尾在 CPU 上做**：Zeus matmul 当前要求 packed weight，本 stage 不做 packing；统一在 CPU 上跑最后这一步线性变换，让 REF / Zeus 看到相同 matmul 实现。
+- **下一步**：把同款融合策略推到 `causal_conv1d_update_qkv_indexed`（一次 launch 同时更新 q/k/v 三份 conv_state，indices 共享）；待 `causal_conv1d_fn` + `chunk_kda` 落地后做 `kimi_delta_attn_extend` 端到端对照。
