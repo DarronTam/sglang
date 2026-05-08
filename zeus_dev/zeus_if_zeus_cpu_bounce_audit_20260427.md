@@ -1,10 +1,11 @@
 # torch_zeus 已支持算子与 SGLang `_is_zeus` CPU bounce 审计
 
-> 创建日期：2026-04-27 | 最后更新：2026-05-08②  
-> 本次更新：按**当前代码**重新整理，只统计**仍然存在**的 CPU bounce；已被最新代码修复的项不再列为现存问题。
+> 创建日期：2026-04-27 | 最后更新：2026-05-08③  
+> 本次更新：`aten::index.Tensor`（`index_get.cpp`）确认可用，所有 `index(read)` CPU bounce 已全部消除。
 > 前提更新（04-27）：`torch_zeus` 已支持 `aten::cumsum` 和 `aten::index_put / index_put_`。
 > 前提更新（05-08）：`torch_zeus` `neg / clamp / where / arange` 均已支持。
 > 前提更新（05-08②）：`sgl_kernel_zeus.build_kv_indices` 五件套已落地；`zeus_backend.py` 已切换到 device kernel 路径，CPU fallback 改为一次性 `logger.warning`。
+> 前提更新（05-08③）：`torch_zeus` 已注册 `aten::index.Tensor / index.Tensor_out`（`index_get.cpp`），支持 2-D fancy index + int32/int64 indices。`alloc_for_decode` last_loc、`filter_batch`、`_resolve_future_token_ids`、`logits_processor` gather loop 的 Zeus CPU 分支已全部删除，统一走 device 路径。
 
 ---
 
@@ -14,22 +15,23 @@
 
 1. **已解决，不再计入当前 CPU bounce**
    - `ReqToTokenPool.write()` 的整表 CPU roundtrip 已去掉
-   - `alloc_for_decode()` 从 `req_to_token` 读 `last_loc` 的行拷贝已去掉
+   - `alloc_for_decode()` 从 `req_to_token` 读 `last_loc` 的行拷贝已去掉（05-08③ 改为 device `aten::index.Tensor`）
    - `ZeusAttnBackend.init_forward_metadata()` 的 non-graph 整表 `req_to_token.cpu()` 已去掉
    - greedy `argmax` 不再有 Zeus 专门的 CPU workaround
+   - `index(read)` / gather 驱动的 CPU bounce 已全部消除（05-08③）：`filter_batch`、`_resolve_future_token_ids`、`logits_processor` gather loop 的 `_is_zeus` CPU 分支均已删除
 
 2. **仍存在的 CPU bounce**
-   - 这些分支背后依赖的能力当前仍缺失，或代码里还保留历史 CPU workaround
-   - 典型：`index` 读取（`aten::index_select` / gather 尚不支持）
+   - 截至 05-08③，因算子缺失导致的不必要 CPU bounce **已全部消除**，本类别当前无内容
 
 3. **设计上保留的 CPU bookkeeping**
-   - 这些不是“不必要 bounce”
+   - 这些不是"不必要 bounce"
    - 而是 Zeus 分支主动保留在 CPU 的状态管理
    - 典型：`ZeusPagedTokenToKVPoolAllocator`
+   - 另：`req_to_token_cpu` mirror 现仅服务 `_build_kv_indices_cpu` 回退路径，`last_loc` 已不依赖
 
 一句话：
 
-> 当前主链路最明显的 `req_to_token` 读写 bounce 已经被新代码消掉了；`cumsum` / `index_put` / `neg` / `clamp` / `where` / `arange` 也已具备 Zeus aten 实现。`overlap_utils` 和 `forward_batch_info` 的相关 CPU bounce 已随之消减。现在更值得继续关注的是 `index(read)` / gather 驱动的 metadata、batch 处理路径。
+> 截至 05-08③，SGLang Zeus 路径中不再有"因算子缺失导致的不必要 CPU bounce"：`cumsum` / `index_put` / `neg` / `clamp` / `where` / `arange` / `index.Tensor`（2-D fancy index）均已具备原生 Zeus 实现；`alloc_for_decode` last_loc、`filter_batch`、`_resolve_future_token_ids`、`logits_processor` gather loop 的 `_is_zeus` CPU 分支已全部删除。仅保留设计上必要的 CPU bookkeeping（`ZeusPagedTokenToKVPoolAllocator`）和 `_build_kv_indices_cpu` 回退 mirror。后续关注点转为 fp32 linearize 精度上限和 `req_pool_indices` dtype 统一。
 
 ---
 
@@ -104,9 +106,13 @@ PyTorch ATen dispatch，`sgl_kernel_zeus` 则是 SGLang 在 Zeus 上使用的
 
 ### 2.3 仍缺失、并且仍影响当前代码的关键算子
 
-| 算子 | 当前影响 |
-|---|---|
-| `index.Tensor_out` / `tensor[indices]` | graph metadata、schedule_batch.filter、logits gather |
+截至 2026-05-08③，主链路和 batch/logits 处理路径影响的关键算子均已具备：
+
+| 算子 | 状态 | 备注 |
+|---|---|---|
+| `index.Tensor` / `index.Tensor_out` | ✅ 已支持（05-08③） | `index_get.cpp` 注册，支持 2-D fancy index，int32/int64 indices；flat offset 用 fp32 累加，上限约 $2^{24}$（见风险注记） |
+
+**fp32 linearize 精度风险注记**：`index_get.cpp` 的 `zenl_linearize_indices` 用 fp32 中间量累加 flat offset。对 `req_to_token[pool_size, max_ctx_len]`，当 `pool_size × max_ctx_len > 2^{24} ≈ 16.7M`（如 `4096 × 8192`）时可能精度溢出，建议向 `index_get.cpp` 反馈改用 int32/int64 累加器。
 
 以下算子已于 2026-05-08 / 05-08② 支持，相关 bounce 已消减：
 
@@ -117,6 +123,7 @@ PyTorch ATen dispatch，`sgl_kernel_zeus` 则是 SGLang 在 Zeus 上使用的
 | `arange(int32)` | fp32, bf16, int8, int32, fp8_e4m3fn | `overlap_utils.py` alloc_future_indices、`forward_batch_info.py` extend_start_loc ✅ |
 | `neg(int32)` | fp32, bf16, int8, int32, fp8_e4m3fn | `scheduler.py` -future_indices.indices、`overlap_utils.py` -input_ids ✅ |
 | `sgl_kernel_zeus.build_kv_indices` | int32 ragged gather（五件套落地） | `zeus_backend.py` kv_indices 构建：CPU mirror gather → device kernel ✅ |
+| `index.Tensor` / `index.Tensor_out` | int32/int64 indices，2-D fancy index（05-08③） | `alloc_for_decode` last_loc、`filter_batch`、`_resolve_future_token_ids`、`logits_processor.py` gather loop ✅ |
 
 ### 2.4 关于 `argmax`
 
@@ -547,34 +554,9 @@ Later batch preparation / later consumer resolves future ids
 
 参考：
 
-- [common.py:461](/root/workspace/sglang/python/sglang/srt/mem_cache/common.py:461)
-- [common.py:467](/root/workspace/sglang/python/sglang/srt/mem_cache/common.py:467)
-- [common.py:485](/root/workspace/sglang/python/sglang/srt/mem_cache/common.py:485)
+- [common.py](/root/workspace/sglang/python/sglang/srt/mem_cache/common.py)
 
-当前仍存在：
-
-- Zeus 分支仍通过 `req_to_token_cpu` mirror 读取 `last_loc`
-- 因为普通路径里的 `req_to_token[req_pool_indices, seq_lens - 1]` 依赖 `index(read)` / gather
-
-当前已清理：
-
-- `seq_lens_next` 不再走 `(sl_cpu + token_per_req).to(device)`
-- 已统一为 `seq_lens_next = batch.seq_lens + token_per_req`
-- `locs` 已经是 `batch.seq_lens.clone()`，不再有旧的 `seq_lens.cpu().to(device)` 写法
-
-为什么还在：
-
-- `aten::index_put` 只解决 `req_to_token` 写入，不解决这里的高级索引读取
-- 在 `index(read)` / gather 没确认可用前，直接删除整个 Zeus 分支会让 `last_loc` 回到 device 高级索引路径，风险较高
-
-能否直接删：
-
-- **不能整段直接删**
-- 可以继续清理纯 `add/sub/clone` 这类小算术残留；目前本节相关的 `seq_lens_next` 已处理
-
-怎么消除：
-
-- 等 `index(read)` / gather 可用并验证后，把 `last_loc` 也统一到普通路径：
+✅ **已解决（05-08③）**：`alloc_for_decode` 中 Zeus 分支的 `req_to_token_cpu` mirror 读取已删除。`aten::index.Tensor` 确认可用后，统一改为：
 
 ```python
 last_loc = batch.req_to_token_pool.req_to_token[
@@ -583,7 +565,7 @@ last_loc = batch.req_to_token_pool.req_to_token[
 seq_lens_next = batch.seq_lens + token_per_req
 ```
 
-- 或者补一个 Zeus 专用 `get_last_loc` kernel，只把 `last_loc` 读取搬到 device
+`_is_zeus` 变量及 `is_zeus` import 已从 `common.py` 删除（该文件不再有 Zeus 特判）。
 
 ---
 
@@ -593,32 +575,19 @@ seq_lens_next = batch.seq_lens + token_per_req
 
 参考：
 
-- [overlap_utils.py:21](/root/workspace/sglang/python/sglang/srt/managers/overlap_utils.py:21)
-- [overlap_utils.py:118](/root/workspace/sglang/python/sglang/srt/managers/overlap_utils.py:118)
+- [overlap_utils.py](/root/workspace/sglang/python/sglang/srt/managers/overlap_utils.py)
 
-当前仍存在：
+✅ **已解决（05-08③）**：`_resolve_future_token_ids` 中的 `_is_zeus` 分支（`buf.cpu() + gather_indices.cpu()` CPU gather）已删除，统一走 device 路径：
 
-- `buf = future_token_ids_map.cpu()`（future buffer 整表拉回 CPU）
-- `gather_indices.cpu()` + `buf[gather_indices.cpu()]`（CPU index read）
+```python
+input_ids[:] = torch.where(
+    input_ids < 0,
+    future_token_ids_map[torch.clamp(-input_ids, min=0)],
+    input_ids,
+)
+```
 
-已解决（2026-05-08）：
-
-- `neg(int32)`：`-input_ids` 直接在 Zeus 上执行 ✅
-- `clamp(int32)`：`torch.clamp(-input_ids, min=0)` 直接在 Zeus 上执行 ✅
-- `where(int32)`：`torch.where(input_ids < 0, looked_up, input_ids)` 直接在 Zeus 上执行 ✅
-- `arange(int32)`：`alloc_future_indices` 中 `torch.arange(..., device=self.device)` 直接分配 ✅
-
-为什么还在：
-
-- `index(read)` / `aten::index_select` 缺失：`buf[gather_indices]` 无法在 Zeus 上做
-
-能否直接删：
-
-- **剩余 CPU 行不能删**
-
-怎么消除：
-
-- 补 `aten::index_select` / gather 后，`buf[gather_indices.cpu()]` 可移至 device
+保留的 `_is_zeus` 用途：`alloc_future_indices` 中 dtype 选择（`int32` vs `int64`，Zeus 无 int64 向量支持）；`token_ids_buf` dtype 选择（`int32`）。这些不属于 CPU bounce，正常保留。
 
 ### B. `managers/scheduler.py`
 
@@ -672,28 +641,9 @@ seq_lens_next = batch.seq_lens + token_per_req
 - [schedule_batch.py:1840](/root/workspace/sglang/python/sglang/srt/managers/schedule_batch.py:1840)
 - [schedule_batch.py:1890](/root/workspace/sglang/python/sglang/srt/managers/schedule_batch.py:1890)
 
-当前仍存在：
+✅ **已解决（05-08③）**：`filter_batch` 中的 `_is_zeus` 分支（`tensor.cpu()[ki_cpu].to(device)`）已删除，统一使用 `tensor[keep_indices_device]`（device 上已有 `keep_indices_device = torch.tensor(keep_indices, dtype=torch.int64).to(self.device)`）。
 
-- `self.seq_lens = (self.seq_lens.cpu() + 1).to(device)`
-- `self.orig_seq_lens = (self.orig_seq_lens.cpu() + 1).to(device)`
-- `tensor.cpu()[ki_cpu].to(self.device)` 的 batch 过滤
-- `torch.cat([x.cpu(), y.cpu()]).to(self.device)` 的 merge
-
-为什么还在：
-
-- `index(read)` 缺失
-- 虽然 `cat` 已支持，但当前代码尚未清理历史分支
-- `+1` 小算术分支也还没回归统一 device 路径
-
-能否直接删：
-
-- **部分能**
-
-怎么消除：
-
-- `cat` 相关分支：可以直接清理
-- `+1` 小算术分支：若 Zeus 上 `add` 路径验证无误，也可直接清理
-- `filter_batch` 的索引读取：仍需等 `index(read)` 或改造数据流
+保留的 `_is_zeus`（line 1779）：`if self.enable_overlap or _is_zeus:` 选择 `+= 1` vs `add_()` 的 in-place 写法，与 CPU bounce 无关，正常保留。
 
 ---
 
@@ -703,27 +653,13 @@ seq_lens_next = batch.seq_lens + token_per_req
 
 - [logits_processor.py:420](/root/workspace/sglang/python/sglang/srt/layers/logits_processor.py:420)
 
-当前仍存在：
+✅ **已解决（05-08③）**：`_is_zeus` 分支（CPU for 循环 `copy_` gather）已删除。`aten::index.Tensor`、`cumsum(int32)`、`arange(int32)`、`sub/mul` 均已原生支持，统一走 device 路径：
 
-- `seq_lens_cpu = ...cpu()`
-- `torch.arange(len(seq_lens_cpu))`
-- 用 Python `for` 循环逐行 `copy_(hidden[idx])`
-
-为什么还在：
-
-- `index(read)` 缺失
-- `arange` 缺失
-- 虽然 `cumsum` 已支持，但该分支当前把 prefix sum、`arange`、gather/index 逻辑混在 CPU 控制流里，所以不能只靠替换一行 `cumsum` 完成 device 化
-
-能否直接删：
-
-- **不能**
-
-怎么消除：
-
-- 补 `index(read)` / gather
-- `arange` 配套解决
-- 再把 prefix sum 留在 Zeus device 上，与 gather/index 路径一起重写
+```python
+last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+pruned_states = hidden_states[last_index]
+```
+（padded 路径同理，`arange + mul + add - 1` 全在 device 上执行）
 
 ---
 
@@ -731,26 +667,9 @@ seq_lens_next = batch.seq_lens + token_per_req
 
 参考：
 
-- [radix_cache.py:42](/root/workspace/sglang/python/sglang/srt/mem_cache/radix_cache.py:42)
-- [radix_cache.py:416](/root/workspace/sglang/python/sglang/srt/mem_cache/radix_cache.py:416)
-- [radix_cache.py:543](/root/workspace/sglang/python/sglang/srt/mem_cache/radix_cache.py:543)
-- [radix_cache.py:631](/root/workspace/sglang/python/sglang/srt/mem_cache/radix_cache.py:631)
+- [radix_cache.py](/root/workspace/sglang/python/sglang/srt/mem_cache/radix_cache.py)
 
-当前仍存在：
-
-- `_cat_zeus()`：`torch.cat([t.cpu() for t in tensors]).to(device)`
-
-为什么还在：
-
-- 这是历史遗留，当前 `cat` 已支持
-
-能否直接删：
-
-- **能**
-
-怎么消除：
-
-- 删除 `_cat_zeus()`，直接统一成 `torch.cat`
+✅ `_cat_zeus()` 已不存在于当前代码，`_is_zeus` 变量声明保留但无其他使用点（可后续一并清理）。
 
 ---
 
@@ -775,33 +694,23 @@ seq_lens_next = batch.seq_lens + token_per_req
 
 ## 6. 当前代码下，哪些项应该优先做
 
-### P0：继续清理已失效的历史分支
+### P0（已全部完成）
 
-1. `radix_cache.py` 里的 `_cat_zeus()`
-2. `schedule_batch.py` 里的 `cat` CPU 分支
-3. `schedule_batch.py` 里仅依赖 `add/sub` 的小算术 Zeus 分支
+- ✅ `radix_cache.py` `_cat_zeus()`：已不存在
+- ✅ `schedule_batch.py` filter_batch CPU 分支：05-08③ 删除
+- ✅ `schedule_batch.py` / `common.py` 小算术 Zeus 分支：已清理
 
-这些项不依赖新 kernel，最容易清掉。
+### P1（已全部完成）
 
-### P1：主链路第二阶段优化
+- ✅ `alloc_for_decode` last_loc mirror 读取：05-08③ 改为 device index
+- ✅ `overlap_utils._resolve_future_token_ids` gather：05-08③ 统一 device
+- ✅ `logits_processor.py` gather loop：05-08③ 统一 device
 
-1. 继续减少 attention metadata 的 host 计算
-2. 等 `index(read)` / gather 可用后，再考虑删除 `common.py` 里的 `last_loc` mirror 读取分支
+### P2：剩余关注点（非 CPU bounce）
 
-### P2：补缺失算子 / 应用已支持算子
-
-以下已完成（2026-05-08）：
-
-- ✅ `arange(int32)`、`neg(int32)`、`clamp(int32)`、`where(int32)` — torch_zeus 全 4 层已支持
-- ✅ 相关 SGLang 侧 bounce 已消减（overlap_utils / scheduler / forward_batch_info）
-
-剩余（依赖 `aten::index_select` / gather）：
-
-1. `index(read)` / gather — 消除后可继续清理：
-   - `overlap_utils._resolve_future_token_ids` 中的 `buf[gather_indices.cpu()]`
-   - `logits_processor.py:420` 中的 gather loop
-   - `common.py` 中的 `last_loc` mirror 读取分支
-2. 清理 `schedule_batch.py` 中的 `tensor.cpu()[ki_cpu].to(device)` filter 分支
+1. **fp32 linearize 精度上限**：`index_get.cpp` flat offset 用 fp32 累加，`pool_size × ctx_len > 2^{24}` 时可能溢出 → 向 `index_get.cpp` 反馈改用 int32/int64 累加器
+2. **`req_pool_indices` dtype**：`alloc_for_extend` 仍以 `int64` 构造；`zeus_backend._build_kv_indices_device` 和 `attention.py` 各有一次防御性 cast → 可将 `alloc_for_extend` 改用 `zeus_index_dtype` 从根源消除 cast
+3. **`req_to_token_cpu` mirror 弱化**：`last_loc` 已 device 化；mirror 现只服务 `_build_kv_indices_cpu` 回退路径，等 device kernel 覆盖率稳定后可降级为 debug-only
 
 ## 6.1 剩余 `cumsum` 调用点优先级表
 
@@ -814,7 +723,7 @@ seq_lens_next = batch.seq_lens + token_per_req
 | 主链路 | [zeus_backend.py:100](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:100), [zeus_backend.py:149](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:149), [zeus_backend.py:168](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:168) | 构 `kv_indptr / qo_indptr` | 已处理 | 已改为 Zeus device `torch.cumsum`；剩余问题转为 `kv_indices` 的 ragged gather |
 | Batch | [forward_batch_info.py:1081](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1081), [forward_batch_info.py:1118](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1118) | 构 `prefix_chunk_cu_seq_lens`、`kv_indptr` | 已处理 | 这两处是纯 `cumsum` CPU 绕路，已改为 Zeus device `torch.cumsum` |
 | Batch | [forward_batch_info.py:compute_position_torch](/root/workspace/sglang/python/sglang/srt/model_executor/forward_batch_info.py:1257) | 构 `extend_start_loc` via cumsum | ✅ 已处理 | `arange(int32)` + `cumsum` 均已原生 Zeus；仍需 `.cpu().tolist()` 获取 Python 标量 |
-| Logits | [logits_processor.py:420](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/logits_processor.py:420) | 构最后 token 的线性下标 | 暂不处理 | 该分支还依赖 gather / index 逻辑，先不只改 `cumsum` |
+| Logits | [logits_processor.py:420](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/logits_processor.py:420) | 构最后 token 的线性下标 | ✅ 已处理（05-08③） | `index.Tensor` 可用后，`_is_zeus` gather loop 已删除；统一走 `hidden_states[last_index]` |
 
 补充说明：
 
@@ -829,5 +738,4 @@ seq_lens_next = batch.seq_lens + token_per_req
 
 这份文档按最新代码重排后，最重要的变化是：
 
-> `req_to_token` 读写和 `kv_metadata` 相关的主链路大块 CPU bounce 已经被解决，不应再继续作为“当前未解决问题”统计。  
-> 现在更准确的说法是：主链路上已基本没有"不必要的大块 CPU bounce"；`neg / clamp / where / arange(int32)` 于 2026-05-08 完成 torch_zeus int32 支持，overlap / scheduler / forward_batch_info 相关 CPU bounce 已消减。`build_kv_indices` device kernel（五件套 + `zeus_backend.py` 切换）已于 2026-05-08② 落地，`kv_indices` ragged gather 可在 Zeus device 上执行，CPU fallback 路径保留并改为一次性 `logger.warning` 提示。当前真正残留的热点，主要集中在 `index(read)` / `aten::index_select` 缺失导致的 `buf[gather_indices]` gather（overlap_utils）和 logits gather loop（logits_processor）。
+> `aten::index.Tensor`（`index_get.cpp`）于 2026-05-08③ 确认可用后，主链路和 batch/logits 处理路径的所有 `index(read)` CPU bounce 已全部消除：`alloc_for_decode` last_loc 直接读 device `req_to_token`，`filter_batch` 统一用 `keep_indices_device`，`_resolve_future_token_ids` 和 `logits_processor` gather 统一走 device 路径。当前 SGLang Zeus 路径中不再有"因 operator 缺失导致的不必要 CPU bounce"，仅保留设计上必要的 CPU bookkeeping（`ZeusPagedTokenToKVPoolAllocator`）、dtype 选择（`int32` vs `int64`）和 `_build_kv_indices_cpu` 回退 mirror。后续关注点转为 fp32 linearize 精度上限和 `req_pool_indices` dtype 统一。

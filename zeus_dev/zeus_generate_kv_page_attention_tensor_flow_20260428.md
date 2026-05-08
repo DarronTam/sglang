@@ -1,6 +1,8 @@
 # Zeus `llm.generate` 到 KV Page Attention Tensor Shape/Dtype 推理
 
-本文从 `zeus_dev/demo_zeus_llm.py` 中的 `llm.generate(...)` 开始，梳理 SGLang Zeus 路径里一次文本生成请求如何进入 prefill/extend、decode，并最终构造 KV page attention 所需 metadata。重点关注 tensor 的 shape、dtype，以及 runtime 侧需要对齐的数据类型约定。
+> 文档版本：2026-05-08③（05-08③：`aten::index.Tensor` 确认可用，`last_loc` 改为 device 直读，CPU mirror 依赖已消除）
+
+本文从 `zeus_dev/demo_zeus_llm.py` 中的 `llm.generate(...)` 开始，梳理 SGLang Zeus 路径里一次文本生成请求如何进入 prefill/extend、decode，并最终构造 KV page attention 所需 metadata。重点关注 tensor 的 shape、dtype，以及 runtime 侧需要与 host 实现对齐的数据类型约定。
 
 示例入口配置：
 
@@ -60,7 +62,7 @@ demo_zeus_llm.py
 | 请求 tokenize/分发 | `python/sglang/srt/managers/tokenizer_manager.py::TokenizerManager.generate_request` | prompt tokenize，组装 tokenized request，发送给 scheduler | CPU 为主；token ids 仍是请求侧数据 |
 | scheduler 调度 | `python/sglang/srt/managers/scheduler.py::Scheduler.handle_generate_request` / `get_new_batch_prefill` / `run_batch` | 接收请求，构造 `ScheduleBatch`，决定 extend/decode batch | CPU Python 控制流；batch tensor 会逐步搬到 Zeus |
 | extend batch 准备 | `python/sglang/srt/managers/schedule_batch.py::ScheduleBatch.prepare_for_extend` | 构造 `input_ids/seq_lens/req_pool_indices/out_cache_loc`，分配 prompt KV slot | 控制流在 CPU；`input_ids/seq_lens/out_cache_loc` 等关键 tensor 在 Zeus |
-| decode batch 准备 | `python/sglang/srt/managers/schedule_batch.py::ScheduleBatch.prepare_for_decode` | 使用上一轮 sampled token，给每个 request 分配新 KV slot，更新 `seq_lens` | 控制流在 CPU；主要 batch tensor 在 Zeus；当前 `last_loc` 读取仍有 CPU fallback |
+| decode batch 准备 | `python/sglang/srt/managers/schedule_batch.py::ScheduleBatch.prepare_for_decode` | 使用上一轮 sampled token，给每个 request 分配新 KV slot，更新 `seq_lens` | 控制流在 CPU；主要 batch tensor 在 Zeus；`last_loc` 已直接从 device `req_to_token` 读取（05-08③）|
 | worker batch 转换 | `python/sglang/srt/managers/schedule_batch.py::ScheduleBatch.get_model_worker_batch` | 从 scheduler batch 提取 model forward 所需字段 | CPU Python dataclass/对象组织；内部 tensor 保持各自 device |
 | model worker | `python/sglang/srt/managers/tp_worker.py::TpModelWorker.forward_batch_generation` | 调用 `ForwardBatch.init_new`，进入 `model_runner.forward`，再做 sample | CPU 控制流；`ForwardBatch` 内模型输入 tensor 在 Zeus；sample 依赖 Zeus/torch 算子实现 |
 | forward batch 初始化 | `python/sglang/srt/model_executor/forward_batch_info.py::ForwardBatch.init_new` | 生成 positions、extend lens、绑定 req/token KV pool、attention backend | CPU 控制流；`positions/extend_seq_lens/extend_prefix_lens` 等在 Zeus |
@@ -80,7 +82,7 @@ demo_zeus_llm.py
 
 - CPU：Python API、tokenizer、scheduler、batch 决策、worker 调度等 control plane。
 - Zeus：模型 forward 主计算、Q/K/V projection、norm/MLP、KV cache 写入、paged attention kernel、`cumsum/index_put/cat/build_kv_indices` 等 tensor/kernel 操作。
-- 当前 CPU fallback：KV metadata 已 device 化；主链路里仍需重点关注 decode allocator 的 `last_loc` 读取是否还依赖 CPU mirror。
+- 当前 CPU 路径：KV metadata 已完全 device 化；decode allocator 的 `last_loc` 已于 05-08③ 改为直接从 device `req_to_token` 读取，不再依赖 CPU mirror。
 
 生成过程分两类 forward：
 
@@ -107,16 +109,20 @@ demo_zeus_llm.py
 
 `ScheduleBatch.prepare_for_extend` 主要把 Python request 列表压成 device tensor，并调用 allocator 分配本轮新增 token 的 KV slot。
 
-| Tensor / 字段 | Shape | Dtype | Device | 含义 |
+SGLang 通过 `zeus_index_dtype(device)` 函数判断当前设备：Zeus device 返回 `torch.int32`，否则返回 `torch.int64`（默认）。因此 `input_ids/seq_lens/out_cache_loc` 等用 `idx_dtype` 构造的 tensor 在 Zeus 上均为 `int32`，非 Zeus 上为 `int64`。
+
+| Tensor / 字段 | Shape | Dtype（Zeus） | Device | 含义 |
 | --- | --- | --- | --- | --- |
-| `input_ids` | `[T_ext]` | `int64` | `zeus` | 本轮需要送入模型的 token ids |
-| `seq_lens` | `[bs]` | `int64` | `zeus` | 每个 request 当前总长度 `L_i` |
-| `seq_lens_cpu` | `[bs]` | `int64` | `cpu` | `seq_lens` 的 CPU mirror，用于调度/部分 Zeus fallback |
-| `orig_seq_lens` | `[bs]` | `int32` | `zeus` | extend 前原始长度 |
-| `extend_seq_lens` | Python list 或后续 tensor `[bs]` | `int32` | `zeus` in `ForwardBatch` | 每个 request 的 `E_i` |
-| `extend_prefix_lens` | Python list 或后续 tensor `[bs]` | `int32` | `zeus` in `ForwardBatch` | 每个 request 的 `P_i` |
-| `req_pool_indices` | `[bs]` | 通常 `int64` | `zeus` | request 在 req pool 中的行号 |
-| `out_cache_loc` | `[T_ext]` | 通常 `int64` | `zeus` | 本轮新增 token 分配到的 KV slot |
+| `input_ids` | `[T_ext]` | **`int32`**（`zeus_index_dtype`） | `zeus` | 本轮需要送入模型的 token ids |
+| `seq_lens` | `[bs]` | **`int32`**（`zeus_index_dtype`） | `zeus` | 每个 request 当前总长度 `L_i` |
+| `seq_lens_cpu` | `[bs]` | `int64`（固定） | `cpu` | `seq_lens` 的 CPU mirror，调度/fallback 用；始终为 int64 |
+| `orig_seq_lens` | `[bs]` | `int32`（固定） | `zeus` | extend 前原始长度 |
+| `extend_seq_lens` | `[bs]` | `int32` | `zeus`（in `ForwardBatch`） | 每个 request 的 `E_i` |
+| `extend_prefix_lens` | `[bs]` | `int32` | `zeus`（in `ForwardBatch`） | 每个 request 的 `P_i` |
+| `req_pool_indices` | `[bs]` | **`int64`**（alloc 时用 `torch.int64` 构造） | `zeus` | request 在 req pool 中的行号；进入 metadata kernel 前需 cast 为 int32 |
+| `out_cache_loc` | `[T_ext]` | **`int32`**（`zeus_index_dtype`，由 `alloc_for_extend` 返回） | `zeus` | 本轮新增 token 分配到的 KV slot |
+
+> **注意**：`req_pool_indices` 在 `alloc_for_extend` 中以 `torch.int64` 创建（`req_pool_indices_cpu = torch.tensor(..., dtype=torch.int64)`），与 `seq_lens/out_cache_loc` 不同，**仍为 int64**。`zeus_backend.py` 的 `_build_kv_indices_device` 在调用 kernel 前会显式 cast 到 `int32`。
 
 首轮无 radix prefix 时，通常 `P_i = 0`，`E_i = L_i`，所以 `T_ext = sum(L_i)`。
 
@@ -153,6 +159,8 @@ qo_indptr[-1] = T_ext = sum(extend_seq_lens)
 
 当前 eager 路径里，`kv_indptr` 的 cumsum 已在 device 上完成；`kv_indices` 由 `sgl_kernel_zeus.build_kv_indices` 从 device `req_to_token` 直接构建，不再需要 `req_to_token_cpu` ragged gather。
 
+> **int64→int32 转换位置**：`seq_lens`（Zeus 上已为 int32）和 `req_pool_indices`（仍为 int64）在 `_build_kv_indices_device` 中均被检查并 cast 到 int32，再传给 `sgl_kernel_zeus.build_kv_indices`（kernel ABI 要求 int32）。Python API 层（`sgl_kernel_zeus/attention.py`）也做了相同的防御性 cast。
+
 ### 2.4 Attention Q/K/V 与 KV cache
 
 进入每层 `RadixAttention.forward` 后，Zeus backend 会先写 KV cache，再调用 page attention kernel。
@@ -185,27 +193,25 @@ kernel 通过 `kv_indices` 中的绝对 KV slot id 和 `page_size` 计算 page �
 
 ### 3.1 ScheduleBatch.prepare_for_decode
 
-| Tensor / 字段 | Shape | Dtype | Device | 含义 |
+| Tensor / 字段 | Shape | Dtype（Zeus） | Device | 含义 |
 | --- | --- | --- | --- | --- |
-| `input_ids` | `[bs]` | `int64` | `zeus` | 上一轮 sampler 产出的 token ids |
-| `seq_lens` | `[bs]` | `int64` | `zeus` | decode 后会加 1，表示 `L_i_new` |
-| `seq_lens_cpu` | `[bs]` | `int64` | `cpu` | CPU mirror，同步加 1 |
-| `req_pool_indices` | `[bs]` | 通常 `int64` | `zeus` | request pool 行号 |
-| `out_cache_loc` | `[bs]` | 通常 `int64` | `zeus` | 本轮每个 request 新 token 的 KV slot |
+| `input_ids` | `[bs]` | **`int32`**（`zeus_index_dtype`） | `zeus` | 上一轮 sampler 产出的 token ids |
+| `seq_lens` | `[bs]` | **`int32`**（`zeus_index_dtype`，由上轮保持） | `zeus` | decode 前加 1（`seq_lens = seq_lens + 1`），表示 `L_i_new` |
+| `seq_lens_cpu` | `[bs]` | `int64`（固定） | `cpu` | CPU mirror，同步加 1 |
+| `req_pool_indices` | `[bs]` | `int64`（alloc 时构造） | `zeus` | request pool 行号 |
+| `out_cache_loc` | `[bs]` | **`int32`**（`zeus_index_dtype`，allocator 返回） | `zeus` | 本轮每个 request 新 token 的 KV slot |
 
-当 `page_size > 1` 时，decode allocator 需要知道上一个 token 的 KV slot：
+当 `page_size > 1` 时，decode allocator 需要知道上一个 token 的 KV slot。05-08③ 后已直接从 device `req_to_token` 读取（`aten::index.Tensor` 在 Zeus 上已注册）：
 
-```text
-last_loc = req_to_token[req_idx, L_i_old - 1]
+```python
+# alloc_for_decode (mem_cache/common.py) 统一路径（05-08③）：
+last_loc = batch.req_to_token_pool.req_to_token[
+    batch.req_pool_indices, batch.seq_lens - 1
+]                                                        # device int32 2-D fancy index
+seq_lens_next = batch.seq_lens + token_per_req           # device int32 + 1
 ```
 
-当前 Zeus 路径为避免 device gather 缺失，使用 `req_to_token_cpu` 读取 `last_loc` 后再转回 device。然后用：
-
-```text
-seq_lens_next = seq_lens + 1
-```
-
-传给 paged token allocator。
+`page_size == 1` 时不需要 `last_loc`，直接 alloc token slots。`seq_lens_next` 以及 `last_loc` 均在 device 上完成，无 CPU 参与。
 
 ### 3.2 ReqToTokenPool 写入
 
@@ -220,11 +226,11 @@ req_to_token[req_pool_indices, L_i_old] = out_cache_loc
 | Tensor | Shape | Dtype | Device | 含义 |
 | --- | --- | --- | --- | --- |
 | `req_to_token` | `[req_pool_size, max_context_len]` | `int32` | `zeus` | request/token_pos 到 KV slot 的映射 |
-| `req_to_token_cpu` | `[req_pool_size, max_context_len]` | `int32` | `cpu` | Zeus mirror，用于当前部分 CPU fallback |
-| `locs` | `[bs]` | `int64` | `zeus` | 本轮写入 token position，值为 `L_i_old` |
-| `out_cache_loc.to(int32)` | `[bs]` | `int32` | `zeus` | 写入页表的 KV slot |
+| `req_to_token_cpu` | `[req_pool_size, max_context_len]` | `int32` | `cpu` | Zeus mirror，与 device 同步；`last_loc` 已改为 device 直读（05-08③）；mirror 现仅服务 `_build_kv_indices_cpu` 回退路径 |
+| `locs` | `[bs]` | **`int32`**（`= batch.seq_lens.clone()`，Zeus 上为 int32） | `zeus` | 本轮写入 token position，值为 `L_i_old`（decode 前的 seq_len） |
+| `out_cache_loc` 写入时 | `[bs]` | **`int32`**（Zeus 上已是 int32，写前调用 `.to(int32)` 确保） | `zeus` | 写入页表的 KV slot |
 
-这里 `index_put` 已有 torch_zeus aten 实现，因此写页表本身可以在 device 上完成；CPU mirror 仍用于后续 ragged read fallback。
+`ReqToTokenPool.write` 在 Zeus 路径下同时更新 device `req_to_token` 和 CPU mirror `req_to_token_cpu`。`index_put` 已有 torch_zeus 实现，device 写入可以在线完成。CPU mirror 写入保留，仅服务 `_build_kv_indices_cpu` 回退路径（device kernel 不可用时）；`last_loc` 已不再依赖 mirror（05-08③）。
 
 ### 3.3 Decode metadata 与 attention
 
@@ -470,18 +476,19 @@ page_id = kv_slot // page_size
 offset  = kv_slot % page_size
 ```
 
-### 5.2 调度层 int64 可以保留，但要在边界显式转换
+### 5.2 调度层 dtype：Zeus 已部分收敛为 int32
 
-SGLang 当前很多调度 tensor 是 `int64`：
+SGLang 通过 `zeus_index_dtype(device)` 在 Zeus device 上将若干 index tensor 直接构造为 `int32`，避免了下游 cast 开销；少数字段由于历史或 PyTorch indexing 原因仍保留 `int64`：
 
-| Tensor | 当前常见 dtype | 建议 |
-| --- | --- | --- |
-| `input_ids` | `int64` | 保持，embedding/token id 通常用 int64 |
-| `seq_lens` | `int64` | 调度层可保持；生成 `kv_indptr` 时输出 int32 |
-| `seq_lens_cpu` | `int64` | CPU 调度 mirror 可保持 |
-| `req_pool_indices` | 通常 `int64` | 如果只用于 kernel/页表，可考虑 runtime 内收敛为 int32；若 PyTorch indexing 仍需要 int64，则边界转换 |
-| `out_cache_loc` | 通常 `int64` | allocator 可保持；写 req-to-token 和传 kernel metadata 前转 int32 |
-| `positions` | `int64` | 保持，position embedding/rope 常用 int64 |
+| Tensor | Zeus 实际 dtype | 非 Zeus 实际 dtype | 说明 |
+| --- | --- | --- | --- |
+| `input_ids` | **`int32`**（`zeus_index_dtype`） | `int64` | embedding 层会做 int32→int64 promote（如需要）|
+| `seq_lens`（device） | **`int32`**（`zeus_index_dtype`） | `int64` | cumsum 时指定 `dtype=torch.int32` 输出 int32 的 `kv_indptr` |
+| `seq_lens_cpu` | `int64`（固定） | `int64` | CPU mirror，始终为 int64 |
+| `req_pool_indices` | **`int64`**（`alloc_for_extend` 中 `torch.tensor(..., dtype=torch.int64)` 构造） | `int64` | 进入 `build_kv_indices` 前 cast 为 int32（两处防御：`attention.py` + `zeus_backend.py`） |
+| `out_cache_loc` | **`int32`**（`zeus_index_dtype`） | `int64` | 写 `req_to_token` 时已经是 int32；`store_kv_cache` 直接使用 |
+| `locs`（decode write） | **`int32`**（`= seq_lens.clone()`） | `int64` | 写页表的 row index |
+| `positions` | `int64`（未经 `zeus_index_dtype`） | `int64` | RoPE 输入，保持 int64 没有问题 |
 
 也就是说，runtime 侧可以采用：
 
@@ -581,11 +588,12 @@ runtime 侧要特别避免两类错位：
 
 在只考虑 KV metadata 构建和 paged KV attention 主流程时，`kv_indptr/qo_indptr/kv_indices/prefix_lens` 已经可以在 device 上构建。当前还需要继续关注的是：
 
-| 位置 | CPU 操作 | 影响 | 可优化方向 |
-| --- | --- | --- | --- |
-| Python control plane | tokenizer、scheduler、batch 决策、对象/dataclass 组织 | 正常控制流，不属于无谓 tensor bounce | 保持 CPU 控制面即可 |
-| decode allocator 的 `last_loc` | 如果仍从 `req_to_token_cpu[req_idx, seq_len-1]` 读取 | decode 分配 page 时仍有一处 CPU mirror 读 | 增加/使用 device index read/gather，直接从 `req_to_token` 取 |
-| CPU mirror 维护 | `req_to_token_cpu` 仍可能为兼容路径同步 | metadata 已不依赖它，但其它 cache/free/debug 路径可能还用 | 梳理剩余读点后逐步删除或降级为 debug-only |
+| 位置 | CPU 操作 | 确认状态 | 影响 | 可优化方向 |
+| --- | --- | --- | --- | --- |
+| Python control plane | tokenizer、scheduler、batch 决策 | 正常控制面 | 正常控制流，不属于无谓 tensor bounce | 保持 CPU 控制面即可 |
+| decode `last_loc`（paged，`page_size > 1`） | `alloc_for_decode` 从 device `req_to_token` 直接 2-D fancy index | ✅ **已解决（05-08③）**：`aten::index.Tensor` 注册后统一 device 路径，`_is_zeus` CPU mirror 分支已删除 | 无额外 CPU bounce | — |
+| `req_to_token_cpu` 写入同步 | `ReqToTokenPool.write` Zeus 分支同时写 device 和 CPU mirror | 保留，服务 `_build_kv_indices_cpu` 回退路径 | 每轮 decode 写一次 CPU mirror（代价极小） | device kernel 覆盖率稳定后可降级为 debug-only |
+| `req_pool_indices` dtype | `alloc_for_extend` 以 `int64` 构造，进 kernel 前 cast | `zeus_backend._build_kv_indices_device` 和 `attention.py` 两处 cast | 一次小 cast，延迟可忽略 | 上游改用 `zeus_index_dtype` 构造 `req_pool_indices`，彻底消除 cast |
 
 已经在 device 上的 metadata 操作：
 
@@ -628,4 +636,80 @@ tokenized prompt
 - metadata ABI：`int32` 的 `kv_indptr/kv_indices/qo_indptr/prefix_lens/req_to_token`，其中 `kv_indices` 由 `build_kv_indices` 在 device 上构建。
 - data ABI：`bfloat16` 的 Q/K/V activation 和 `[num_pages, Hkv, page_size, head_dim]` paged KV cache。
 
-当前 KV metadata 构建已经完成 device 化闭环；后续 CPU 优化重点转为 decode allocator 的 `last_loc` device read，以及梳理 `req_to_token_cpu` mirror 是否仍被其它非 metadata 路径依赖。
+当前 KV metadata 构建和主链路 index(read) 操作已经完成 device 化闭环（05-08③）。后续关注点仅剩：`req_pool_indices` dtype 统一（改用 `zeus_index_dtype` 消除 `int64→int32` cast）；以及 `index_get.cpp` fp32 linearize 精度上限（`pool_size × max_ctx_len > 2^{24}` 时需改用 int32/int64 累加器）。
+
+## 10. Dtype 转换流水线（附录）
+
+以下展示 Zeus 路径关键 tensor 从构造到 kernel 消费的完整 dtype 变化链路，供 runtime 对接参考。
+
+### 10.1 Extend 路径
+
+```text
+prepare_for_extend (schedule_batch.py)
+  input_ids      : zeus_index_dtype → int32[T_ext]   @zeus
+  seq_lens       : zeus_index_dtype → int32[bs]      @zeus
+  seq_lens_cpu   : int64 固定       → int64[bs]      @cpu
+  req_pool_indices: int64 固定      → int64[bs]      @zeus   ← 注意：未用 zeus_index_dtype
+  out_cache_loc  : zeus_index_dtype → int32[T_ext]   @zeus
+  orig_seq_lens  : int32 固定       → int32[bs]      @zeus
+
+write_cache_indices / ReqToTokenPool.write
+  写 req_to_token[req_pool_indices, pos] = out_cache_loc.to(int32)
+  写 req_to_token_cpu 同步
+
+init_forward_metadata (zeus_backend.py)
+  kv_indptr[1:] = cumsum(seq_lens, dtype=int32)      → int32[bs+1] @zeus
+  _build_kv_indices_device:
+    req_pool_indices.to(int32) if int64             # cast
+    seq_lens.to(int32) if int64                     # 已是 int32，no-op
+    build_kv_indices(req_to_token, rpi32, sl32, kv_indptr, kv_indices_out)
+  kv_indices                                        → int32[T_kv]  @zeus
+  qo_indptr[1:] = cumsum(extend_seq_lens, int32)    → int32[bs+1]  @zeus
+  prefix_lens = extend_prefix_lens.to(int32)        → int32[bs]    @zeus
+
+extend_attention kernel ABI
+  q_  : bfloat16[T_ext, Hq, Dqk]
+  o_  : bfloat16[T_ext, Hq, Dv]
+  k_cache / v_cache : bfloat16[num_pages, Hkv, page_size, D]
+  kv_indptr, kv_indices, qo_indptr, prefix_lens : int32
+```
+
+### 10.2 Decode 路径
+
+```text
+prepare_for_decode (schedule_batch.py)
+  seq_lens  = seq_lens + 1                          → int32[bs]    @zeus  (继承 extend 后的 int32)
+  out_cache_loc : zeus_index_dtype                  → int32[bs]    @zeus
+
+alloc_for_decode (mem_cache/common.py) 统一路径（05-08③）
+  last_loc = req_to_token[req_pool_indices, seq_lens - 1]   # device 2-D index，int32
+  seq_lens_next = seq_lens + token_per_req          → int32[bs]    @zeus
+
+ReqToTokenPool.write
+  locs = seq_lens.clone()                           → int32[bs]    @zeus
+  req_to_token[req_pool_indices, locs] = out_cache_loc.to(int32)
+  req_to_token_cpu 同步
+
+init_forward_metadata (zeus_backend.py)
+  kv_indptr[1:] = cumsum(seq_lens, dtype=int32)    → int32[bs+1]  @zeus
+  _build_kv_indices_device:
+    req_pool_indices cast to int32                 # int64 → int32
+    build_kv_indices(...)
+  kv_indices                                       → int32[T_kv]  @zeus
+  (qo_indptr, prefix_lens = None for decode)
+
+decode_attention kernel ABI
+  q_  : bfloat16[bs, Hq, Dqk]
+  o_  : bfloat16[bs, Hq, Dv]
+  k_cache / v_cache : bfloat16[num_pages, Hkv, page_size, D]
+  kv_indptr, kv_indices : int32
+```
+
+### 10.3 Runtime 对接时需要特别关注的转换点
+
+| 转换点 | 当前位置 | 方向 | 必要原因 |
+| --- | --- | --- | --- |
+| `req_pool_indices` int64→int32 | `zeus_backend._build_kv_indices_device` + `attention.py` | int64 → int32 | kernel ABI 要求 int32；SGLang 内部用 int64 构造 |
+| `cumsum(seq_lens, dtype=int32)` | `zeus_backend.init_forward_metadata` | int32 in → int32 out（Zeus），int64 in → int32 out（non-Zeus） | 显式 `dtype` 参数保证输出类型 |
+| `extend_prefix_lens.to(int32)` | `zeus_backend.init_forward_metadata` | int32 → int32（no-op，defensive） | 防御性 cast |
+| `out_cache_loc.to(int32)` 写页表 | `alloc_for_decode` / `write_cache_indices` | int32 on Zeus → int32（no-op）；int64 on non-Zeus → int32 | `req_to_token` 要求 int32 |

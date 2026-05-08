@@ -1,9 +1,10 @@
 # Zeus 主链路 CPU Bounce 重新评估与实现方案
 
-> 创建日期：2026-04-27 | 最后更新：2026-05-08（2）  
+> 创建日期：2026-04-27 | 最后更新：2026-05-08③  
 > 前提更新（04-27）：`torch_zeus` 已支持 `aten::index_put`  
 > 前提更新（05-08）：`torch_zeus` `neg / clamp / where / arange` 均已新增 `int32` dtype 支持  
 > 前提更新（05-08②）：`sgl_kernel_zeus.build_kv_indices` 五件套已实现（triton 参考 + sim.c + host cpp + Python API + tests + docs）；`zeus_backend.py` 已切换到 device kernel 路径，CPU fallback 改为 `logger.warning` 一次性提示。  
+> 前提更新（05-08③）：`torch_zeus` 已注册 `aten::index.Tensor / index.Tensor_out`（`index_get.cpp`）；`alloc_for_decode` last_loc、`filter_batch`、`_resolve_future_token_ids`、`logits_processor` gather loop 的 Zeus CPU 分支已全部删除，统一走 device 路径。  
 > 目标：重新评估 `allocator + req_to_token 读写 + attention metadata + kv page attention` 这条链路上的 CPU bounce，并给出在当前前提下的最佳实现方案。
 
 ---
@@ -40,13 +41,21 @@
 | `overlap_utils.py` clamp/where/neg 去 bounce | `overlap_utils.py` | `clamp(-input_ids)` + `where` 原生 Zeus；仅 `buf[...]` index read 仍需 CPU |
 | `forward_batch_info.py` 三处 bounce 消减 | `forward_batch_info.py` | `extend_prefix_lens(sub)` / `extend_start_loc(arange int32)` / `clamp_position` 均原生 Zeus |
 
-**剩余（🔲）：**
+**05-08③ 新增已完成（✅）：**
+
+| 项目 | 位置 | 说明 |
+|---|---|---|
+| `alloc_for_decode` last_loc device 化 | `common.py` | `_is_zeus` CPU mirror 分支删除；统一 `req_to_token[req_pool_indices, seq_lens-1]` |
+| `filter_batch` device index | `schedule_batch.py` | `tensor.cpu()[ki_cpu].to(device)` 分支删除；统一 `tensor[keep_indices_device]` |
+| `_resolve_future_token_ids` device gather | `overlap_utils.py` | `buf.cpu()` + `gather_indices.cpu()` 分支删除；统一 `token_ids_buf[clamp(-input_ids, 0)]` |
+| `logits_processor` gather loop | `logits_processor.py:420` | CPU for-loop `copy_` 分支删除；统一 `hidden_states[last_index]` 在 device 上执行 |
+
+**仍保留的 CPU 路径（设计上保留，非不必要 bounce）：**
 
 | 项目 | 位置 | 原因 |
 |---|---|---|
-| `_resolve_future_token_ids` index(read) | `overlap_utils.py:24-25` | `buf[gather_indices]` 需要 `aten::index_select` / gather，Zeus 尚不支持 |
-| `logits_processor.py` gather loop | `logits_processor.py:420` | CPU arange + index gather loop，依赖 index(read) |
 | `build_kv_indices` CPU mirror 回退路径 | `zeus_backend._build_kv_indices_cpu_with_warning` | 当 `sgl_kernel_zeus` 未重建时自动降级；会发出一次性 `logger.warning` 提示重建命令 |
+| `req_to_token_cpu` mirror 写入 | `memory_pool.py ReqToTokenPool.write` | 服务 `_build_kv_indices_cpu` 回退路径；`last_loc` 已不再依赖 |
 
 ---
 
@@ -448,7 +457,7 @@ build_kv_metadata(
 | 主链路 | [zeus_backend.py:100](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:100), [zeus_backend.py:149](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:149), [zeus_backend.py:168](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:168) | 构 `kv_indptr / qo_indptr` | 已处理 | 已改为 Zeus device `torch.cumsum`；剩余问题转为 `kv_indices` 的 ragged gather |
 | Batch | [forward_batch_info.py:1081](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1081), [forward_batch_info.py:1118](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1118) | 构 `prefix_chunk_cu_seq_lens`、`kv_indptr` | 已处理 | 这两处是纯 `cumsum` CPU 绕路，已改为 Zeus device `torch.cumsum` |
 | Batch | [forward_batch_info.py:compute_position_torch](/root/workspace/sglang/python/sglang/srt/model_executor/forward_batch_info.py:1257) | 构 `extend_start_loc` via cumsum | ✅ 已处理 | `arange(int32)` + `cumsum` 均已原生 Zeus；仍需 `.cpu().tolist()` 获取 Python 标量驱动 range() |
-| Logits | [logits_processor.py:420](/root/workspace/sglang/python/sglang/srt/layers/logits_processor.py:420) | 构最后 token 的线性下标 | 🔲 暂不处理 | 该分支依赖 gather / index(read)，待 `aten::index_select` 支持后处理 |
+| Logits | [logits_processor.py:420](/root/workspace/sglang/python/sglang/srt/layers/logits_processor.py:420) | 构最后 token 的线性下标 | ✅ 已处理（05-08③） | `_is_zeus` gather loop 删除；统一 `hidden_states[last_index]`（device cumsum + index） |
 
 因此这里对 `cumsum` 的定位应更新为：
 
@@ -683,9 +692,13 @@ for b in batch:
 - ✅ 新增已完成：`scheduler.py` neg(int32) 去 CPU bounce
 - ✅ 新增已完成：`overlap_utils.py` clamp/where(int32) 去 CPU bounce
 - ✅ 新增已完成：`forward_batch_info.py` sub/arange/clamp(int32) 去 CPU bounce
-- 🔲 待处理：`overlap_utils._resolve_future_token_ids` — `buf[gather_indices]` index read（依赖 `aten::index_select`）
-- 🔲 待处理：`logits_processor.py:420` — CPU arange + gather loop（依赖 `aten::index_select`）
-- 🟢 P2 仍有效：Python-level device `cat` 过渡验证（已有 device aten，可直接使用）
+- ✅ 新增已完成（05-08③）：`alloc_for_decode` last_loc device 化（`aten::index.Tensor` 确认可用）
+- ✅ 新增已完成（05-08③）：`filter_batch` device index（`tensor[keep_indices_device]`）
+- ✅ 新增已完成（05-08③）：`overlap_utils._resolve_future_token_ids` device gather
+- ✅ 新增已完成（05-08③）：`logits_processor.py:420` device gather loop
+- 🟢 P2 关注：`index_get.cpp` fp32 linearize 精度上限（`pool_size × ctx_len > 2^{24}` 需改 int32/int64 累加器）
+- 🟢 P2 关注：`req_pool_indices` dtype 统一（`alloc_for_extend` 改用 `zeus_index_dtype` 消除 cast）
+- 🟢 P2 关注：`req_to_token_cpu` mirror 弱化（device kernel 稳定后降级为 debug-only）
 
 ---
 

@@ -1,37 +1,37 @@
 {
   "eager": {
     "1": {
-      "avg_latency_s": 6.6383,
+      "avg_latency_s": 5.9948,
       "avg_tokens": 8.0,
-      "throughput_tok_s": 1.21
+      "throughput_tok_s": 1.33
     },
     "4": {
-      "avg_latency_s": 55.0516,
+      "avg_latency_s": 59.4301,
       "avg_tokens": 125.0,
-      "throughput_tok_s": 2.27
+      "throughput_tok_s": 2.1
     },
     "8": {
-      "avg_latency_s": 84.2659,
+      "avg_latency_s": 97.5758,
       "avg_tokens": 197.0,
-      "throughput_tok_s": 2.34
+      "throughput_tok_s": 2.02
     },
     "memory_used_mb": 4096.0
   },
   "graph": {
     "1": {
-      "avg_latency_s": 6.0225,
+      "avg_latency_s": 6.3773,
       "avg_tokens": 8.0,
-      "throughput_tok_s": 1.33
+      "throughput_tok_s": 1.25
     },
     "4": {
-      "avg_latency_s": 41.1166,
+      "avg_latency_s": 45.8184,
       "avg_tokens": 93.7,
-      "throughput_tok_s": 2.28
+      "throughput_tok_s": 2.04
     },
     "8": {
-      "avg_latency_s": 81.8465,
+      "avg_latency_s": 92.4068,
       "avg_tokens": 193.0,
-      "throughput_tok_s": 2.36
+      "throughput_tok_s": 2.09
     },
     "memory_used_mb": 4096.0
   }
