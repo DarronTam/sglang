@@ -80,6 +80,7 @@ Its core features include:
    platforms/nvidia_jetson.md
    platforms/ascend_npu_support.rst
    platforms/xpu.md
+   platforms/zeus.md
 
 .. toctree::
    :maxdepth: 1
