@@ -24,8 +24,8 @@ must be built or installed against the active torch ABI.
 
 ```bash
 python -m pip install \
-  torch==2.9.1+cpu \
-  torchvision==0.24.1+cpu \
+  torch==2.10.0+cpu \
+  torchvision==0.25.0+cpu \
   --index-url https://download.pytorch.org/whl/cpu
 ```
 
@@ -85,7 +85,7 @@ PY
 Expected torch stack:
 
 ```text
-torch: 2.9.1+cpu
-torchvision: 0.24.1+cpu
+torch: 2.10.0+cpu
+torchvision: 0.25.0+cpu
 torch.zeus.is_available: True
 ```
