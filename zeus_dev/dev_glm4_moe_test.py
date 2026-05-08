@@ -33,6 +33,7 @@ Stage:
 
 import argparse
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -48,8 +49,26 @@ sglang.srt.server_args.get_global_server_args = lambda *a, **kw: _dummy_args
 
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
-REF_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+
+# def _resolve_ref_device():
+#     # Allow overriding reference device via environment variable:
+#     #   REF_DEVICE=zeus|cuda|cpu
+#     env = os.getenv("REF_DEVICE")
+#     if env:
+#         req = env.strip().lower()
+#         if req in ("zeus", "cuda", "cpu"):
+#             if req == "cuda" and not torch.cuda.is_available():
+#                 print("[warn] REF_DEVICE=cuda but CUDA is unavailable, fallback to cpu")
+#                 return "cpu"
+#             return req
+#         print(f"[warn] Unknown REF_DEVICE={env!r}, fallback to auto")
+#     return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# REF_DEVICE = _resolve_ref_device()
+
+REF_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 def load_glm4_config():
     cfg = json.loads(CONFIG_PATH.read_text())
@@ -847,9 +866,9 @@ def test_moe_block_full(cfg, num_tokens=16, seed=42):
     # ── Zeus 路径 ──
     # router_logits 在 REF 端已是 fp32，直接 .to('zeus') 喂 biased_grouped_topk。
     # shared_output 是 bf16，直接作为 residual 喂 moe_sum_reduce。
-    router_logits_z = router_logits_fp32.to("zeus")
+    router_logits_z = (router_logits_fp32.cpu() if router_logits_fp32.is_cuda else router_logits_fp32).to("zeus")
     corr_bias_z = corr_bias_fp32.to("zeus")
-    shared_out_z = shared_out_bf16.to("zeus")
+    shared_out_z = (shared_out_bf16.cpu() if shared_out_bf16.is_cuda else shared_out_bf16).to("zeus")
     x_z = x_bf16.to("zeus")
     w13_z = w13_bf16.to("zeus")
     w2_z = w2_bf16.to("zeus")

@@ -1,8 +1,9 @@
 # torch_zeus 已支持算子与 SGLang `_is_zeus` CPU bounce 审计
 
-> 日期：2026-04-27  
+> 创建日期：2026-04-27 | 最后更新：2026-05-08  
 > 本次更新：按**当前代码**重新整理，只统计**仍然存在**的 CPU bounce；已被最新代码修复的项不再列为现存问题。
-> 前提更新：`torch_zeus` 已支持 `aten::cumsum` 和 `aten::index_put / index_put_`。
+> 前提更新（04-27）：`torch_zeus` 已支持 `aten::cumsum` 和 `aten::index_put / index_put_`。
+> 前提更新（05-08）：`torch_zeus` `neg / clamp / where / arange` 均已支持。
 
 ---
 
@@ -18,7 +19,7 @@
 
 2. **仍存在的 CPU bounce**
    - 这些分支背后依赖的能力当前仍缺失，或代码里还保留历史 CPU workaround
-   - 典型：`index` 读取、`clamp`、`where`、`arange`、`neg(int)`
+   - 典型：`index` 读取（`aten::index_select` / gather 尚不支持）
 
 3. **设计上保留的 CPU bookkeeping**
    - 这些不是“不必要 bounce”
@@ -27,7 +28,7 @@
 
 一句话：
 
-> 当前主链路最明显的 `req_to_token` 读写 bounce 已经被新代码消掉了；`cumsum` / `index_put` 也已具备 Zeus aten 实现。现在更值得继续关注的是 `index(read)` 驱动的 metadata、batch 处理，以及 overlap 上的 `clamp / where / arange / neg(int)` 小算子路径。
+> 当前主链路最明显的 `req_to_token` 读写 bounce 已经被新代码消掉了；`cumsum` / `index_put` / `neg` / `clamp` / `where` / `arange` 也已具备 Zeus aten 实现。`overlap_utils` 和 `forward_batch_info` 的相关 CPU bounce 已随之消减。现在更值得继续关注的是 `index(read)` / gather 驱动的 metadata、batch 处理路径。
 
 ---
 
@@ -41,16 +42,25 @@
 
 - [torch_zeus_operator_analysis-20260415.md](/root/workspace/sglang/zeus_dev/torch_zeus_operator_analysis-20260415.md:1)
 - [sglang_zeus_manual.md](/root/workspace/sglang/zeus_dev/sglang_zeus_manual.md:1131)
+- torch_zeus `csrc/aten/operators/zenl/` + `zenl/src/host/` 源码（2026-05-08 核查）
 
-| 类别 | 算子 | 当前判断 |
-|---|---|---|
-| 拼接 | `cat`, `cat.out` | ✅ 原生 |
-| 算术 | `add`, `sub`, `mul` | ✅ 原生 |
-| 归约 | `sum`, `mean`, `norm` | ✅ 原生 |
-| 前缀和 | `cumsum` | ✅ 原生 |
-| GEMM | `mm`, `addmm`, `linear` | ✅ 原生 |
-| 索引写入 | `index_put_`, `index_put` | ✅ 原生 |
-| greedy 归约 | `argmax` | ✅ 当前代码已直接使用 |
+| 类别 | 算子 | 支持 dtype | 备注 |
+|---|---|---|---|
+| 拼接 | `cat`, `cat.out` | dtype 透传（不做限制） | ✅ 原生 |
+| 算术 | `add`（scalar 加） | fp32, bf16, int32 | ✅ scalar fast path；int64 自动降级到 int32（带一次性警告） |
+| 算术 | `add`（element-wise vector） | fp32, bf16, int8, fp8_e4m3fn | ✅ optensor 路径 |
+| 算术 | `sub`, `mul` | fp32, bf16, int8, fp8_e4m3fn | ✅ optensor 路径 |
+| 归约 | `sum`, `mean`, `norm` | fp32, bf16, int8, fp8_e4m3fn | ✅ reduce 内核 |
+| 前缀和 | `cumsum` | fp32, bf16, int32 | ✅ 原生；int64 输入按 PyTorch promote_integers 规则提升 |
+| GEMM | `mm`, `addmm`, `linear` | bf16, fp8_e4m3fn | ✅ 原生；权重须先 `pack_weights` 放入 LocalMem |
+| 索引写入 | `index_put_`, `index_put` | value dtype 透传；index: int32/int64 | ✅ 原生 |
+| 元素选取 | `neg` | fp32, bf16, int8, int32, fp8_e4m3fn | ✅ 原生 |
+| 元素选取 | `clamp` | fp32, bf16, int8, int32, fp8_e4m3fn | ✅ 原生；int8 遇浮点 bound 自动升 fp32 |
+| 条件选取 | `where` | value: fp32, bf16, int8, int32, fp8_e4m3fn；condition: bool | ✅ 原生 |
+| 序列生成 | `arange` | fp32, bf16, int8, int32, fp8_e4m3fn | ✅ 原生 |
+| Embedding | `embedding` | weight dtype 透传；index: int32/int64 | ✅ 原生 |
+| 非零索引 | `nonzero` | fp16, fp32, bf16, int8, uint8, int16, int32, bool, fp8_e4m3fn | ✅ 原生；output index 为 int64 |
+| greedy 归约 | `argmax` | fp32, bf16, int8, fp8_e4m3fn（经 reduce 路径） | ✅ 当前代码已直接使用 |
 
 ### 2.2 `sgl_kernel_zeus` 已支持 / 已接入的自定义 kernel
 
@@ -95,10 +105,15 @@ PyTorch ATen dispatch，`sgl_kernel_zeus` 则是 SGLang 在 Zeus 上使用的
 | 算子 | 当前影响 |
 |---|---|
 | `index.Tensor_out` / `tensor[indices]` | graph metadata、schedule_batch.filter、logits gather |
-| `clamp` | overlap、position |
-| `where` | overlap、NaN 替换 |
-| `arange(device=zeus)` | overlap、forward_batch_info |
-| `neg(int)` | overlap future index 标记 |
+
+以下算子已于 2026-05-08 支持，相关 bounce 已消减：
+
+| 算子 | 完整支持 dtype（05-08 后） | 已修复的影响位置 |
+|---|---|---|
+| `clamp(int32)` | fp32, bf16, int8, int32, fp8_e4m3fn | `overlap_utils.py` clamp(-input_ids)、`forward_batch_info.py` clamp_position ✅ |
+| `where(int32)` | fp32, bf16, int8, int32, fp8_e4m3fn | `overlap_utils.py` torch.where(ids<0, ...) ✅ |
+| `arange(int32)` | fp32, bf16, int8, int32, fp8_e4m3fn | `overlap_utils.py` alloc_future_indices、`forward_batch_info.py` extend_start_loc ✅ |
+| `neg(int32)` | fp32, bf16, int8, int32, fp8_e4m3fn | `scheduler.py` -future_indices.indices、`overlap_utils.py` -input_ids ✅ |
 
 ### 2.4 关于 `argmax`
 
@@ -108,6 +123,48 @@ PyTorch ATen dispatch，`sgl_kernel_zeus` 则是 SGLang 在 Zeus 上使用的
 - 当前 `sampler.py` 不再有 Zeus 专门的 `logits.cpu() -> argmax -> to(device)` workaround
 
 因此本审计中，`argmax` **不再计入当前仍存在的 CPU bounce**。
+
+### 2.5 torch_zeus 算子支持 dtype 速查矩阵
+
+> 数据来源：`torch_zeus/csrc/aten/operators/zenl/` ATen 层 + `zenl/src/host/` host 层源码，2026-05-08 核查。
+
+ZENL 内部 dtype 枚举（`zenl.h`）：
+
+| 枚举值 | 含义 | PyTorch `kType` |
+|---|---|---|
+| `ZENL_DTYPE_FLOAT32 = 1` | FP32 | `at::kFloat` |
+| `ZENL_DTYPE_FLOAT16 = 2` | FP16 | `at::kHalf` |
+| `ZENL_DTYPE_BFLOAT16 = 3` | BF16 | `at::kBFloat16` |
+| `ZENL_DTYPE_INT8 = 4` | INT8（有符号） | `at::kChar` |
+| `ZENL_DTYPE_UINT8 = 5` | UINT8 | `at::kByte` |
+| `ZENL_DTYPE_INT16 = 6` | INT16 | `at::kShort` |
+| `ZENL_DTYPE_INT32 = 7` | INT32 | `at::kInt` |
+| `ZENL_DTYPE_INT64 = 8` | INT64（无硬件向量支持） | `at::kLong` |
+| `ZENL_DTYPE_BOOL = 9` | Bool | `at::kBool` |
+| `ZENL_DTYPE_FLOAT8_E4M3FN = 10` | FP8 E4M3 | `at::kFloat8_e4m3fn` |
+
+> Zeus 芯片不支持 int64 / fp64 向量。int64 标量在 `add/sub` 等少数路径下可自动降级到 int32（带一次性警告）。
+
+各算子支持 dtype 矩阵：
+
+| 算子 | fp32 | bf16 | fp16 | int8 | uint8 | int16 | int32 | bool | fp8_e4m3fn | 备注 |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|---|
+| `neg` | ✅ | ✅ | — | ✅ | — | — | ✅ | — | ✅ | int32 于 05-08 新增 |
+| `clamp` | ✅ | ✅ | — | ✅ | — | — | ✅ | — | ✅ | int8 遇浮点 bound 自动提升 fp32；int32 于 05-08 新增 |
+| `where` | ✅ | ✅ | — | ✅ | — | — | ✅ | — | ✅ | condition 必须 bool；int32 于 05-08 新增 |
+| `arange` | ✅ | ✅ | — | ✅ | — | — | ✅ | — | ✅ | int32 于 05-08 新增 |
+| `cumsum` | ✅ | ✅ | — | — | — | — | ✅ | — | — | int64 按 PyTorch promote_integers 规则提升 |
+| `add`（scalar） | ✅ | ✅ | — | — | — | — | ✅ | — | — | int64 自动降级 int32（有警告） |
+| `add`（vector） | ✅ | ✅ | — | ✅ | — | — | — | — | ✅ | optensor element-wise 路径 |
+| `sub` | ✅ | ✅ | — | ✅ | — | — | — | — | ✅ | optensor |
+| `mul` | ✅ | ✅ | — | ✅ | — | — | — | — | ✅ | optensor |
+| `sum` / `mean` / `norm` | ✅ | ✅ | — | ✅ | — | — | — | — | ✅ | reduce 内核 |
+| `argmax` | ✅ | ✅ | — | ✅ | — | — | — | — | ✅ | 经 reduce 路径 |
+| `mm` / `addmm` / `linear` | — | ✅ | — | — | — | — | — | — | ✅ | 权重须先 `pack_weights` |
+| `index_put` / `index_put_` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | value dtype 透传；index 须 int32/int64 |
+| `embedding` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | weight dtype 透传；index 须 int32/int64 |
+| `cat` / `cat.out` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | dtype 透传 |
+| `nonzero` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | output index 为 int64 |
 
 ---
 
@@ -398,12 +455,12 @@ Scheduler.run_batch()
 FutureMap.alloc_future_indices(bs)      [managers/overlap_utils.py]
    |
    | allocate future slots: [f1, f2, ...]
-   | [仍存在小 bounce] arange 在 Zeus 下仍走历史 CPU 特判
+   | [已优化] arange(int32) 现原生 Zeus，直接在 device 上分配
    v
 future_indices
    |
    | encode as negative placeholders
-   | [仍存在小 bounce] (-future_indices.indices.cpu()).to(device)
+   | [已优化] neg(int32) 原生 Zeus；-future_indices.indices 直接在 device 上执行
    v
 (-future_indices.indices)               [managers/scheduler.py]
    |
@@ -416,10 +473,10 @@ batch.output_ids / next-step inputs
 FutureMap.resolve_future()
    |
    | where(ids < 0, future_buf[clamp(-ids)], ids)
-   | [仍存在小 bounce]
-   |   - input_ids.cpu()
+   | [已优化] neg / clamp / where 现原生 Zeus(int32)
+   | [仍存在] index(read): buf[gather_indices] 仍需 CPU（缺 aten::index_select）
    |   - future_token_ids_map.cpu()
-   |   - CPU where / clamp / index(read)
+   |   - gather_indices.cpu() + buf[...]
    v
 ModelWorker.forward_batch_generation()
    |
@@ -452,7 +509,7 @@ Later batch preparation / later consumer resolves future ids
 也因此它们的 Zeus 改造重点不同：
 
 - 主链路最关心：`req_to_token` 读写、metadata 构建、KV page attention
-- Overlap / Scheduler 最关心：`where / clamp / arange / neg(int)` 这组小算子
+- Overlap / Scheduler 最关心：~~`where / clamp / arange / neg(int)`~~ ✅ 已补齐 int32 支持；当前剩余关注点为 `index(read)` / `aten::index_select`
 
 ## 4.1 主链路状态更新
 
@@ -538,23 +595,27 @@ seq_lens_next = batch.seq_lens + token_per_req
 
 当前仍存在：
 
-- `ids = input_ids.cpu()`
-- `buf = future_token_ids_map.cpu()`
-- `torch.where(...)`
-- `torch.clamp(...)`
-- `torch.arange(...).to(self.device)`
+- `buf = future_token_ids_map.cpu()`（future buffer 整表拉回 CPU）
+- `gather_indices.cpu()` + `buf[gather_indices.cpu()]`（CPU index read）
+
+已解决（2026-05-08）：
+
+- `neg(int32)`：`-input_ids` 直接在 Zeus 上执行 ✅
+- `clamp(int32)`：`torch.clamp(-input_ids, min=0)` 直接在 Zeus 上执行 ✅
+- `where(int32)`：`torch.where(input_ids < 0, looked_up, input_ids)` 直接在 Zeus 上执行 ✅
+- `arange(int32)`：`alloc_future_indices` 中 `torch.arange(..., device=self.device)` 直接分配 ✅
 
 为什么还在：
 
-- `where` / `clamp` / `arange(device)` / `index(read)` 缺失
+- `index(read)` / `aten::index_select` 缺失：`buf[gather_indices]` 无法在 Zeus 上做
 
 能否直接删：
 
-- **不能**
+- **剩余 CPU 行不能删**
 
 怎么消除：
 
-- 补齐 `where + clamp + arange + neg(int)` 这一组 overlap 小算子
+- 补 `aten::index_select` / gather 后，`buf[gather_indices.cpu()]` 可移至 device
 
 ### B. `managers/scheduler.py`
 
@@ -562,21 +623,10 @@ seq_lens_next = batch.seq_lens + token_per_req
 
 - [scheduler.py:2061](/root/workspace/sglang/python/sglang/srt/managers/scheduler.py:2061)
 
-当前仍存在：
+当前状态：✅ 已修复（2026-05-08）
 
-- `(-future_indices.indices.cpu()).to(device)`
-
-为什么还在：
-
-- `neg(int)` 缺失
-
-能否直接删：
-
-- **不能**
-
-怎么消除：
-
-- 补 `neg` 的 int dtype dispatch
+- `future_indices_or_next_token_ids = -future_indices.indices`
+- `neg(int32)` 现已原生 Zeus；`-future_indices.indices` 直接在 Zeus device 上执行
 
 ---
 
@@ -590,29 +640,24 @@ seq_lens_next = batch.seq_lens + token_per_req
 - [forward_batch_info.py:1246](/root/workspace/sglang/python/sglang/srt/model_executor/forward_batch_info.py:1246)
 - [forward_batch_info.py:1276](/root/workspace/sglang/python/sglang/srt/model_executor/forward_batch_info.py:1276)
 
+已解决（2026-05-08）：
+
+- `extend_prefix_lens = self.seq_lens - 1`（`sub` 原生 Zeus）✅
+- `extend_start_loc = torch.arange(bs, dtype=torch.int32, device=...)` 直接 device ✅
+- `clamp_position()` 改为 `torch.clamp((seq_lens - 1), min=0)` 直接 Zeus ✅
+- `compute_position_torch()` Zeus 分支改为 `arange(int32, device=device)` + `cumsum` ✅
+
 当前仍存在：
 
-- `self.extend_prefix_lens = (self.seq_lens.cpu() - 1).to(device)`
-- `torch.arange(...).to(device)`
-- `compute_position_torch()` 里的 CPU `arange + 变长拼接`
-- `clamp_position()` 里的 CPU `clamp`
+- `compute_position_torch()` 中仍需 `extend_prefix_lens.cpu().tolist()` / `extend_seq_lens.cpu().tolist()` 获取 Python 标量来驱动 `range()`（`zip(p_list, s_list)` 迭代边界）
 
 为什么还在：
 
-- `arange(device)`、`clamp` 缺失
-- `compute_position_torch()` 仍混合动态 `arange`、变长拼接和 Python 循环；虽然 `cumsum` / `cat` 已支持，但该分支还不是纯 device tensor 表达
+- `range()` 需要 Python 整数；读取标量本身代价小，不属于大块 bounce
 
 能否直接删：
 
-- **不能整体直接删**
-
-怎么消除：
-
-- 已处理纯 `cumsum` 路径：
-  - `prefix_chunk_cu_seq_lens`
-  - `fetch_mha_one_shot_kv_indices()` 中的 `kv_indptr`
-- 后续再补 `arange`
-- 后续再补 `clamp`
+- 不需要再做额外改动；`.cpu().tolist()` 用于 Python 标量属于正常模式
 
 ---
 
@@ -742,14 +787,18 @@ seq_lens_next = batch.seq_lens + token_per_req
 
 ### P2：补缺失算子 / 应用已支持算子
 
-建议顺序：
+以下已完成（2026-05-08）：
 
-1. `index(read)` / gather
-2. `arange`
-3. `where`
-4. `clamp`
-5. `neg(int)`
-6. 清理仍停留在历史 CPU workaround 中的 `cumsum` 使用点
+- ✅ `arange(int32)`、`neg(int32)`、`clamp(int32)`、`where(int32)` — torch_zeus 全 4 层已支持
+- ✅ 相关 SGLang 侧 bounce 已消减（overlap_utils / scheduler / forward_batch_info）
+
+剩余（依赖 `aten::index_select` / gather）：
+
+1. `index(read)` / gather — 消除后可继续清理：
+   - `overlap_utils._resolve_future_token_ids` 中的 `buf[gather_indices.cpu()]`
+   - `logits_processor.py:420` 中的 gather loop
+   - `common.py` 中的 `last_loc` mirror 读取分支
+2. 清理 `schedule_batch.py` 中的 `tensor.cpu()[ki_cpu].to(device)` filter 分支
 
 ## 6.1 剩余 `cumsum` 调用点优先级表
 
@@ -761,7 +810,7 @@ seq_lens_next = batch.seq_lens + token_per_req
 |------|----------|----------|--------|------|
 | 主链路 | [zeus_backend.py:100](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:100), [zeus_backend.py:149](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:149), [zeus_backend.py:168](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/attention\/zeus_backend.py:168) | 构 `kv_indptr / qo_indptr` | 已处理 | 已改为 Zeus device `torch.cumsum`；剩余问题转为 `kv_indices` 的 ragged gather |
 | Batch | [forward_batch_info.py:1081](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1081), [forward_batch_info.py:1118](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1118) | 构 `prefix_chunk_cu_seq_lens`、`kv_indptr` | 已处理 | 这两处是纯 `cumsum` CPU 绕路，已改为 Zeus device `torch.cumsum` |
-| Batch | [forward_batch_info.py:1258](\/root\/workspace\/sglang\/python\/sglang\/srt\/model_executor\/forward_batch_info.py:1258) | 构 `extend_start_loc` | 暂不处理 | 该分支还混合动态 `arange`、变长拼接和索引逻辑，不只依赖 `cumsum` |
+| Batch | [forward_batch_info.py:compute_position_torch](/root/workspace/sglang/python/sglang/srt/model_executor/forward_batch_info.py:1257) | 构 `extend_start_loc` via cumsum | ✅ 已处理 | `arange(int32)` + `cumsum` 均已原生 Zeus；仍需 `.cpu().tolist()` 获取 Python 标量 |
 | Logits | [logits_processor.py:420](\/root\/workspace\/sglang\/python\/sglang\/srt\/layers\/logits_processor.py:420) | 构最后 token 的线性下标 | 暂不处理 | 该分支还依赖 gather / index 逻辑，先不只改 `cumsum` |
 
 补充说明：
@@ -778,4 +827,4 @@ seq_lens_next = batch.seq_lens + token_per_req
 这份文档按最新代码重排后，最重要的变化是：
 
 > `req_to_token` 读写和 `kv_metadata` 相关的主链路大块 CPU bounce 已经被解决，不应再继续作为“当前未解决问题”统计。  
-> 现在更准确的说法是：主链路上已基本没有“不必要的大块 CPU bounce”，`kv_indptr / qo_indptr` 的 `cumsum` 也已 device 化；Paged KV metadata 剩余的 host 工作主要是 `kv_indices` ragged gather。此外真正残留的热点，主要是 batch / logits 上的 `index(read)` / gather 路径，以及 overlap 上的 `clamp/where/arange/neg` 小算子分支。
+> 现在更准确的说法是：主链路上已基本没有"不必要的大块 CPU bounce"；`neg / clamp / where / arange(int32)` 于 2026-05-08 完成 torch_zeus int32 支持，overlap / scheduler / forward_batch_info 相关 CPU bounce 已消减。当前真正残留的热点，主要集中在 `index(read)` / `aten::index_select` 缺失导致的 `buf[gather_indices]` gather（overlap_utils）、logits gather loop（logits_processor），以及 `kv_indices` ragged gather（可由 `build_kv_indices` device kernel 替代）。
