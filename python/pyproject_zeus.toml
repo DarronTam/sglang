@@ -18,8 +18,8 @@ classifiers = [
 # PrivateUse1 backend. Install torch_zeus and sgl_kernel_zeus before installing
 # SGLang; they are not published to PyPI and intentionally are not listed here.
 dependencies = [
-  "torch==2.9.1",
-  "torchvision==0.24.1",
+  "torch==2.10.0",
+  "torchvision==0.25.0",
   "IPython",
   "aiohttp",
   "anthropic>=0.20.0",

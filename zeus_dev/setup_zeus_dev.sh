@@ -17,15 +17,6 @@ if [[ ! -f python/pyproject_zeus.toml ]]; then
   exit 1
 fi
 
-if [[ ! -f zeus_dev/check_zeus_env.py ]]; then
-  echo "error: zeus_dev/check_zeus_env.py not found." >&2
-  echo "  Restore it from git or run this from the sglang repo." >&2
-  exit 1
-fi
-
-echo "[zeus-setup] checking active Python environment"
-python zeus_dev/check_zeus_env.py
-
 echo "[zeus-setup] using python/pyproject_zeus.toml as python/pyproject.toml"
 cp python/pyproject_zeus.toml python/pyproject.toml
 
