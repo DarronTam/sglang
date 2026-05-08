@@ -847,9 +847,9 @@ def test_moe_block_full(cfg, num_tokens=16, seed=42):
     # ── Zeus 路径 ──
     # router_logits 在 REF 端已是 fp32，直接 .to('zeus') 喂 biased_grouped_topk。
     # shared_output 是 bf16，直接作为 residual 喂 moe_sum_reduce。
-    router_logits_z = router_logits_fp32.to("zeus")
+    router_logits_z = (router_logits_fp32.cpu() if router_logits_fp32.is_cuda else router_logits_fp32).to("zeus")
     corr_bias_z = corr_bias_fp32.to("zeus")
-    shared_out_z = shared_out_bf16.to("zeus")
+    shared_out_z = (shared_out_bf16.cpu() if shared_out_bf16.is_cuda else shared_out_bf16).to("zeus")
     x_z = x_bf16.to("zeus")
     w13_z = w13_bf16.to("zeus")
     w2_z = w2_bf16.to("zeus")

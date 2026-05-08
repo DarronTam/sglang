@@ -2058,12 +2058,8 @@ class Scheduler(
                         batch_result.future_indices = future_indices
 
                 # FIXME(lsyin): move this assignment elsewhere
-                if _is_zeus:
-                    future_indices_or_next_token_ids = (
-                        (-future_indices.indices.cpu()).to(future_indices.indices.device)
-                    )
-                else:
-                    future_indices_or_next_token_ids = -future_indices.indices
+                # neg(int32) now runs natively on Zeus device
+                future_indices_or_next_token_ids = -future_indices.indices
 
                 if batch.is_v2_eagle:
                     # FIXME(lsyin): tmp code for eagle v2
