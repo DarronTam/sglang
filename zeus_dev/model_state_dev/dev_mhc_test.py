@@ -20,9 +20,9 @@ Stage：
   mhc_block_ffn_full     —— 端到端组装 (expand → pre 四步 → identity sublayer → post)
 
 用法：
-  python zeus_dev/dev_mhc_test.py                          # 跑所有 stage
-  python zeus_dev/dev_mhc_test.py --stage mhc_sinkhorn
-  python zeus_dev/dev_mhc_test.py --stage mhc_block_ffn_full
+  python zeus_dev/model_state_dev/dev_mhc_test.py                          # 跑所有 stage
+  python zeus_dev/model_state_dev/dev_mhc_test.py --stage mhc_sinkhorn
+  python zeus_dev/model_state_dev/dev_mhc_test.py --stage mhc_block_ffn_full
 """
 
 import argparse
@@ -36,7 +36,9 @@ import torch
 
 
 # ── REF import (bypass ref_tile_kernels_torch/__init__.py's broader imports) ──
-_REF_MHC_PATH = Path(__file__).parent / "ref_tile_kernels_torch" / "mhc.py"
+_THIS_DIR = Path(__file__).resolve().parent
+_ZEUS_DEV_DIR = _THIS_DIR.parent
+_REF_MHC_PATH = _ZEUS_DEV_DIR / "ref" / "ref_tile_kernels_torch" / "mhc.py"
 _spec = importlib.util.spec_from_file_location("_ref_mhc", _REF_MHC_PATH)
 ref_mhc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ref_mhc)
