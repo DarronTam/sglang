@@ -58,6 +58,12 @@ COMMON_ENGINE_KWARGS = dict(
     disable_radix_cache=True,
     # Zeus has no tied embedding support
     json_model_override_args='{"tie_word_embeddings": false}',
+    # The Zeus simulator runs each kernel as a fork+exec subprocess; a single
+    # forward pass at bs>=4 routinely exceeds the default 300s watchdog and
+    # triggers SIGQUIT mid-kernel, which corrupts simulator outputs and
+    # surfaces as fake "argmax segfault" stacks in sampler.py. 2h is enough
+    # headroom for full graph capture + decode on the simulator.
+    watchdog_timeout=7200,
 )
 
 TEST_PROMPTS = [
