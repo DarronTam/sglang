@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GLM-MoE-DSA / GLM5-Next DSA — 计算流程 & 数据流</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:     #0d0e1c;
+  --panel:  #13152a;
+  --card:   #181a32;
+  --border: #272a52;
+  --text:   #c8cfe8;
+  --dim:    #5a6395;
+  --blue:   #4a90e2;
+  --cyan:   #38d9a9;
+  --pink:   #f06292;
+  --yellow: #ffd166;
+  --green:  #69db7c;
+  --purple: #b39ddb;
+  --orange: #ffab76;
+  --red:    #ef5350;
+  --teal:   #4dd0e1;
+  --mono:   'Courier New', 'Consolas', monospace;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  height: 100vh;
+  overflow: hidden;
+  user-select: none;
+}
+
+#deck { width: 100vw; height: 100vh; position: relative; }
+
+.slide {
+  position: absolute; inset: 0;
+  display: none; flex-direction: column;
+  align-items: center; justify-content: center;
+  padding: 28px 56px 64px; gap: 10px;
+}
+.slide.active { display: flex; }
+
+.slide-tag {
+  position: absolute; top: 18px; left: 32px;
+  font-size: 0.7em; color: var(--dim);
+  letter-spacing: 0.14em; text-transform: uppercase;
+}
+.slide-num {
+  position: absolute; top: 18px; right: 32px;
+  font-size: 0.7em; color: var(--dim); font-family: var(--mono);
+}
+
+h1 { font-size: 2.38em; font-weight: 700; color: #fff; line-height: 1.2; text-align: center; }
+h2 { font-size: 1.62em; font-weight: 600; color: #dde4ff; text-align: center; }
+h3 { font-size: 0.92em; font-weight: 700; margin-bottom: 8px; }
+p  { font-size: 0.93em; line-height: 1.7; text-align: center; }
+code, .mono { font-family: var(--mono); }
+.sub { font-size: 0.84em; color: var(--dim); text-align: center; margin-top: -6px; }
+
+.row { display: flex; align-items: flex-start; gap: 16px; }
+.col { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.wrap { flex-wrap: wrap; justify-content: center; }
+.divider { width: 100%; height: 1px; background: var(--border); }
+
+.badge {
+  display: inline-block;
+  padding: 5px 14px; border-radius: 18px;
+  font-size: 0.78em; font-family: var(--mono); font-weight: 600;
+}
+.b-blue   { background:#182450; color:var(--blue);   border:1px solid #253570; }
+.b-cyan   { background:#0e2530; color:var(--cyan);   border:1px solid #1e3540; }
+.b-green  { background:#0e2818; color:var(--green);  border:1px solid #1e3828; }
+.b-yellow { background:#2a2008; color:var(--yellow); border:1px solid #3a3018; }
+.b-pink   { background:#2a1030; color:var(--pink);   border:1px solid #3a2040; }
+.b-purple { background:#1a1030; color:var(--purple); border:1px solid #2a2040; }
+.b-orange { background:#281808; color:var(--orange); border:1px solid #4a2a10; }
+
+.box {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--blue);
+  border-radius: 7px;
+  padding: 11px 16px;
+  font-size: 0.88em;
+}
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 18px;
+}
+
+table.T, table.kv {
+  border-collapse: collapse; font-family: var(--mono); font-size: 0.82em;
+}
+table.T th, table.T td, table.kv th, table.kv td {
+  border: 1px solid var(--border); padding: 5px 10px; text-align: center;
+}
+table.T th, table.kv th { background: #1c1f3a; color: var(--dim); font-weight: 600; }
+table.T td.l, table.kv td.l { text-align: left; color: var(--text); }
+.c-q  { background:#1a2050; color:var(--blue); }
+.c-k  { background:#0f2a2a; color:var(--cyan); }
+.c-v  { background:#0e2818; color:var(--green); }
+.c-i  { background:#18102a; color:var(--purple); }
+.c-w  { background:#2a2010; color:var(--yellow); }
+.c-o  { background:#1e1208; color:var(--orange); }
+.c-b  { background:#2a1030; color:var(--pink); }
+.c-d  { background:#111320; color:var(--dim); }
+.hi { outline: 2px solid #fff; outline-offset: -2px; }
+
+.formula {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 13px 20px;
+  font-family: var(--mono); font-size: 0.86em; line-height: 1.85;
+  text-align: left; max-width: 950px;
+}
+.formula .blue { color: var(--blue); }
+.formula .cyan { color: var(--cyan); }
+.formula .green { color: var(--green); }
+.formula .yellow { color: var(--yellow); }
+.formula .pink { color: var(--pink); }
+.formula .purple { color: var(--purple); }
+.formula .orange { color: var(--orange); }
+.formula .red { color: var(--red); }
+.formula .dim { color: var(--dim); }
+
+.ascii {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px 20px;
+  font-family: var(--mono); font-size: 0.78em; line-height: 1.58;
+  white-space: pre; color: var(--text);
+  overflow-x: auto; text-align: left;
+}
+.ascii .q { color: var(--blue); font-weight: 700; }
+.ascii .k { color: var(--cyan); font-weight: 700; }
+.ascii .v { color: var(--green); font-weight: 700; }
+.ascii .i { color: var(--purple); font-weight: 700; }
+.ascii .w { color: var(--yellow); font-weight: 700; }
+.ascii .o { color: var(--orange); font-weight: 700; }
+.ascii .d { color: var(--dim); }
+
+.flow {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(155px, 1fr));
+  gap: 12px;
+  width: min(1060px, 100%);
+}
+.node {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 12px; min-height: 82px;
+}
+.node b { display:block; font-size:0.86em; margin-bottom:5px; color:#fff; }
+.node span { display:block; font-family:var(--mono); color:var(--dim); font-size:0.76em; line-height:1.55; }
+.n-q { border-left: 3px solid var(--blue); }
+.n-k { border-left: 3px solid var(--cyan); }
+.n-v { border-left: 3px solid var(--green); }
+.n-i { border-left: 3px solid var(--purple); }
+.n-o { border-left: 3px solid var(--orange); }
+
+#nav {
+  position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 14px;
+  background: rgba(19, 21, 42, 0.92);
+  backdrop-filter: blur(12px);
+  padding: 9px 22px; border-radius: 32px;
+  border: 1px solid var(--border);
+}
+#nav button {
+  background: none; border: none; color: var(--text);
+  cursor: pointer; font-size: 1.3em; padding: 3px 8px;
+  border-radius: 6px;
+}
+#nav button:hover { background: #272a52; }
+#nav button:disabled { color: #2a2d4a; cursor: not-allowed; }
+#prog { font-size: 0.83em; color: var(--dim); min-width: 54px; text-align:center; font-family:var(--mono); }
+#dots { display:flex; gap:6px; align-items:center; }
+.dot { width:7px; height:7px; border-radius:50%; background:var(--border); cursor:pointer; }
+.dot.on { background: var(--blue); }
+</style>
+</head>
+
+<body>
+<div id="deck">
+
+<div class="slide" style="background:radial-gradient(ellipse at 50% 38%, #141b40 0%, #0d0e1c 68%)">
+  <div class="slide-num">1 / 13</div>
+  <div style="text-align:center">
+    <div style="font-size:0.78em; color:var(--cyan); letter-spacing:0.18em; text-transform:uppercase; margin-bottom:10px">
+      zeus_dev · GLM5-Next DSA
+    </div>
+    <h1>GLM-MoE-DSA Attention</h1>
+    <p style="color:#6878aa; margin-top:10px; font-size:1em">
+      Projection · Indexer · TopK · Sparse MLA · KV Cache
+    </p>
+    <div class="row wrap" style="margin-top:22px; gap:10px">
+      <span class="badge b-blue">GLM5-Next</span>
+      <span class="badge b-cyan">DSA full-attn layers = 3,7,11,15,19,23</span>
+      <span class="badge b-purple">KDA:DSA ≈ 3:1</span>
+      <span class="badge b-green">index_topk = 2048</span>
+    </div>
+    <p style="margin-top:28px; font-size:0.78em; color:#333860">
+      → / Space 下一页 · ← 上一页 · 点击小圆点跳转
+    </p>
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">范围</div><div class="slide-num">2 / 13</div>
+  <h2>只看 DSA，不看 KDA linear attention</h2>
+  <div class="row wrap" style="margin-top:10px">
+    <div class="box" style="width:430px; border-left-color:var(--purple)">
+      <b style="color:#fff">GLM5-Next 是 hybrid attention</b><br>
+      <span class="mono" style="color:var(--dim)">kda_layers = 0,1,2,4,5,6,...</span><br>
+      <span class="mono" style="color:var(--cyan)">full_attn_layers = 3,7,11,15,19,23</span>
+    </div>
+    <div class="box" style="width:430px; border-left-color:var(--green)">
+      <b style="color:#fff">本 slides 的起点和终点</b><br>
+      起点：<span class="mono" style="color:var(--pink)">hidden_states [T,H]</span><br>
+      终点：<span class="mono" style="color:var(--green)">o_proj_out [T,H]</span>
+    </div>
+  </div>
+  <div class="formula" style="margin-top:14px">
+    if layer_id in <span class="purple">kda_layers</span>: KDA linear attention<br>
+    if layer_id in <span class="cyan">full_attn_layers</span>: <span class="yellow">DSA = MLA projection + indexer topk + sparse attention</span>
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">真实配置</div><div class="slide-num">3 / 13</div>
+  <h2>GLM5-Next DSA 真实维度</h2>
+  <table class="T" style="margin-top:8px">
+    <tr><th>符号</th><th>值</th><th>含义</th><th>影响的算子</th></tr>
+    <tr><td class="c-b">H</td><td>2048</td><td class="l">residual hidden</td><td class="l">所有 GEMM 输入/输出</td></tr>
+    <tr><td class="c-q">Nh</td><td>32</td><td class="l">main attention heads</td><td class="l">Q/K/V reshape</td></tr>
+    <tr><td class="c-q">Rq</td><td>768</td><td class="l">q_lora_rank</td><td class="l">q_a_proj / q_b_proj</td></tr>
+    <tr><td class="c-k">Rkv</td><td>512</td><td class="l">kv_lora_rank</td><td class="l">kv_a_layernorm / kv_b_proj</td></tr>
+    <tr><td class="c-q">Dqk</td><td>128 + 64 = 192</td><td class="l">nope + rope</td><td class="l">attention score dim</td></tr>
+    <tr><td class="c-v">Dv</td><td>128</td><td class="l">value head dim</td><td class="l">attention output head dim</td></tr>
+    <tr><td class="c-i">I, Di</td><td>8, 128</td><td class="l">index heads / dim</td><td class="l">DSA indexer scoring</td></tr>
+    <tr><td class="c-w">Ktop</td><td>2048</td><td class="l">top-k sparse tokens</td><td class="l">sparse attention indices</td></tr>
+  </table>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">总览</div><div class="slide-num">4 / 13</div>
+  <h2>DSA 完整数据流</h2>
+  <div class="ascii" style="margin-top:8px; font-size:0.76em">
+hidden_states [T,H]
+   │
+   ├─ <span class="q">main MLA path</span>: q_a → q_norm → q_b → split(q_nope, q_rope)
+   │                 kv_a → split(kv_lora,k_rope) → kv_norm → kv_b → split(k_nope,v)
+   │                 RoPE(q_rope,k_rope) → Q/K/V
+   │
+   └─ <span class="i">DSA indexer path</span>: wq_b(q_lora) + wk(hidden) + weights_proj(hidden)
+                     RoPE(index q/k) → score[t,s] → causal mask → topk_indices
+
+Q/K/V + topk_indices
+   ↓
+<span class="o">sparse MLA attention</span> 只看 top-k 历史 token
+   ↓
+o_proj [T, Nh*Dv] → [T,H]
+  </div>
+  <div class="row wrap" style="margin-top:10px">
+    <span class="badge b-blue">projection 是 GEMM-heavy</span>
+    <span class="badge b-purple">indexer 是 top-k-heavy</span>
+    <span class="badge b-green">attention 是 cache-heavy</span>
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">projection</div><div class="slide-num">5 / 13</div>
+  <h2>Main MLA projection 输入输出</h2>
+  <div class="flow" style="margin-top:8px">
+    <div class="node n-q"><b>q_a_proj</b><span>[T,2048] → [T,768]</span><span>q_lora</span></div>
+    <div class="node n-q"><b>q_a_layernorm</b><span>[T,768]</span><span>q_lora_norm</span></div>
+    <div class="node n-q"><b>q_b_proj</b><span>[T,768] → [T,6144]</span><span>view [T,32,192]</span></div>
+    <div class="node n-q"><b>split Q</b><span>q_nope [T,32,128]</span><span>q_rope [T,32,64]</span></div>
+    <div class="node n-k"><b>kv_a_proj</b><span>[T,2048] → [T,576]</span><span>512 + 64</span></div>
+    <div class="node n-k"><b>kv_a_layernorm</b><span>[T,512]</span><span>kv_lora_norm</span></div>
+    <div class="node n-k"><b>kv_b_proj</b><span>[T,512] → [T,8192]</span><span>view [T,32,256]</span></div>
+    <div class="node n-v"><b>split K/V</b><span>k_nope [T,32,128]</span><span>v [T,32,128]</span></div>
+  </div>
+  <div class="formula" style="margin-top:12px">
+    Q = concat(q_nope, RoPE(q_rope)) → <span class="blue">[T,32,192]</span><br>
+    K = concat(k_nope, RoPE(k_rope).expand(32 heads)) → <span class="cyan">[T,32,192]</span><br>
+    V = v → <span class="green">[T,32,128]</span>
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">indexer</div><div class="slide-num">6 / 13</div>
+  <h2>DSA Indexer 输入输出</h2>
+  <div class="row wrap" style="margin-top:8px">
+    <div class="panel" style="width:310px">
+      <h3 style="color:var(--blue)">Query branch</h3>
+      <div class="mono" style="font-size:0.78em; line-height:1.8">
+        q_lora_norm [T,768]<br>
+        wq_b: 768 → 8*128<br>
+        q_idx [T,8,128]<br>
+        split 64 rope + 64 nope<br>
+        RoPE(q_idx_rope)
+      </div>
+    </div>
+    <div class="panel" style="width:310px">
+      <h3 style="color:var(--cyan)">Key branch</h3>
+      <div class="mono" style="font-size:0.78em; line-height:1.8">
+        hidden_states [T,2048]<br>
+        wk: 2048 → 128<br>
+        k_norm [T,128]<br>
+        split 64 rope + 64 nope<br>
+        RoPE(k_idx_rope)
+      </div>
+    </div>
+    <div class="panel" style="width:310px">
+      <h3 style="color:var(--yellow)">Head gate</h3>
+      <div class="mono" style="font-size:0.78em; line-height:1.8">
+        hidden_states [T,2048]<br>
+        weights_proj: 2048 → 8<br>
+        weights [T,8]<br>
+        * 1/sqrt(8)<br>
+        * 1/sqrt(128)
+      </div>
+    </div>
+  </div>
+  <div class="formula" style="margin-top:12px">
+    score[t,s] = Σ_i weights[t,i] · dot(q_idx[t,i,:], k_idx[s,:])<br>
+    然后加 causal/ragged mask，再做 topk(score[t,:], Ktop=2048)
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">数值例子 1</div><div class="slide-num">7 / 13</div>
+  <h2>Indexer score 的小数值例子</h2>
+  <p class="sub">toy shape: T=4, index_heads=2, index_head_dim=2, topk=2</p>
+  <div class="row wrap" style="margin-top:8px">
+    <table class="T">
+      <tr><th>token s</th><th>k_idx[s]</th></tr>
+      <tr><td>0</td><td class="c-k">[1, 0]</td></tr>
+      <tr><td>1</td><td class="c-k">[0, 1]</td></tr>
+      <tr><td>2</td><td class="c-k">[1, 1]</td></tr>
+      <tr><td>3</td><td class="c-k">[2, 0]</td></tr>
+    </table>
+    <table class="T">
+      <tr><th>query t=3</th><th>q_idx head0</th><th>q_idx head1</th><th>weights</th></tr>
+      <tr><td>3</td><td class="c-q">[1, 1]</td><td class="c-q">[2, 0]</td><td class="c-w">[0.6, 0.4]</td></tr>
+    </table>
+  </div>
+  <div class="formula" style="margin-top:12px">
+    score[3,0] = 0.6·dot([1,1],[1,0]) + 0.4·dot([2,0],[1,0]) = <span class="yellow">1.4</span><br>
+    score[3,1] = 0.6·dot([1,1],[0,1]) + 0.4·dot([2,0],[0,1]) = <span class="yellow">0.6</span><br>
+    score[3,2] = 0.6·dot([1,1],[1,1]) + 0.4·dot([2,0],[1,1]) = <span class="yellow">2.0</span><br>
+    score[3,3] = 0.6·dot([1,1],[2,0]) + 0.4·dot([2,0],[2,0]) = <span class="yellow">2.8</span>
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">数值例子 2</div><div class="slide-num">8 / 13</div>
+  <h2>Causal mask + TopK</h2>
+  <p class="sub">同一个 score 矩阵，未来 token 必须变成 -inf，不能进入 sparse indices</p>
+  <table class="T" style="margin-top:8px">
+    <tr><th>query t</th><th>有效 key s</th><th>score after mask</th><th>top2 indices</th></tr>
+    <tr><td>0</td><td>0</td><td class="c-w">[0.7, -inf, -inf, -inf]</td><td class="c-i">[0, -1]</td></tr>
+    <tr><td>1</td><td>0..1</td><td class="c-w">[1.0, 0.2, -inf, -inf]</td><td class="c-i">[0, 1]</td></tr>
+    <tr><td>2</td><td>0..2</td><td class="c-w">[0.1, 1.5, 0.9, -inf]</td><td class="c-i">[1, 2]</td></tr>
+    <tr><td>3</td><td>0..3</td><td class="c-w">[1.4, 0.6, 2.0, 2.8]</td><td class="c-i hi">[3, 2]</td></tr>
+  </table>
+  <div class="box" style="margin-top:14px; border-left-color:var(--red); max-width:880px">
+    注意：如果 topk 直接从带 -inf 的整行取固定 K，短行可能把 future token 填进 indices。
+    dev 脚本已按行只从 <span class="mono">0..t</span> 取 top-k，其余位置填 <span class="mono">-1</span>。
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">数值例子 3</div><div class="slide-num">9 / 13</div>
+  <h2>Sparse Attention 只看 TopK token</h2>
+  <p class="sub">toy shape: 1 head, D=2, Dv=2。query t=3 的 top2 = [3,2]</p>
+  <div class="row wrap" style="margin-top:8px">
+    <table class="T">
+      <tr><th>张量</th><th>值</th></tr>
+      <tr><td>q[3]</td><td class="c-q">[1, 0]</td></tr>
+      <tr><td>k[3]</td><td class="c-k">[2, 0]</td></tr>
+      <tr><td>k[2]</td><td class="c-k">[1, 1]</td></tr>
+      <tr><td>v[3]</td><td class="c-v">[4, 1]</td></tr>
+      <tr><td>v[2]</td><td class="c-v">[1, 3]</td></tr>
+    </table>
+    <div class="formula" style="max-width:540px">
+      scale = 1/sqrt(2) = 0.707<br>
+      score3 = dot([1,0],[2,0]) · 0.707 = 1.414<br>
+      score2 = dot([1,0],[1,1]) · 0.707 = 0.707<br>
+      softmax([1.414,0.707]) ≈ [0.67,0.33]<br>
+      out = 0.67·[4,1] + 0.33·[1,3] = <span class="green">[3.01,1.66]</span>
+    </div>
+  </div>
+  <div class="box" style="margin-top:12px; border-left-color:var(--green); max-width:900px">
+    Dense causal attention 会看 0..3；DSA sparse attention 只看 top-k 的 [3,2]。
+    当 topk ≥ 当前有效长度时，sparse 结果应与 dense causal 完全一致。
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">cache</div><div class="slide-num">10 / 13</div>
+  <h2>KV / Index K cache store 与 update</h2>
+  <div class="row wrap" style="margin-top:8px">
+    <table class="kv">
+      <tr><th>cache</th><th>写入内容</th><th>shape</th><th>用途</th></tr>
+      <tr><td class="c-i">index K cache</td><td class="l">wk + k_norm + index RoPE 后的 k_idx</td><td>[pool, Di]</td><td class="l">给 indexer 算 top-k</td></tr>
+      <tr><td class="c-k">main K cache</td><td class="l">main attention K 或 MLA latent K</td><td>[pool, Nh, Dqk]</td><td class="l">给 sparse attention 读 K</td></tr>
+      <tr><td class="c-v">main V cache</td><td class="l">main attention V 或 absorbed latent</td><td>[pool, Nh, Dv]</td><td class="l">给 sparse attention 读 V</td></tr>
+    </table>
+  </div>
+  <div class="formula" style="margin-top:12px">
+    slots = [2,3,4,5] 代表 token 写入的 paged cache 位置<br>
+    index_cache[slots] = k_idx<br>
+    main_k_cache[slots] = K<br>
+    main_v_cache[slots] = V<br>
+    <span class="dim">dev stage: index_k_cache_store 会校验读回相等，并确认 untouched slots 不被改写</span>
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">decode</div><div class="slide-num">11 / 13</div>
+  <h2>Decode 从 cache 做 DSA</h2>
+  <div class="ascii" style="margin-top:8px; font-size:0.76em">
+current token t
+   │
+   ├─ compute <span class="q">q_idx[t]</span>, <span class="q">Q[t]</span>
+   │
+   ├─ read <span class="i">index_cache[history_slots]</span>
+   │      → score[t, history] → topk local ids
+   │
+   └─ read <span class="k">main_k_cache[history_slots[topk]]</span>
+      read <span class="v">main_v_cache[history_slots[topk]]</span>
+          ↓
+      sparse attention → attn_out[t] → o_proj
+  </div>
+  <div class="row wrap" style="margin-top:12px">
+    <div class="box" style="border-left-color:var(--purple); width:420px">
+      <b style="color:#fff">本地 dev stage</b><br>
+      <span class="mono">decode_sparse_attn_from_cache</span><br>
+      最后一个 token 从 cache 读历史 K/V，对齐 full-sequence REF。
+    </div>
+    <div class="box" style="border-left-color:var(--cyan); width:420px">
+      <b style="color:#fff">SGLang 线上参考</b><br>
+      <span class="mono">flash_mla_with_kvcache(indices=topk_indices)</span><br>
+      Blackwell TRT-LLM DSA decode / FlashMLA sparse decode。
+    </div>
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">Zeus 拆分</div><div class="slide-num">12 / 13</div>
+  <h2>算子依赖表中的 Zeus kernel 切分</h2>
+  <table class="T" style="margin-top:8px; font-size:0.78em">
+    <tr><th>#</th><th>子步骤</th><th>输入</th><th>输出</th><th>Zeus 目标</th></tr>
+    <tr><td>15</td><td class="l">index score</td><td class="l">q_idx, index K cache, weights</td><td class="l">logits</td><td class="l">dsa_indexer_logits</td></tr>
+    <tr><td>16</td><td class="l">topk transform</td><td class="l">logits + causal/ragged metadata</td><td class="l">topk_indices</td><td class="l">dsa_topk / fused</td></tr>
+    <tr><td>17</td><td class="l">sparse MLA attention</td><td class="l">Q, K/V cache, topk_indices</td><td class="l">attn_out</td><td class="l">dsa_sparse_attention</td></tr>
+    <tr><td>20a</td><td class="l">index K cache store</td><td class="l">k_idx, slots</td><td class="l">index cache updated</td><td class="l">dsa_index_k_cache_store</td></tr>
+    <tr><td>20b</td><td class="l">main KV cache store</td><td class="l">K/V or MLA latent, slots</td><td class="l">KV cache updated</td><td class="l">DSA KV layout</td></tr>
+    <tr><td>20c</td><td class="l">decode from cache</td><td class="l">Q, topk_indices, paged KV</td><td class="l">attn_out</td><td class="l">decode_dsa_sparse_attn_from_cache</td></tr>
+  </table>
+  <div class="box" style="margin-top:12px; border-left-color:var(--yellow); max-width:940px">
+    第一版建议先做 bf16/fp32 proxy。FP8 index key cache、IndexCache、dense fallback
+    可以作为第二阶段性能优化，不要阻塞数学路径对齐。
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">总结</div><div class="slide-num">13 / 13</div>
+  <h2>DSA 的核心不是一个 attention kernel，而是一条 cache-aware 流水线</h2>
+  <div class="row wrap" style="margin-top:10px; align-items:stretch">
+    <div class="panel" style="width:300px">
+      <h3 style="color:var(--blue)">1. Projection</h3>
+      <div class="mono" style="font-size:0.78em; line-height:1.8">
+        q_a/q_b<br>kv_a/kv_b<br>RoPE split/concat
+      </div>
+    </div>
+    <div class="panel" style="width:300px">
+      <h3 style="color:var(--purple)">2. Indexer</h3>
+      <div class="mono" style="font-size:0.78em; line-height:1.8">
+        wq_b/wk<br>weights_proj<br>score + topk
+      </div>
+    </div>
+    <div class="panel" style="width:300px">
+      <h3 style="color:var(--green)">3. Cache</h3>
+      <div class="mono" style="font-size:0.78em; line-height:1.8">
+        index K cache<br>main K/V cache<br>paged slots
+      </div>
+    </div>
+    <div class="panel" style="width:300px">
+      <h3 style="color:var(--orange)">4. Sparse MLA</h3>
+      <div class="mono" style="font-size:0.78em; line-height:1.8">
+        topk indices<br>softmax over selected tokens<br>o_proj
+      </div>
+    </div>
+  </div>
+  <div class="formula" style="margin-top:14px">
+    当前 dev 脚本已覆盖：projection_rope → indexer_topk → cache_store → decode_from_cache → full proxy<br>
+    下一步：把 <span class="purple">indexer logits/topk</span> 和 <span class="green">sparse attention from cache</span> 替换成 Zeus kernel。
+  </div>
+</div>
+
+</div>
+
+<div id="nav">
+  <button id="bp" onclick="go(-1)">◀</button>
+  <div id="dots"></div>
+  <div id="prog">1 / 13</div>
+  <button id="bn" onclick="go(1)">▶</button>
+</div>
+
+<script>
+const slides = document.querySelectorAll('.slide');
+const N = slides.length;
+let cur = 0;
+const dotsEl = document.getElementById('dots');
+const progEl = document.getElementById('prog');
+const bp = document.getElementById('bp');
+const bn = document.getElementById('bn');
+
+slides.forEach((_, i) => {
+  const d = document.createElement('div');
+  d.className = 'dot' + (i === 0 ? ' on' : '');
+  d.onclick = () => goTo(i);
+  dotsEl.appendChild(d);
+});
+
+function goTo(n) {
+  slides[cur].classList.remove('active');
+  dotsEl.children[cur].classList.remove('on');
+  cur = Math.max(0, Math.min(N - 1, n));
+  slides[cur].classList.add('active');
+  dotsEl.children[cur].classList.add('on');
+  progEl.textContent = `${cur + 1} / ${N}`;
+  bp.disabled = cur === 0;
+  bn.disabled = cur === N - 1;
+}
+
+function go(d) { goTo(cur + d); }
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); go(1); }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); go(-1); }
+});
+
+let tx = 0;
+document.addEventListener('touchstart', e => { tx = e.touches[0].clientX; });
+document.addEventListener('touchend', e => {
+  const dx = e.changedTouches[0].clientX - tx;
+  if (Math.abs(dx) > 40) go(dx < 0 ? 1 : -1);
+});
+
+goTo(0);
+</script>
+</body>
+</html>

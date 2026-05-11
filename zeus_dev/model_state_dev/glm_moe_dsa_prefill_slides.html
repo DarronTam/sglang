@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GLM-MoE-DSA Prefill / Extend Path — 计算流程 & Ragged 数据流</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root { --bg:#0d0e1c; --panel:#13152a; --card:#181a32; --border:#272a52; --text:#c8cfe8; --dim:#5a6395; --blue:#4a90e2; --cyan:#38d9a9; --pink:#f06292; --yellow:#ffd166; --green:#69db7c; --purple:#b39ddb; --orange:#ffab76; --red:#ef5350; --mono:'Courier New','Consolas',monospace; }
+body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;height:100vh;overflow:hidden;user-select:none}
+#deck{width:100vw;height:100vh;position:relative}.slide{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;padding:28px 56px 64px;gap:10px}.slide.active{display:flex}
+.slide-tag{position:absolute;top:18px;left:32px;font-size:.7em;color:var(--dim);letter-spacing:.14em;text-transform:uppercase}.slide-num{position:absolute;top:18px;right:32px;font-size:.7em;color:var(--dim);font-family:var(--mono)}
+h1{font-size:2.45em;font-weight:700;color:#fff;line-height:1.2;text-align:center}h2{font-size:1.62em;font-weight:600;color:#dde4ff;text-align:center}h3{font-size:.92em;font-weight:700;margin-bottom:8px}p{font-size:.93em;line-height:1.7;text-align:center}code,.mono{font-family:var(--mono)}.sub{font-size:.84em;color:var(--dim);text-align:center;margin-top:-6px}
+.row{display:flex;align-items:flex-start;gap:16px}.wrap{flex-wrap:wrap;justify-content:center}.badge{display:inline-block;padding:5px 14px;border-radius:18px;font-size:.78em;font-family:var(--mono);font-weight:600}
+.b-blue{background:#182450;color:var(--blue);border:1px solid #253570}.b-cyan{background:#0e2530;color:var(--cyan);border:1px solid #1e3540}.b-green{background:#0e2818;color:var(--green);border:1px solid #1e3828}.b-yellow{background:#2a2008;color:var(--yellow);border:1px solid #3a3018}.b-pink{background:#2a1030;color:var(--pink);border:1px solid #3a2040}.b-purple{background:#1a1030;color:var(--purple);border:1px solid #2a2040}.b-orange{background:#281808;color:var(--orange);border:1px solid #4a2a10}
+.box{background:var(--card);border:1px solid var(--border);border-left:3px solid var(--blue);border-radius:7px;padding:11px 16px;font-size:.88em}.panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 18px}
+table.T{border-collapse:collapse;font-family:var(--mono);font-size:.82em}table.T th,table.T td{border:1px solid var(--border);padding:5px 10px;text-align:center}table.T th{background:#1c1f3a;color:var(--dim);font-weight:600}table.T td.l{text-align:left;color:var(--text)}
+.c-q{background:#1a2050;color:var(--blue)}.c-k{background:#0f2a2a;color:var(--cyan)}.c-v,.c-green{background:#0e2818;color:var(--green)}.c-i{background:#18102a;color:var(--purple)}.c-w,.c-yellow{background:#2a2010;color:var(--yellow)}.c-o{background:#1e1208;color:var(--orange)}.c-b{background:#2a1030;color:var(--pink)}.c-d{background:#111320;color:var(--dim)}.hi{outline:2px solid #fff;outline-offset:-2px}
+.formula{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:13px 20px;font-family:var(--mono);font-size:.86em;line-height:1.85;text-align:left;max-width:980px}.formula .blue{color:var(--blue)}.formula .cyan{color:var(--cyan)}.formula .green{color:var(--green)}.formula .yellow{color:var(--yellow)}.formula .pink{color:var(--pink)}.formula .purple{color:var(--purple)}.formula .orange{color:var(--orange)}.formula .red{color:var(--red)}.formula .dim{color:var(--dim)}
+.ascii{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 20px;font-family:var(--mono);font-size:.78em;line-height:1.58;white-space:pre;color:var(--text);overflow-x:auto;text-align:left}.ascii .q{color:var(--blue);font-weight:700}.ascii .k{color:var(--cyan);font-weight:700}.ascii .v{color:var(--green);font-weight:700}.ascii .i{color:var(--purple);font-weight:700}.ascii .w{color:var(--yellow);font-weight:700}.ascii .o{color:var(--orange);font-weight:700}.ascii .d{color:var(--dim)}
+.flow{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:12px;width:min(1060px,100%)}.node{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px 12px;min-height:82px}.node b{display:block;font-size:.86em;margin-bottom:5px;color:#fff}.node span{display:block;font-family:var(--mono);color:var(--dim);font-size:.76em;line-height:1.55}.n-q{border-left:3px solid var(--blue)}.n-k{border-left:3px solid var(--cyan)}.n-v{border-left:3px solid var(--green)}.n-i{border-left:3px solid var(--purple)}.n-o{border-left:3px solid var(--orange)}
+#nav{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:14px;background:rgba(19,21,42,.92);backdrop-filter:blur(12px);padding:9px 22px;border-radius:32px;border:1px solid var(--border)}#nav button{background:none;border:none;color:var(--text);cursor:pointer;font-size:1.3em;padding:3px 8px;border-radius:6px}#nav button:hover{background:#272a52}#nav button:disabled{color:#2a2d4a;cursor:not-allowed}#prog{font-size:.83em;color:var(--dim);min-width:54px;text-align:center;font-family:var(--mono)}#dots{display:flex;gap:6px;align-items:center}.dot{width:7px;height:7px;border-radius:50%;background:var(--border);cursor:pointer}.dot.on{background:var(--blue)}
+</style>
+</head>
+<body>
+<div id="deck">
+
+<div class="slide" style="background:radial-gradient(ellipse at 50% 38%, #141b40 0%, #0d0e1c 68%)">
+  <div class="slide-num">1 / 11</div>
+  <div style="text-align:center">
+    <div style="font-size:.78em;color:var(--cyan);letter-spacing:.18em;text-transform:uppercase;margin-bottom:10px">GLM5-Next DSA · Prefill / Extend Path</div>
+    <h1>DSA Prefill / Extend Path</h1>
+    <p style="color:#6878aa;margin-top:10px;font-size:1em">多 token ragged 序列 · 批量 cache 写入 · sparse prefill attention</p>
+    <div class="row wrap" style="margin-top:22px;gap:10px">
+      <span class="badge b-blue">T = sum extend tokens</span>
+      <span class="badge b-purple">cu_seqlens / block table</span>
+      <span class="badge b-green">批量写 K/V/index K cache</span>
+      <span class="badge b-yellow">短序列可 dense fallback</span>
+    </div>
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">prefill 总览</div><div class="slide-num">2 / 11</div>
+  <h2>Prefill / Extend 与 Decode 的核心差异</h2>
+  <table class="T" style="margin-top:10px">
+    <tr><th>项目</th><th>Prefill / Extend</th><th>Decode</th></tr>
+    <tr><td>query 数</td><td class="c-q">每请求多个 token，展平成 T</td><td>每请求 1 token</td></tr>
+    <tr><td>序列边界</td><td class="c-i">cu_seqlens / ragged metadata</td><td>batch 内固定 1 query</td></tr>
+    <tr><td>indexer logits</td><td class="c-w">ragged [T, total_K]，需要 mask</td><td>paged per request logits</td></tr>
+    <tr><td>attention</td><td class="c-green">sparse prefill 或短序列 dense</td><td>sparse decode from cache</td></tr>
+    <tr><td>cache 写入</td><td class="c-k">批量写本 chunk 的所有 token</td><td>append 当前 token</td></tr>
+  </table>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">输入输出</div><div class="slide-num">3 / 11</div>
+  <h2>Prefill path 的输入输出</h2>
+  <div class="row wrap" style="margin-top:8px">
+    <div class="panel" style="width:430px"><h3 style="color:var(--pink)">输入</h3><div class="mono" style="font-size:.8em;line-height:1.85">hidden_states [T,H=2048]<br>positions [T]<br>extend_seq_lens [B]<br>prefix_lens [B]<br>out_cache_loc [T]<br>block_table / page table</div></div>
+    <div class="panel" style="width:430px"><h3 style="color:var(--green)">输出 / side effect</h3><div class="mono" style="font-size:.8em;line-height:1.85">o_proj_out [T,H=2048]<br>topk_indices [T,2048]<br>index K cache 批量写入<br>main K/V cache 批量写入<br>prefill sparse metadata</div></div>
+  </div>
+  <div class="box" style="margin-top:12px;border-left-color:var(--yellow);max-width:900px">
+    Prefill 的难点不是单个 token，而是 ragged：每个 query token 的有效 key 范围不同，需要由 prefix_len、query offset、sequence boundary 决定。
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">完整流程图</div><div class="slide-num">4 / 18</div>
+  <h2>Prefill / Extend DSA 全流程图</h2>
+  <div class="ascii" style="margin-top:8px;font-size:.72em">
+hidden_states [T,H]   T = sum(extend_seq_lens)
+  │
+  ├─ <span class="q">batch Q projection</span>
+  │    q_a → q_norm → q_b → Q [T,Nh,Dqk]
+  │
+  ├─ <span class="k">batch KV projection</span>
+  │    kv_a → kv_norm → kv_b → Knew [T,Nh,Dqk], Vnew [T,Nh,Dv]
+  │
+  ├─ <span class="i">batch indexer prep</span>
+  │    wq_b(q_lora_norm) → q_idx [T,I,Di]
+  │    wk(hidden) + norm + RoPE → index_k_new [T,Di]
+  │    weights_proj(hidden) → gate [T,I]
+  │
+  ├─ <span class="k">batch cache store</span>
+  │    cache[out_cache_loc] = Knew / Vnew / index_k_new
+  │
+  ├─ <span class="w">ragged top-k</span>
+  │    for each row q: valid keys = prefix(req) + current chunk up to q
+  │    q_idx[q] × index_k_cache[valid_slots] + gate[q] → topk_slots[q]
+  │
+  ├─ <span class="o">prefill sparse attention</span>
+  │    Q[q] attends only topk_slots[q] from main K/V cache
+  │
+  └─ <span class="o">o_proj</span>: [T,Nh*Dv] → [T,H]
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">stage 合同</div><div class="slide-num">5 / 18</div>
+  <h2>Prefill 每个 stage 的输入 / 输出 / side effect</h2>
+  <table class="T" style="margin-top:8px;font-size:.73em">
+    <tr><th>stage</th><th>输入</th><th>输出</th><th>side effect</th></tr>
+    <tr><td class="c-q">Batch Q projection</td><td class="l">hidden_states [T,H], q weights, positions [T]</td><td class="l">q_lora_norm [T,Rq], Q [T,Nh,Dqk]</td><td class="l">无</td></tr>
+    <tr><td class="c-k">Batch KV projection</td><td class="l">hidden_states [T,H], kv weights, positions [T]</td><td class="l">Knew [T,Nh,Dqk], Vnew [T,Nh,Dv]</td><td class="l">无</td></tr>
+    <tr><td class="c-i">Indexer prep</td><td class="l">hidden_states, q_lora_norm, positions</td><td class="l">q_idx [T,I,Di], index_k_new [T,Di], gate [T,I]</td><td class="l">无</td></tr>
+    <tr><td class="c-k">Cache store</td><td class="l">out_cache_loc [T], Knew/Vnew/index_k_new</td><td class="l">无显式输出</td><td class="l">批量更新 cache</td></tr>
+    <tr><td class="c-w">Ragged topk</td><td class="l">q_idx, gate, cache, prefix/extend metadata</td><td class="l">topk_local/topk_slots [T,Ktop]</td><td class="l">可选 IndexCache</td></tr>
+    <tr><td class="c-green">Sparse prefill</td><td class="l">Q, main K/V cache, topk_slots</td><td class="l">attn_out [T,Nh,Dv]</td><td class="l">无</td></tr>
+    <tr><td class="c-o">Output</td><td class="l">attn_out, o_proj.weight</td><td class="l">out [T,H]</td><td class="l">无</td></tr>
+  </table>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">metadata</div><div class="slide-num">6 / 18</div>
+  <h2>Prefill 必须先定义清楚 metadata</h2>
+  <table class="T" style="margin-top:8px">
+    <tr><th>metadata</th><th>shape</th><th>含义</th><th>谁使用</th></tr>
+    <tr><td class="c-i">extend_seq_lens</td><td>[B]</td><td class="l">每个请求本次新增 token 数</td><td class="l">ragged row mapping</td></tr>
+    <tr><td class="c-i">prefix_lens</td><td>[B]</td><td class="l">每个请求已有历史长度</td><td class="l">valid key span</td></tr>
+    <tr><td class="c-i">cu_seqlens_q</td><td>[B+1]</td><td class="l">flat query row 边界</td><td class="l">attention backend</td></tr>
+    <tr><td class="c-k">out_cache_loc</td><td>[T]</td><td class="l">每个新增 token 写入的物理 slot</td><td class="l">cache store</td></tr>
+    <tr><td class="c-k">block_table</td><td>[B, blocks]</td><td class="l">请求 local token 到物理 page</td><td class="l">cache fetch / topk slots</td></tr>
+  </table>
+  <div class="box" style="margin-top:12px;border-left-color:var(--yellow);max-width:900px">
+    Prefill 的 correctness 首先取决于 metadata：没有这些边界，top-k 很容易跨请求或看未来 token。
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">stage: projection</div><div class="slide-num">7 / 18</div>
+  <h2>Batch Q/KV projection 的输入输出</h2>
+  <div class="formula">
+    input: hidden_states <span class="pink">[T,2048]</span>, positions [T]<br><br>
+    Q path:<br>
+    q_a_proj → q_lora [T,768] → q_norm → q_lora_norm [T,768] → q_b_proj → Q [T,32,192]<br><br>
+    KV path:<br>
+    kv_a_proj → latent [T,576] → split(kv_lora [T,512], k_rope [T,64])<br>
+    kv_norm + kv_b_proj → Knew [T,32,192], Vnew [T,32,128]<br><br>
+    output tensors are already flat by request order; no per-request loop required here.
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">stage: cache store</div><div class="slide-num">8 / 18</div>
+  <h2>Batch cache store 的输入输出</h2>
+  <div class="row wrap" style="margin-top:8px">
+    <div class="panel" style="width:420px"><h3 style="color:var(--pink)">输入</h3><div class="mono" style="font-size:.8em;line-height:1.85">out_cache_loc [T]<br>index_k_new [T,128]<br>Knew [T,32,192]<br>Vnew [T,32,128]</div></div>
+    <div class="panel" style="width:420px"><h3 style="color:var(--green)">side effect</h3><div class="mono" style="font-size:.8em;line-height:1.85">index_k_cache[out_cache_loc] = index_k_new<br>main_k_cache[out_cache_loc] = Knew<br>main_v_cache[out_cache_loc] = Vnew<br>untouched slots unchanged</div></div>
+  </div>
+  <div class="box" style="margin-top:12px;border-left-color:var(--cyan);max-width:920px">
+    SGLang 线上提到 fuse store indexer K cache；Zeus prefill 可以把 wk/norm/rope/quant/store 融合成一条 cache 写入路径。
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">stage: ragged topk</div><div class="slide-num">9 / 18</div>
+  <h2>Ragged top-k 的输入输出</h2>
+  <div class="formula">
+    input:<br>
+    &nbsp;&nbsp;q_idx [T,8,128], gate [T,8]<br>
+    &nbsp;&nbsp;index_k_cache [pool,128]<br>
+    &nbsp;&nbsp;prefix_lens [B], extend_seq_lens [B], block_table<br><br>
+    per row output:<br>
+    &nbsp;&nbsp;topk_local[row] [2048]  // request-local token id or -1<br>
+    &nbsp;&nbsp;topk_slots[row] [2048]  // physical cache slot or -1<br><br>
+    invariant:<br>
+    &nbsp;&nbsp;topk row 只能包含 same request 中 prefix + current chunk 已到达的位置。
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">stage: sparse prefill</div><div class="slide-num">10 / 18</div>
+  <h2>Sparse prefill attention 的输入输出</h2>
+  <div class="formula">
+    input:<br>
+    &nbsp;&nbsp;Q [T,32,192]<br>
+    &nbsp;&nbsp;topk_slots [T,2048]<br>
+    &nbsp;&nbsp;main_k_cache [pool,32,192]<br>
+    &nbsp;&nbsp;main_v_cache [pool,32,128]<br><br>
+    output:<br>
+    &nbsp;&nbsp;attn_out [T,32,128]<br><br>
+    short-context branch:<br>
+    &nbsp;&nbsp;if valid_len(row) <= index_topk: 可以走 dense/MHA one-shot fallback。
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">step 1</div><div class="slide-num">4 / 11</div>
+  <h2>批量 projection：与 decode 同算子，不同 T</h2>
+  <div class="flow" style="margin-top:8px">
+    <div class="node n-q"><b>q_a_proj</b><span>[T,2048] → [T,768]</span><span>all query tokens</span></div>
+    <div class="node n-q"><b>q_b_proj</b><span>[T,768] → [T,6144]</span><span>Q [T,32,192]</span></div>
+    <div class="node n-k"><b>kv_a_proj</b><span>[T,2048] → [T,576]</span><span>kv_lora + k_rope</span></div>
+    <div class="node n-k"><b>kv_b_proj</b><span>[T,512] → [T,8192]</span><span>K/V [T,32,*]</span></div>
+    <div class="node n-i"><b>indexer.wq_b</b><span>[T,768] → [T,8,128]</span><span>q_idx</span></div>
+    <div class="node n-i"><b>indexer.wk</b><span>[T,2048] → [T,128]</span><span>new index K</span></div>
+    <div class="node n-i"><b>weights_proj</b><span>[T,2048] → [T,8]</span><span>head gates</span></div>
+    <div class="node n-o"><b>RoPE</b><span>positions [T]</span><span>main + index</span></div>
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">step 2</div><div class="slide-num">5 / 11</div>
+  <h2>批量写 cache：当前 chunk 先入池</h2>
+  <div class="formula">
+    out_cache_loc [T] = 每个新 token 的物理 slot<br><br>
+    index_k_cache[out_cache_loc] = k_idx_new [T,128]<br>
+    main_k_cache[out_cache_loc]  = K_new     [T,32,192]<br>
+    main_v_cache[out_cache_loc]  = V_new     [T,32,128]
+  </div>
+  <div class="box" style="margin-top:12px;border-left-color:var(--cyan);max-width:920px">
+    SGLang 0.5.10 的线上优化里有 “NSA fuse store indexer K cache” 和 “prefill KV cache fetching”。
+    Zeus prefill path 应把 cache 写入和后续 fetch/gather 当成同等重要的算子边界。
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">ragged mask</div><div class="slide-num">6 / 11</div>
+  <h2>每个 query token 的有效 key 范围不同</h2>
+  <p class="sub">例：两个请求，prefix_lens=[3,1]，extend_lens=[3,2]</p>
+  <table class="T" style="margin-top:8px">
+    <tr><th>flat query row</th><th>请求</th><th>本请求内 query pos</th><th>可见 key 数</th><th>说明</th></tr>
+    <tr><td>0</td><td>A</td><td>0</td><td class="c-w">4</td><td class="l">3 prefix + 当前第 1 个 token</td></tr>
+    <tr><td>1</td><td>A</td><td>1</td><td class="c-w">5</td><td class="l">3 prefix + 当前前 2 个 token</td></tr>
+    <tr><td>2</td><td>A</td><td>2</td><td class="c-w">6</td><td class="l">3 prefix + 当前前 3 个 token</td></tr>
+    <tr><td>3</td><td>B</td><td>0</td><td class="c-w">2</td><td class="l">1 prefix + 当前第 1 个 token</td></tr>
+    <tr><td>4</td><td>B</td><td>1</td><td class="c-w">3</td><td class="l">1 prefix + 当前前 2 个 token</td></tr>
+  </table>
+  <div class="formula" style="margin-top:12px">
+    topk 不可以跨请求；logits 中其他请求的 key 必须是 -inf。
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">step 3</div><div class="slide-num">7 / 11</div>
+  <h2>Ragged indexer logits + TopK</h2>
+  <div class="ascii" style="margin-top:8px">
+for each flat query row q:
+  req = token_to_request[q]
+  valid key slots = prefix slots(req) + current chunk slots(req, <= q_pos)
+
+  <span class="q">q_idx[q]</span> [8,128]
+  <span class="i">Kidx_valid</span> [S_q,128]
+  <span class="w">weights[q]</span> [8]
+
+  score[q,s] = Σ_i weights[q,i] · dot(q_idx[q,i], Kidx_valid[s])
+  topk_indices[q] = topk(score[q,:], min(index_topk, S_q))
+  </div>
+  <div class="box" style="margin-top:12px;border-left-color:var(--purple);max-width:900px">
+    如果 S_q <= index_topk，可以跳过 sparse top-k 的收益路径，直接 dense/MHA one-shot。这对应 SGLang 的 dense fallback 阈值策略。
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">数值例子</div><div class="slide-num">8 / 11</div>
+  <h2>Prefill TopK 小例子</h2>
+  <p class="sub">请求 A: prefix 3 + extend 3。当前 flat row=2，是 A 的第三个新 token。</p>
+  <table class="T" style="margin-top:8px">
+    <tr><th>local key</th><th>来源</th><th>score</th></tr>
+    <tr><td>0</td><td class="c-d">prefix A0</td><td class="c-w">0.4</td></tr>
+    <tr><td>1</td><td class="c-d">prefix A1</td><td class="c-w">1.1</td></tr>
+    <tr><td>2</td><td class="c-d">prefix A2</td><td class="c-w">0.2</td></tr>
+    <tr><td>3</td><td class="c-k">extend A0</td><td class="c-w">1.8</td></tr>
+    <tr><td>4</td><td class="c-k">extend A1</td><td class="c-w hi">2.3</td></tr>
+    <tr><td>5</td><td class="c-k">extend A2</td><td class="c-w hi">2.0</td></tr>
+  </table>
+  <div class="formula" style="margin-top:12px">
+    top2 local ids = <span class="purple">[4,5]</span>。<br>
+    注意 row=2 能看 A0/A1/A2 的当前 chunk token，但不能看请求 B，也不能看 A 的未来 token。
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">step 4</div><div class="slide-num">9 / 11</div>
+  <h2>Prefill sparse attention</h2>
+  <div class="formula">
+    for each query row q:<br>
+    selected_slots = local_to_physical_slots(req, topk_indices[q])<br>
+    selected_k = main_k_cache[selected_slots] → [Ktop,32,192]<br>
+    selected_v = main_v_cache[selected_slots] → [Ktop,32,128]<br>
+    out[q,h,:] = softmax(Q[q,h] · selected_k[:,h] / sqrt(192)) · selected_v[:,h]
+  </div>
+  <div class="row wrap" style="margin-top:12px">
+    <div class="box" style="border-left-color:var(--cyan);width:420px"><b style="color:#fff">线上 SGLang 参考</b><br><span class="mono">flashmla_sparse</span>, <span class="mono">flashmla_kv</span>, <span class="mono">tilelang</span>, <span class="mono">trtllm</span></div>
+    <div class="box" style="border-left-color:var(--green);width:420px"><b style="color:#fff">Zeus 第一版目标</b><br>先支持 bf16/fp32 ragged sparse attention，再考虑 FP8 cache 和 backend auto-select。</div>
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">dev gap</div><div class="slide-num">10 / 11</div>
+  <h2>当前 dev 脚本与 Prefill 真实路径的差距</h2>
+  <table class="T" style="margin-top:8px">
+    <tr><th>能力</th><th>当前 dev 脚本</th><th>Prefill 还需补</th></tr>
+    <tr><td>projection</td><td class="c-green">已覆盖</td><td class="l">真实 shape smoke</td></tr>
+    <tr><td>index K/main KV store</td><td class="c-green">proxy slot 已覆盖</td><td class="l">paged block table + ragged out_cache_loc</td></tr>
+    <tr><td>indexer logits/topk</td><td class="c-yellow">单序列 causal 已覆盖</td><td class="l">多请求 ragged topk</td></tr>
+    <tr><td>sparse attention</td><td class="c-yellow">单序列 topk REF 已覆盖</td><td class="l">prefill ragged sparse MLA</td></tr>
+    <tr><td>dense fallback</td><td class="c-d">文档规划</td><td class="l">seq_len <= index_topk policy</td></tr>
+  </table>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">总结</div><div class="slide-num">11 / 11</div>
+  <h2>Prefill path 的 kernel 优先级</h2>
+  <div class="row wrap" style="margin-top:10px">
+    <div class="panel" style="width:310px"><h3 style="color:var(--cyan)">P0: cache store/fetch</h3><div class="mono" style="font-size:.8em;line-height:1.8">batch write out_cache_loc<br>paged fetch valid slots<br>untouched slot invariant</div></div>
+    <div class="panel" style="width:310px"><h3 style="color:var(--purple)">P0: ragged topk</h3><div class="mono" style="font-size:.8em;line-height:1.8">per-row valid key span<br>no cross-request leakage<br>topk padding -1</div></div>
+    <div class="panel" style="width:310px"><h3 style="color:var(--green)">P1: sparse prefill</h3><div class="mono" style="font-size:.8em;line-height:1.8">selected slot gather<br>QK softmax AV<br>backend threshold</div></div>
+  </div>
+  <div class="box" style="margin-top:14px;border-left-color:var(--yellow);max-width:920px">
+    Prefill path 不是 decode kernel 的简单批量版：它需要 ragged metadata、请求隔离、prefix+current chunk 的可见性，以及短上下文 dense fallback。
+  </div>
+</div>
+
+</div>
+<div id="nav"><button id="bp" onclick="go(-1)">◀</button><div id="dots"></div><div id="prog">1 / 18</div><button id="bn" onclick="go(1)">▶</button></div>
+<script>
+const slides=document.querySelectorAll('.slide');const N=slides.length;let cur=0;const dotsEl=document.getElementById('dots');const progEl=document.getElementById('prog');const bp=document.getElementById('bp');const bn=document.getElementById('bn');
+slides.forEach((sl,i)=>{const n=sl.querySelector('.slide-num');if(n)n.textContent=`${i+1} / ${N}`;});
+slides.forEach((_,i)=>{const d=document.createElement('div');d.className='dot'+(i===0?' on':'');d.onclick=()=>goTo(i);dotsEl.appendChild(d);});
+function goTo(n){slides[cur].classList.remove('active');dotsEl.children[cur].classList.remove('on');cur=Math.max(0,Math.min(N-1,n));slides[cur].classList.add('active');dotsEl.children[cur].classList.add('on');progEl.textContent=`${cur+1} / ${N}`;bp.disabled=cur===0;bn.disabled=cur===N-1}
+function go(d){goTo(cur+d)}document.addEventListener('keydown',e=>{if(e.key==='ArrowRight'||e.key===' '){e.preventDefault();go(1)}if(e.key==='ArrowLeft'){e.preventDefault();go(-1)}});goTo(0);
+</script>
+</body>
+</html>
