@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GLM5-Next DSA Decode Zeus 适配开发追踪</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:     #0d0e1c;
+  --panel:  #13152a;
+  --card:   #181a32;
+  --border: #272a52;
+  --text:   #c8cfe8;
+  --dim:    #68709b;
+  --blue:   #4a90e2;
+  --cyan:   #38d9a9;
+  --pink:   #f06292;
+  --yellow: #ffd166;
+  --green:  #69db7c;
+  --purple: #b39ddb;
+  --orange: #ffab76;
+  --red:    #ef5350;
+  --teal:   #4dd0e1;
+  --mono:   'Courier New', 'Consolas', monospace;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  height: 100vh;
+  overflow: hidden;
+  user-select: none;
+}
+
+#deck { width: 100vw; height: 100vh; position: relative; }
+
+.slide {
+  position: absolute; inset: 0;
+  display: none; flex-direction: column;
+  align-items: center; justify-content: center;
+  padding: 28px 54px 64px; gap: 10px;
+}
+.slide.active { display: flex; }
+
+.slide-tag {
+  position: absolute; top: 18px; left: 32px;
+  font-size: 0.7em; color: var(--dim);
+  letter-spacing: 0.14em; text-transform: uppercase;
+}
+.slide-num {
+  position: absolute; top: 18px; right: 32px;
+  font-size: 0.7em; color: var(--dim); font-family: var(--mono);
+}
+
+h1 { font-size: 2.32em; font-weight: 700; color: #fff; line-height: 1.18; text-align: center; }
+h2 { font-size: 1.58em; font-weight: 650; color: #dde4ff; text-align: center; }
+h3 { font-size: 0.9em; font-weight: 700; margin-bottom: 8px; }
+p  { font-size: 0.92em; line-height: 1.7; text-align: center; }
+code, .mono { font-family: var(--mono); }
+.sub { font-size: 0.84em; color: var(--dim); text-align: center; margin-top: -4px; }
+
+.row { display: flex; align-items: flex-start; gap: 14px; }
+.col { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.wrap { flex-wrap: wrap; justify-content: center; }
+.divider { width: 100%; height: 1px; background: var(--border); }
+
+.badge {
+  display: inline-block;
+  padding: 5px 13px; border-radius: 18px;
+  font-size: 0.76em; font-family: var(--mono); font-weight: 650;
+}
+.b-blue   { background:#182450; color:var(--blue);   border:1px solid #253570; }
+.b-cyan   { background:#0e2530; color:var(--cyan);   border:1px solid #1e3540; }
+.b-green  { background:#0e2818; color:var(--green);  border:1px solid #1e3828; }
+.b-yellow { background:#2a2008; color:var(--yellow); border:1px solid #3a3018; }
+.b-pink   { background:#2a1030; color:var(--pink);   border:1px solid #3a2040; }
+.b-purple { background:#1a1030; color:var(--purple); border:1px solid #2a2040; }
+.b-orange { background:#281808; color:var(--orange); border:1px solid #4a2a10; }
+.b-red    { background:#2c1114; color:var(--red);    border:1px solid #4a2025; }
+
+.box {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--blue);
+  border-radius: 7px;
+  padding: 11px 15px;
+  font-size: 0.86em;
+  line-height: 1.65;
+}
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 17px;
+}
+
+table.T, table.kv {
+  border-collapse: collapse; font-family: var(--mono); font-size: 0.78em;
+}
+table.T th, table.T td, table.kv th, table.kv td {
+  border: 1px solid var(--border); padding: 5px 9px; text-align: center;
+}
+table.T th, table.kv th { background: #1c1f3a; color: var(--dim); font-weight: 650; }
+table.T td.l, table.kv td.l { text-align: left; color: var(--text); }
+.c-q  { background:#1a2050; color:var(--blue); }
+.c-k  { background:#0f2a2a; color:var(--cyan); }
+.c-v  { background:#0e2818; color:var(--green); }
+.c-i  { background:#18102a; color:var(--purple); }
+.c-w  { background:#2a2010; color:var(--yellow); }
+.c-o  { background:#1e1208; color:var(--orange); }
+.c-b  { background:#2a1030; color:var(--pink); }
+.c-r  { background:#2c1114; color:var(--red); }
+.c-d  { background:#111320; color:var(--dim); }
+
+.formula {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 13px 20px;
+  font-family: var(--mono); font-size: 0.84em; line-height: 1.85;
+  text-align: left; max-width: 1000px;
+}
+.formula .blue { color: var(--blue); }
+.formula .cyan { color: var(--cyan); }
+.formula .green { color: var(--green); }
+.formula .yellow { color: var(--yellow); }
+.formula .pink { color: var(--pink); }
+.formula .purple { color: var(--purple); }
+.formula .orange { color: var(--orange); }
+.formula .red { color: var(--red); }
+.formula .dim { color: var(--dim); }
+
+.ascii {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px 20px;
+  font-family: var(--mono); font-size: 0.75em; line-height: 1.55;
+  white-space: pre; color: var(--text);
+  overflow-x: auto; text-align: left; max-width: min(1060px, 100%);
+}
+.ascii .q { color: var(--blue); font-weight: 700; }
+.ascii .k { color: var(--cyan); font-weight: 700; }
+.ascii .v { color: var(--green); font-weight: 700; }
+.ascii .i { color: var(--purple); font-weight: 700; }
+.ascii .w { color: var(--yellow); font-weight: 700; }
+.ascii .o { color: var(--orange); font-weight: 700; }
+.ascii .r { color: var(--red); font-weight: 700; }
+.ascii .d { color: var(--dim); }
+
+.flow {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  gap: 12px;
+  width: min(1050px, 100%);
+}
+.node {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 12px; min-height: 82px;
+}
+.node b { display:block; font-size:0.84em; margin-bottom:5px; color:#fff; }
+.node span { display:block; font-family:var(--mono); color:var(--dim); font-size:0.74em; line-height:1.55; }
+.n-q { border-left: 3px solid var(--blue); }
+.n-k { border-left: 3px solid var(--cyan); }
+.n-v { border-left: 3px solid var(--green); }
+.n-i { border-left: 3px solid var(--purple); }
+.n-o { border-left: 3px solid var(--orange); }
+.n-r { border-left: 3px solid var(--red); }
+
+#nav {
+  position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 14px;
+  background: rgba(19, 21, 42, 0.92);
+  backdrop-filter: blur(12px);
+  padding: 9px 22px; border-radius: 32px;
+  border: 1px solid var(--border);
+}
+#nav button {
+  background: none; border: none; color: var(--text);
+  cursor: pointer; font-size: 1.3em; padding: 3px 8px;
+  border-radius: 6px;
+}
+#nav button:hover { background: #272a52; }
+#nav button:disabled { color: #2a2d4a; cursor: not-allowed; }
+#prog { font-size: 0.83em; color: var(--dim); min-width: 54px; text-align:center; font-family:var(--mono); }
+#dots { display:flex; gap:6px; align-items:center; }
+.dot { width:7px; height:7px; border-radius:50%; background:var(--border); cursor:pointer; }
+.dot.on { background: var(--blue); }
+</style>
+</head>
+
+<body>
+<div id="deck">
+
+<div class="slide">
+  <div class="slide-num">1 / 12</div>
+  <div style="text-align:center">
+    <div style="font-size:0.78em; color:var(--cyan); letter-spacing:0.18em; text-transform:uppercase; margin-bottom:10px">
+      zeus_dev · GLM5-Next DSA Decode
+    </div>
+    <h1>GLM5-Next DSA Decode<br>Zeus 适配开发追踪</h1>
+    <p style="color:#7682b5; margin-top:12px; font-size:1em">
+      hidden_state → Indexer TopK → Sparse MQA → FA-reduce → o_proj
+    </p>
+    <div class="row wrap" style="margin-top:22px; gap:10px">
+      <span class="badge b-blue">Glm5NextForCausalLM</span>
+      <span class="badge b-cyan">Decode only</span>
+      <span class="badge b-purple">CP-aware</span>
+      <span class="badge b-green">Dro = 0</span>
+      <span class="badge b-yellow">Ktop = 2048</span>
+    </div>
+    <p style="margin-top:28px; font-size:0.78em; color:#394066">
+      → / Space 下一页 · ← 上一页 · 点击小圆点跳转
+    </p>
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">scope</div><div class="slide-num">2 / 12</div>
+  <h2>切片边界：只覆盖单个 DSA Decode 模块</h2>
+  <div class="row wrap" style="margin-top:10px; align-items:stretch">
+    <div class="box" style="width:430px; border-left-color:var(--green)">
+      <b style="color:#fff">起点</b><br>
+      <span class="mono" style="color:var(--green)">hidden_state [B,H]</span><br>
+      来自 <span class="mono">layer_communicator.prepare_attn(...)</span> 后。
+    </div>
+    <div class="box" style="width:430px; border-left-color:var(--orange)">
+      <b style="color:#fff">终点</b><br>
+      <span class="mono" style="color:var(--orange)">self_attn.o_proj out [B,H]</span><br>
+      不包含 MLP/MoE、MHC postprocess、NextN。
+    </div>
+    <div class="box" style="width:430px; border-left-color:var(--purple)">
+      <b style="color:#fff">方法</b><br>
+      stage 化 <span class="mono">REF vs Zeus</span>；Zeus 未落地时必须显式
+      <span class="mono">SKIP/TODO</span>，禁止 silent fallback。
+    </div>
+    <div class="box" style="width:430px; border-left-color:var(--cyan)">
+      <b style="color:#fff">CP 视角</b><br>
+      <span class="mono">CP=1</span> 本地完成；<span class="mono">CP&gt;1</span>
+      增加 TopK gather/merge 与 partial FA-reduce。
+    </div>
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">config</div><div class="slide-num">3 / 12</div>
+  <h2>两套配置合表：值不同，但 DSA 形态一致</h2>
+  <table class="T" style="margin-top:8px">
+    <tr><th>字段</th><th>GLM5-Next-16B</th><th>GLM5-Next</th><th>说明</th></tr>
+    <tr><td class="c-b">H</td><td>2048</td><td>4096</td><td class="l">hidden_size</td></tr>
+    <tr><td class="c-q">Nh</td><td>32</td><td>64</td><td class="l">attention heads</td></tr>
+    <tr><td class="c-q">Rq</td><td>768</td><td>1536</td><td class="l">q_lora_rank</td></tr>
+    <tr><td class="c-k">Rkv</td><td>512</td><td>512</td><td class="l">latent KV 宽度固定</td></tr>
+    <tr><td class="c-q">Dqk</td><td>128</td><td>192</td><td class="l">Dro=0 后的实际 qk_head_dim</td></tr>
+    <tr><td class="c-v">Dv</td><td>128</td><td>256</td><td class="l">V absorb 输出 head dim</td></tr>
+    <tr><td class="c-i">I / Di</td><td>8 / 128</td><td>8 / 128</td><td class="l">Indexer 维度完全相同</td></tr>
+    <tr><td class="c-w">Ktop</td><td>2048</td><td>2048</td><td class="l">Sparse MQA 选中的 token 数</td></tr>
+    <tr><td class="c-o">DSA 层数</td><td>6</td><td>11</td><td class="l">full_attn_layers</td></tr>
+  </table>
+  <div class="box" style="margin-top:12px; border-left-color:var(--yellow); max-width:940px">
+    关键：GLM5-Next 的 <span class="mono">config.json</span> 写 <span class="mono">qk_rope_head_dim=64</span>，
+    但当前部署版本按 <span class="mono">Dro=0</span>；本文、脚本和算子 shape 都按实际 Dro=0。
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">Dro=0</div><div class="slide-num">4 / 12</div>
+  <h2>Dro=0：主 MLA 与 Indexer 都不走 RoPE</h2>
+  <div class="ascii" style="margin-top:8px">
+<span class="q">q_b_proj(q_lora)</span> → q [B, Nh, Dqk]
+    Dro = 0
+    └─ q_new = bmm(q, w_kc)                     <span class="d"># no q_pe split, no concat</span>
+
+<span class="k">kv_a_layernorm(latent_cache)</span> → k_new [B, 1, 512]
+    Dro = 0
+    └─ latent KV row = Rkv = 512 elem            <span class="d"># no k_pe tail</span>
+
+<span class="i">Indexer</span>
+    q_idx = wq_b(q_lora)
+    k_idx = LayerNorm(wk(hidden_state))
+    no NeoX RoPE → Hadamard → FP8 quant
+  </div>
+  <div class="row wrap" style="margin-top:12px">
+    <span class="badge b-green">latent KV = 1024 B/token BF16</span>
+    <span class="badge b-purple">index K = 128 B FP8 + 4 B scale</span>
+    <span class="badge b-blue">sparse MQA head_dim = 512</span>
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">pipeline</div><div class="slide-num">5 / 12</div>
+  <h2>DSA Decode 算子主链</h2>
+  <div class="flow" style="margin-top:10px">
+    <div class="node n-q"><b>#0.Q q_a_proj_norm</b><span>hidden → q_a_proj<br>RMSNorm → q_lora</span></div>
+    <div class="node n-q"><b>#0.KV kv_a_proj_norm_store</b><span>hidden → kv_a_proj<br>RMSNorm → latent_kv_cache[slot]</span></div>
+    <div class="node n-q"><b>#1 q_main_absorb</b><span>q_b_proj(q_lora)<br>bmm w_kc<br>q_new [B,Nh,512]</span></div>
+    <div class="node n-i"><b>#2.Q indexer_q_weights</b><span>wq_b · q_lora → reshape<br>Hadamard ±1/√Di → fp8 e4m3<br>+ gate → weights</span></div>
+    <div class="node n-i"><b>#2.K indexer_k_prep_store</b><span>wk · hidden → LayerNorm<br>Hadamard ±1/√Di → fp8 e4m3<br>scatter cache[slot]</span></div>
+    <div class="node n-i"><b>#3 idx_logits</b><span>Index GEMM<br>gate reduce<br>scale</span></div>
+    <div class="node n-i"><b>#4 local_topK</b><span>S_local≤2048 direct<br>otherwise radix select</span></div>
+    <div class="node n-r"><b>#5/#6 CP topK</b><span>all-gather local topK<br>merge global topK</span></div>
+    <div class="node n-k"><b>#7 gather K</b><span>skip-invalid scalar if<br>2-core broadcast<br>K_local + mask</span></div>
+    <div class="node n-v"><b>#8 sparse MQA</b><span>FA-v2 online softmax<br>Q-head split, no reduce<br>partial_out + partial_lse</span></div>
+    <div class="node n-r"><b>#9 partial AG</b><span>CP&gt;1 only<br>out/lse gather</span></div>
+    <div class="node n-o"><b>#10 no-CP post</b><span>V absorb<br>o_proj</span></div>
+    <div class="node n-o"><b>#11 CP post</b><span>FA-reduce<br>V absorb + o_proj</span></div>
+    <div class="node n-k"><b>output</b><span>out [B,H]<br>进入外层 communicator</span></div>
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">fusion</div><div class="slide-num">6 / 12</div>
+  <h2>#0 / #2 显式拆分：两个独立 kernel，不 fuse</h2>
+  <div class="ascii" style="margin-top:8px">
+hidden_state [B,H]
+    │
+    ├─ <span class="q">#0.Q  dsa_q_a_proj_norm</span>
+    │      hidden → q_a_proj → RMSNorm → <span class="i">q_lora [B,Rq]</span>
+    │
+    ├─ <span class="q">#0.KV dsa_kv_a_proj_norm_store</span>
+    │      hidden → kv_a_proj → RMSNorm → <span class="k">latent_kv_cache[slot, :]</span>
+    │                                                  ↑ in-place scatter
+    │
+    ├─ <span class="i">#2.K dsa_indexer_k_prep_store</span>
+    │      hidden → wk → 完整 LayerNorm(γ, β) → Hadamard / √Di
+    │             → fp8 e4m3 quant → cache_body[slot] / cache_scale[slot]
+    │
+    └─ <span class="i">#2.Q dsa_indexer_q_weights</span>  (消费 q_lora，不直接消费 hidden 做 K 路径)
+           q_lora → wq_b → reshape [B,I,Di] → Hadamard / √Di → fp8 e4m3
+           hidden → weights_proj → gate → weights = gate · I^-½ · q_scale · Di^-½
+  </div>
+  <div class="box" style="margin-top:12px; border-left-color:var(--cyan); max-width:940px">
+    #0 / #2 都<b>显式不 fuse</b>：#0.Q 和 #0.KV 独立 <span class="mono">grid=(1,)</span>，hidden 各读一次；
+    #2.Q 与 #2.K 互不依赖（输入只有 <span class="mono">q_lora / hidden / slot_mapping</span>），首版 dev 分 stage 对齐，
+    fuse 决策留给 porting 阶段。<br>
+    #1 q-main 与 #2.Q 都消费 q_lora，但计算性质不同（#1 是 heavy GEMM + absorb bmm，#2.Q 是 indexer prep）。
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">index logits</div><div class="slide-num">7 / 12</div>
+  <h2>Index logits：GEMM → gate → scale</h2>
+  <div class="formula" style="margin-top:8px">
+q_idx_fp8:      <span class="blue">[B, I=8, Di=128]</span><br>
+index_K_local: <span class="purple">[B, S_local, Di=128]</span><br>
+raw = q_idx_fp8 · index_K_local^T       <span class="dim"># [B,I,S_local]</span><br>
+logits = sum_i(raw_i · weights_i)       <span class="dim"># [B,S_local]</span><br>
+logits = logits · k_scale               <span class="dim"># scale 只乘 [B,S_local]</span>
+  </div>
+  <div class="row wrap" style="margin-top:12px">
+    <div class="box" style="width:420px; border-left-color:var(--purple)">
+      <b style="color:#fff">为什么 scale 放最后</b><br>
+      避免对 <span class="mono">[B,I,S_local]</span> 做 broadcast 乘法；
+      scale 是 per token row，一个 <span class="mono">[B,S_local]</span> 乘法即可。
+    </div>
+    <div class="box" style="width:420px; border-left-color:var(--green)">
+      <b style="color:#fff">CP 之前基本无感</b><br>
+      CP 只改变 <span class="mono">S_local</span> 与 global position offset；
+      all-gather local topK 前 kernel 主体不变。
+    </div>
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">topK CP</div><div class="slide-num">8 / 12</div>
+  <h2>TopK：本地 select，CP&gt;1 再 merge</h2>
+  <div class="ascii" style="margin-top:8px">
+logits_local [B,S_local]
+    │
+    ├─ if S_local ≤ 2048:
+    │      return all valid positions + padding(-1 / -inf)
+    │
+    └─ else:
+           radix select → local_topk(logit,pos) [B,2048]
+
+CP=1:
+    global_topk = local_topk
+
+CP&gt;1:
+    all-gather local_topk across CP ranks
+    merge-topK over CP × 2048 candidates
+    → global_topk_pos [B,2048]
+  </div>
+  <div class="box" style="margin-top:12px; border-left-color:var(--yellow); max-width:940px">
+    Local radix select 与 global merge-topK 是同类问题；后者输入已经是候选集，
+    但要保留 tie-break 规则，保证 <span class="mono">CP=1</span> 与 <span class="mono">CP&gt;1</span> 可对齐。
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">sparse MQA</div><div class="slide-num">9 / 12</div>
+  <h2>Sparse MQA：partial 接口固定输出 out + lse</h2>
+  <div class="formula" style="margin-top:8px">
+q_new:        <span class="blue">[B,Nh,512]</span>                        <span class="dim"># from #1 absorb</span><br>
+K_local:      <span class="cyan">[B,Ktop,512]</span> bf16                 <span class="dim"># from #7, invalid 行 garbage</span><br>
+mask:         <span class="purple">[B,Ktop]</span>   bf16 (1.0 / 0.0)     <span class="dim"># from #7, score · mask + (1−mask)·-1e9</span><br>
+partial_out:  <span class="green">[B,Nh,512]</span>                       <span class="dim"># FA-v2 在线 softmax</span><br>
+partial_lse:  <span class="yellow">[B,Nh]</span>
+  </div>
+  <div class="row wrap" style="margin-top:12px">
+    <div class="box" style="width:430px; border-left-color:var(--green)">
+      <b style="color:#fff">CP=1</b><br>
+      partial_out 就是全局 latent attention 输出；post kernel 只做
+      <span class="mono">V absorb + o_proj</span>。
+    </div>
+    <div class="box" style="width:430px; border-left-color:var(--red)">
+      <b style="color:#fff">CP&gt;1</b><br>
+      all-gather <span class="mono">(partial_out, partial_lse)</span>，
+      再做 FA-reduce + V absorb + o_proj。
+    </div>
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">FA-reduce</div><div class="slide-num">10 / 12</div>
+  <h2>FA-reduce：不能用 all_reduce(sum) 替代</h2>
+  <div class="formula" style="margin-top:8px">
+partial_out_r [B,Nh,512], partial_lse_r [B,Nh]<br><br>
+m = max_r(partial_lse_r)<br>
+z = Σ_r exp(partial_lse_r - m)<br>
+out_latent = Σ_r exp(partial_lse_r - m) · partial_out_r / z<br><br>
+attn_out = bmm(out_latent.T, w_vc[Nh,512,Dv]).T<br>
+out = o_proj(attn_out.reshape(B, Nh·Dv))
+  </div>
+  <div class="box" style="margin-top:12px; border-left-color:var(--red); max-width:920px">
+    空集 rank 约定：<span class="mono">partial_lse=-inf</span>，merge 权重为 0。
+    裸 <span class="mono">all_reduce(sum)</span> 会丢掉 softmax 分母信息，数学不等价。
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">layout</div><div class="slide-num">11 / 12</div>
+  <h2>CP page/block interleave 与 2-core Index Lmem</h2>
+  <div class="ascii" style="margin-top:8px">
+DSA cache follows page attention.
+
+CP owner is decided by page/block group, not by one contiguous sequence chunk.
+
+Example: CP=4, two core Index Lmem are treated as two adjacent blocks
+
+block pair 0 → rank0 / core0, rank0 / core1
+block pair 1 → rank1 / core0, rank1 / core1
+block pair 2 → rank2 / core0, rank2 / core1
+block pair 3 → rank3 / core0, rank3 / core1
+block pair 4 → rank0 / core0, rank0 / core1
+...
+  </div>
+  <div class="box" style="margin-top:12px; border-left-color:var(--purple); max-width:940px">
+    对 #3/#4 Index logits/topK 来说，只需要知道本 rank 的 <span class="mono">S_local</span>
+    和每行的 global position；是否 CP、CP 几路，在 local-topK all-gather 之前都不改变核心逻辑。
+  </div>
+</div>
+
+<div class="slide">
+  <div class="slide-tag">dev stages</div><div class="slide-num">12 / 12</div>
+  <h2>Dev 脚本与开发状态</h2>
+  <table class="T" style="margin-top:8px; font-size:0.75em">
+    <tr><th>stage</th><th>覆盖步骤</th><th>检查重点</th><th>Zeus 现状</th></tr>
+    <tr><td class="c-q">q_a_proj_norm</td><td>#0.Q</td><td class="l">hidden → q_a_proj → RMSNorm → q_lora</td><td class="c-v">✅ CPU sim</td></tr>
+    <tr><td class="c-q">kv_a_proj_norm_store</td><td>#0.KV</td><td class="l">hidden + slot → latent_kv_cache[slot] in-place</td><td class="c-v">✅ CPU sim</td></tr>
+    <tr><td class="c-q">q_main</td><td>#1</td><td class="l">Dro=0, q_new [B,Nh,512]</td><td class="c-v">✅ CPU sim</td></tr>
+    <tr><td class="c-i">idx_q_weights</td><td>#2.Q</td><td class="l">Hadamard ±1/√Di → row-wise fp8 e4m3 (amax/448) + head-gate weights</td><td class="c-v">✅ CPU sim</td></tr>
+    <tr><td class="c-i">idx_k_prep_store</td><td>#2.K</td><td class="l">完整 LayerNorm + Hadamard → row-wise fp8 e4m3 (amax/448) → scatter cache[slot]</td><td class="c-v">✅ CPU sim</td></tr>
+    <tr><td class="c-i">idx_logits</td><td>#3</td><td class="l">Index GEMM → gate → scale（CORE_NUM=2 沿 S 切核）</td><td class="c-v">✅ CPU sim</td></tr>
+    <tr><td class="c-i">local_topk</td><td>#4</td><td class="l">direct (S_local≤Ktop) / 7-phase radix select</td><td class="c-v">✅ CPU sim</td></tr>
+    <tr><td class="c-r">cp_topk_merge</td><td>#5/#6</td><td class="l">global topK == full sequence topK</td><td class="c-r">TODO</td></tr>
+    <tr><td class="c-k">latent_gather</td><td>#7</td><td class="l">skip-invalid scalar if + 2-core broadcast；输出 K_local + mask</td><td class="c-v">✅ CPU sim</td></tr>
+    <tr><td class="c-v">sparse_mqa_partial</td><td>#8</td><td class="l">FA-v2 在线 softmax + Q-head 切核（无核间 reduce）</td><td class="c-v">✅ CPU sim</td></tr>
+    <tr><td class="c-o">post_o_proj_nocp</td><td>#10</td><td class="l">V absorb + o_proj dual-GEMM 单 kernel，无 FA-reduce</td><td class="c-v">✅ CPU sim</td></tr>
+    <tr><td class="c-o">post_o_proj_cp</td><td>#11</td><td class="l">FA-reduce + V absorb + o_proj</td><td class="c-r">TODO</td></tr>
+    <tr><td class="c-o">decode_full_nocp</td><td>#0..#10</td><td class="l">no-CP decode 端到端</td><td class="c-r">TODO</td></tr>
+    <tr><td class="c-o">decode_full_cp</td><td>#0..#11</td><td class="l">cp=1 vs cp=k output 对齐</td><td class="c-r">TODO</td></tr>
+  </table>
+  <div class="formula" style="margin-top:12px">
+python zeus_dev/model_state_dev/dev_glm5next_dsa_decode_test.py --stage decode_full_cp --cp 4<br>
+默认 <span class="yellow">mode=both</span>：REF 先跑；Zeus unsupported 时打印 <span class="red">SKIP</span>，不算 FAIL。
+  </div>
+</div>
+
+</div>
+
+<div id="nav">
+  <button id="bp" onclick="go(-1)">◀</button>
+  <div id="dots"></div>
+  <div id="prog">1 / 12</div>
+  <button id="bn" onclick="go(1)">▶</button>
+</div>
+
+<script>
+const slides = document.querySelectorAll('.slide');
+const N = slides.length;
+let cur = 0;
+const dotsEl = document.getElementById('dots');
+const progEl = document.getElementById('prog');
+const bp = document.getElementById('bp');
+const bn = document.getElementById('bn');
+
+slides.forEach((_, i) => {
+  const d = document.createElement('div');
+  d.className = 'dot' + (i === 0 ? ' on' : '');
+  d.onclick = () => goTo(i);
+  dotsEl.appendChild(d);
+});
+
+function goTo(n) {
+  slides[cur].classList.remove('active');
+  dotsEl.children[cur].classList.remove('on');
+  cur = Math.max(0, Math.min(N - 1, n));
+  slides[cur].classList.add('active');
+  dotsEl.children[cur].classList.add('on');
+  progEl.textContent = `${cur + 1} / ${N}`;
+  bp.disabled = cur === 0;
+  bn.disabled = cur === N - 1;
+}
+
+function go(d) { goTo(cur + d); }
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); go(1); }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); go(-1); }
+});
+
+let tx = 0;
+document.addEventListener('touchstart', e => { tx = e.touches[0].clientX; });
+document.addEventListener('touchend', e => {
+  const dx = e.changedTouches[0].clientX - tx;
+  if (Math.abs(dx) > 40) go(dx < 0 ? 1 : -1);
+});
+
+goTo(0);
+</script>
+</body>
+</html>

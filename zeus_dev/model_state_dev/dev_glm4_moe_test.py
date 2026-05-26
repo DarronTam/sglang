@@ -742,25 +742,37 @@ def test_moe_block_full(cfg, num_tokens=16, seed=42):
       - 真实 GLM-4.7 权重过大（w13≈4.8GB），本 stage 使用 proxy shape
         (T=16, H=256, mI=128, E=8, top_k=4)。GLM-4.7 真实 shape 的 kernel
         层对齐分别由 sgl-kernel-zeus/tests/ 的各 kernel test 承担。
-      - `gate` Linear 与 `shared_experts` MLP 的 GEMM 不是本 stage 的测试对象
-        （它们在 qwen demo / 早期 stage 已验证），我们在 **CPU/CUDA 上用纯
-        torch 预计算** `router_logits` 和 `shared_output`，两条路径共享同一份
-        输入，专心比较 **MoE 核心 6-kernel pipeline** 的组装是否对齐。
+      - **2026-05-25 GAP-3 闭环**：`gate` Linear 与 `shared_experts` MLP
+        的 3 颗 Linear (`gate / shared_gate_up / shared_down`) 切到 Zeus
+        `sgl_kernel_zeus.linear_bf16`（packed-weight dense GEMM），整段
+        front-end 完全 device-resident。
+      - REF 与 Zeus **共享同一份 Zeus-computed `router_logits` 和
+        `shared_output`** 作为 MoE 6-kernel pipeline 的输入：这样比对焦点仍
+        在 MoE 6-kernel 上，避免 `linear_bf16` (fp32 acc + bf16 RNE) vs
+        `F.linear` (bf16 acc) 的量化噪声造成 top-k 路由翻转把测试变成
+        "linear_bf16 测试"（linear_bf16 的正确性由 `tests/test_linear_bf16.py`
+        14/14 PASS 独立保证）。
       - routed_scaling_factor 融合策略与生产 Zeus 路径一致：
         `biased_grouped_topk(apply_scale_on_output=True)` 把 scale 乘进 weights，
         `moe_grouped_gemm(gemm2, mul_routed_weight=True)` 把 weights 乘进
         accumulator，`moe_sum_reduce(scale=1.0, shared_output=…)` 只做 topk
         求和并融合 shared residual。
 
-    REF:  biased_grouped_topk_impl → per-token per-expert pytorch loop →
-          + shared_output
-    Zeus: biased_grouped_topk → moe_align_block_size_alloc →
-          moe_grouped_gemm(gemm1) → silu_and_mul → moe_grouped_gemm(gemm2) →
-          moe_sum_reduce(shared_output=…)
+    Front-end (Zeus linear_bf16 + silu_and_mul, GAP-3 闭环):
+      - gate Linear:      [T, H] @ [E, H].T  → router_logits_bf16 [T, E]
+      - shared gate_up:   [T, H] @ [2*mI, H].T → sh_gu_bf16 [T, 2*mI]
+      - shared silu_and_mul: [T, 2*mI] → [T, mI]
+      - shared down:      [T, mI] @ [H, mI].T → shared_out_bf16 [T, H]
+
+    REF MoE core:  biased_grouped_topk_impl → per-token MoE 循环 → + shared
+    Zeus MoE core: biased_grouped_topk → moe_align_block_size_alloc →
+                   moe_grouped_gemm(gemm1) → silu_and_mul → moe_grouped_gemm(gemm2) →
+                   moe_sum_reduce(shared_output=…)
     """
     print()
     print("=" * 60)
-    print("Stage: moe_block_full (GLM-4.7 MoE-FFN end-to-end)")
+    print("Stage: moe_block_full (GLM-4.7 MoE-FFN end-to-end)  "
+          "[GAP-3 闭环 2026-05-25: gate / shared MLP 切 linear_bf16]")
     print("=" * 60)
 
     from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
@@ -780,49 +792,73 @@ def test_moe_block_full(cfg, num_tokens=16, seed=42):
     print(f"  routed_scaling_factor = {scaling}  block_size = {block_size}")
     print(f"  n_group = {n_group}  topk_group = {topk_group}  "
           f"norm_topk_prob = {cfg.norm_topk_prob}")
-    print(f"  NOTE: proxy shape — 真实 GLM-4.7 权重无法在 CPU ref 跑；")
-    print(f"        gate Linear / shared_experts MLP 走 REF_DEVICE 预计算，")
-    print(f"        两条路径共享同一份 router_logits / shared_output。")
+    print(f"  GAP-3 闭环：gate / shared gate_up / shared down → Zeus linear_bf16")
+    print(f"  REF / Zeus 共享同一份 Zeus-computed router_logits / shared_out")
+    print(f"  （linear_bf16 正确性由 tests/test_linear_bf16.py 独立保证）")
 
     torch.manual_seed(seed)
 
-    # ── 合成输入与权重（仅 MoE 核心需要的部分在 zeus 上运行） ──
+    # ── 合成输入与权重（gate / shared 现在通过 Zeus linear_bf16 算）──
     x_bf16 = torch.randn(T, H, dtype=torch.bfloat16) * 0.1
     gate_w_bf16 = torch.randn(E, H, dtype=torch.bfloat16) * 0.1
     corr_bias_fp32 = torch.randn(E, dtype=torch.float32) * 0.01
-    # shared-experts MLP 权重（仅用 torch ref 算）
+    # shared-experts MLP 权重（GAP-3 后 Zeus 端用 linear_bf16 算）
     sh_gu_bf16 = torch.randn(2 * mI, H, dtype=torch.bfloat16) * 0.1
     sh_dp_bf16 = torch.randn(H, mI, dtype=torch.bfloat16) * 0.1
-    # routed-experts 权重（MoE 核心，两侧都要用）
+    # routed-experts 权重（MoE 核心 6-kernel pipeline 用）
     w13_bf16 = torch.randn(E, 2 * mI, H, dtype=torch.bfloat16) * 0.1
     w2_bf16 = torch.randn(E, H, mI, dtype=torch.bfloat16) * 0.1
 
-    # ── REF_DEVICE 预计算 router_logits 和 shared_output（共享输入） ──
-    x_ref = x_bf16.to(REF_DEVICE)
-    gate_w_ref = gate_w_bf16.to(REF_DEVICE)
-    sh_gu_ref = sh_gu_bf16.to(REF_DEVICE)
-    sh_dp_ref = sh_dp_bf16.to(REF_DEVICE)
-    corr_bias_ref = corr_bias_fp32.to(REF_DEVICE)
+    # ── Front-end via Zeus linear_bf16 (GAP-3 闭环) ───────────────────
+    # gate / shared gate_up / shared down 都走 Zeus linear_bf16，完全 device-
+    # resident；router_logits 与 shared_out 在 Zeus 上算出后，REF 路径用同一
+    # 份 .cpu() 副本，避免 bf16 量化噪声导致 top-k 路由翻转。
+    x_z = x_bf16.to("zeus")
+    gate_w_lmem = torch.zeus.local_memory.from_tensor(
+        gate_w_bf16.to("zeus"), kind="weight", Tr=1, Tc=1,
+    )
+    sh_gu_lmem = torch.zeus.local_memory.from_tensor(
+        sh_gu_bf16.to("zeus"), kind="weight", Tr=1, Tc=1,
+    )
+    sh_dp_lmem = torch.zeus.local_memory.from_tensor(
+        sh_dp_bf16.to("zeus"), kind="weight", Tr=1, Tc=1,
+    )
 
     with torch.no_grad():
-        # gate Linear: bf16 × bf16 → bf16, 进 topk 前 .float()
-        router_logits_bf16 = torch.nn.functional.linear(x_ref, gate_w_ref)
-        router_logits_fp32 = router_logits_bf16.float()
-        # shared_experts: MLP bf16 pipeline (gate_up → silu_and_mul → down)
-        sh_gu = torch.nn.functional.linear(x_ref, sh_gu_ref)              # [T, 2*mI]
-        sh_silu = (
-            torch.nn.functional.silu(sh_gu[:, :mI].float())
-            * sh_gu[:, mI:].float()
-        ).to(torch.bfloat16)
-        shared_out_bf16 = torch.nn.functional.linear(sh_silu, sh_dp_ref)  # [T, H] bf16
+        # gate Linear: [T, H] @ [E, H].T → [T, E] bf16
+        router_logits_bf16_z = sgl_kernel_zeus.linear_bf16(x_z, gate_w_lmem)
+        # biased_grouped_topk 期望 fp32 gating_output：device-side cast
+        router_logits_z = router_logits_bf16_z.float()
+
+        # shared_experts: gate_up → silu_and_mul → down
+        sh_gu_z = sgl_kernel_zeus.linear_bf16(x_z, sh_gu_lmem)        # [T, 2*mI]
+        sh_silu_z = torch.empty(T, mI, dtype=torch.bfloat16, device="zeus")
+        sgl_kernel_zeus.silu_and_mul(sh_gu_z, sh_silu_z)              # [T, mI]
+        shared_out_z = sgl_kernel_zeus.linear_bf16(sh_silu_z, sh_dp_lmem)  # [T, H]
+
+    # REF 借用 Zeus 算的 router_logits / shared_out，确保两侧 6-kernel pipeline
+    # 看到完全相同的 front-end，6-kernel 对比纯净（不再混入 linear_bf16 噪声）。
+    router_logits_fp32 = router_logits_z.cpu()
+    shared_out_bf16 = shared_out_z.cpu()
+
+    print(f"  Zeus front-end via linear_bf16 ↓")
+    print(f"    router_logits[0, :{min(E, 4)}] = "
+          f"{[round(v, 4) for v in router_logits_fp32[0, :min(E, 4)].tolist()]}")
+    print(f"    shared_out[0, :4]               = "
+          f"{[round(v, 4) for v in shared_out_bf16[0, :4].float().tolist()]}")
 
     # ── REF 路径：biased_grouped_topk_impl → per-token MoE 循环 → + shared ──
+    x_ref = x_bf16.to(REF_DEVICE)
+    corr_bias_ref = corr_bias_fp32.to(REF_DEVICE)
     w13_ref = w13_bf16.to(REF_DEVICE)
     w2_ref = w2_bf16.to(REF_DEVICE)
+    router_logits_ref = router_logits_fp32.to(REF_DEVICE)
+    shared_out_ref = shared_out_bf16.to(REF_DEVICE)
+
     with torch.no_grad():
         w_ref, ids_ref = biased_grouped_topk_impl(
             hidden_states=x_ref,
-            gating_output=router_logits_fp32,
+            gating_output=router_logits_ref,
             correction_bias=corr_bias_ref,
             topk=top_k,
             renormalize=cfg.norm_topk_prob,
@@ -838,21 +874,17 @@ def test_moe_block_full(cfg, num_tokens=16, seed=42):
             w_ref.cpu(), ids_ref.cpu(), mI=mI,
         )
         # residual add in fp32 (mirrors kernel's fused fp32 add + single RNE)
-        final_ref = (moe_core_ref.float() + shared_out_bf16.float().cpu()).to(torch.bfloat16)
+        final_ref = (moe_core_ref.float() + shared_out_ref.float().cpu()).to(torch.bfloat16)
 
     print(f"  REF final:  shape={tuple(final_ref.shape)} dtype={final_ref.dtype}")
     print(f"  REF final[0, :6] = "
           f"{[round(v, 4) for v in final_ref[0, :6].float().tolist()]}")
 
-    # ── Zeus 路径 ──
-    # router_logits 在 REF 端已是 fp32，直接 .to('zeus') 喂 biased_grouped_topk。
-    # shared_output 是 bf16，直接作为 residual 喂 moe_sum_reduce。
-    router_logits_z = (router_logits_fp32.cpu() if router_logits_fp32.is_cuda else router_logits_fp32).to("zeus")
+    # ── Zeus 6-kernel MoE 核心 ──
     corr_bias_z = corr_bias_fp32.to("zeus")
-    shared_out_z = (shared_out_bf16.cpu() if shared_out_bf16.is_cuda else shared_out_bf16).to("zeus")
-    x_z = x_bf16.to("zeus")
     w13_z = w13_bf16.to("zeus")
     w2_z = w2_bf16.to("zeus")
+    # router_logits_z / shared_out_z 已在 Zeus 上（上面 front-end 算出）
 
     with torch.no_grad():
         # 1) biased_grouped_topk（scale fused 进 weights）

@@ -33,6 +33,7 @@ from dev_glm_moe_dsa_common import (
     ref_mla_projection_rope,
     ref_o_proj,
     run_stage_table,
+    run_zeus_kv_proj_cache_store,
     run_zeus_q_proj,
     skip_stage,
     stage_header,
@@ -78,28 +79,52 @@ def test_decode_q_proj_fused(args):
 
 def test_decode_kv_proj_cache_store_fused(args):
     stage_header("D1 decode_kv_proj_cache_store_fused")
-    if args.mode == "zeus":
-        return skip_stage("D1 fused KV projection + main KV cache store is not landed")
-    cfg, _, _, _, _, _, k, v, _, _, _ = _decode_case(args)
+    cfg, hidden, positions, weights, _, _, k, v, _, _, _ = _decode_case(args)
     t = args.history_tokens - 1
     slots = torch.tensor([args.cache_offset + t], dtype=torch.long)
     pool_size = args.cache_offset + args.history_tokens + 4
+    print(f"  new_slot: {int(slots[0])}")
+    print(f"  hidden_t : {tuple(hidden[t : t + 1].shape)}")
+    print(f"  k_full_t : {tuple(k[t : t + 1].shape)}  v_t: {tuple(v[t : t + 1].shape)}")
+
+    if args.mode == "ref":
+        k_cache = torch.full(
+            (pool_size, cfg.num_attention_heads, cfg.qk_head_dim),
+            float("nan"), dtype=k.dtype,
+        )
+        v_cache = torch.full(
+            (pool_size, cfg.num_attention_heads, cfg.v_head_dim),
+            float("nan"), dtype=v.dtype,
+        )
+        store_main_kv_cache(k_cache, v_cache, slots, k[t : t + 1], v[t : t + 1])
+        ok = True
+        ok &= compare_tensors("D1/k_cache_new_slot", k[t : t + 1], k_cache[slots])
+        ok &= compare_tensors("D1/v_cache_new_slot", v[t : t + 1], v_cache[slots])
+        return pass_stage((k_cache, v_cache, slots)) if ok else fail_stage()
+
     k_cache = torch.full(
         (pool_size, cfg.num_attention_heads, cfg.qk_head_dim),
-        float("nan"),
-        dtype=k.dtype,
+        float("nan"), dtype=torch.bfloat16,
     )
     v_cache = torch.full(
         (pool_size, cfg.num_attention_heads, cfg.v_head_dim),
-        float("nan"),
-        dtype=v.dtype,
+        float("nan"), dtype=torch.bfloat16,
     )
-    store_main_kv_cache(k_cache, v_cache, slots, k[t : t + 1], v[t : t + 1])
+    try:
+        got_k, got_v = run_zeus_kv_proj_cache_store(
+            hidden[t : t + 1], positions[t : t + 1], slots, weights, cfg,
+            k_cache, v_cache,
+        )
+    except ImportError as exc:
+        return skip_stage(f"Zeus runtime unavailable for D1: {exc}")
     ok = True
-    ok &= compare_tensors("D1/k_cache_new_slot", k[t : t + 1], k_cache[slots])
-    ok &= compare_tensors("D1/v_cache_new_slot", v[t : t + 1], v_cache[slots])
-    print(f"  new_slot: {int(slots[0])}")
-    return pass_stage((k_cache, v_cache, slots)) if ok else fail_stage()
+    ok &= compare_tensors(
+        "D1/k_cache_new_slot", k[t : t + 1], got_k.cpu()[slots], atol=2e-2, rtol=1e-2
+    )
+    ok &= compare_tensors(
+        "D1/v_cache_new_slot", v[t : t + 1], got_v.cpu()[slots], atol=2e-2, rtol=1e-2
+    )
+    return pass_stage((got_k, got_v, slots)) if ok else fail_stage()
 
 
 def test_decode_indexer_prep_store_fused(args):

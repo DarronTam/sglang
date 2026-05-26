@@ -45,10 +45,10 @@
 | # | 子步骤 | shape | CUDA sgl-kernel | Zeus 现状 |
 |---|---|---|---|---|
 | 0 | fused add+rmsnorm（post_attention） | `[T,H]` | `sgl_kernel.fused_add_rmsnorm` | ✅ `sgl_kernel_zeus.fused_add_rmsnorm` |
-| 1 | shared_experts gate_up_proj | `[T,H]→[T,2·mI]` | GEMM | ✅ `linear_zeus` |
+| 1 | shared_experts gate_up_proj | `[T,H]→[T,2·mI]` | GEMM | ✅ `sgl_kernel_zeus.linear_bf16`（2026-05-25 LANDED，见 `linear_bf16.md`）|
 | 2 | shared_experts SiluAndMul | `[T,2·mI]→[T,mI]` | `sgl_kernel.silu_and_mul` | ✅ `sgl_kernel_zeus.silu_and_mul` |
-| 3 | shared_experts down_proj | `[T,mI]→[T,H]` | GEMM | ✅ `linear_zeus` |
-| 4 | gate Linear（router_logits） | `[T,H]→[T,E=160]` | GEMM | ✅ `linear_zeus` |
+| 3 | shared_experts down_proj | `[T,mI]→[T,H]` | GEMM | ✅ `sgl_kernel_zeus.linear_bf16`（2026-05-25 LANDED，见 `linear_bf16.md`）|
+| 4 | gate Linear（router_logits） | `[T,H]→[T,E=160]` | GEMM | ✅ `sgl_kernel_zeus.linear_bf16`（2026-05-25 LANDED；E=160 不整除 256 时由 caller host pad，sim path 无 N % 256 硬约束）|
 | 5 | biased_grouped_topk | `[T,E]→(topk_w[T,k], topk_ids[T,k])` | `sgl_kernel.moe_fused_gate` | ✅ `sgl_kernel_zeus.biased_grouped_topk`（v1 通用，fp32，`num_fused_shared_experts=0`）；✅ `sgl_kernel_zeus.glm4_biased_grouped_topk`（GLM-4.7 特化快路径，E=160/K=8/G=1/Gk=1，bf16 IO，scale 已 fuse） |
 | 6 | moe_align_block_size | `(topk_ids)→(sorted_ids, expert_ids, num_post)` | `sgl_kernel.moe_align_block_size` | ✅ `sgl_kernel_zeus.moe_align_block_size`（+ `moe_align_block_size_alloc` 分配 wrapper；Zeus 约束：`sorted_ids/expert_ids/cumsum` 改 fp32 bit-exact，`num_post` 保留 i32） |
 | 7 | fused_moe GEMM-1（w13/gate_up） | 分块 `[T,H]→[T·k,2·mI]` | Triton `invoke_fused_moe_kernel` | ✅ `sgl_kernel_zeus.moe_grouped_gemm`（`top_k=原始 topk`、`mul_routed_weight=False`；v1：bf16 A/B/C、fp32 accum、CORE_NUM=2 N-split、BLOCK_M/N/K=64/128/128） |
@@ -57,6 +57,76 @@
 | 10 | moe_sum_reduce | `[T,k,H]→[T,H]` | `sgl_kernel.moe_sum_reduce` | ✅ `sgl_kernel_zeus.moe_sum_reduce`（v1：bf16 I/O + fp32 accum，CORE_NUM=2 H-split，BLOCK_T/K/H=4/2/128；**Zeus 扩展**：可选 `shared_output` residual fuse——省一次 DRAM 往返，精度更高） |
 | 11 | `*routed_scaling_factor` + shared_output 相加 | `[T,H]` | elementwise | ✅ `*routed_scaling_factor` 已经被 `glm4_biased_grouped_topk` (`apply_scale_on_output=True`) + gemm2 (`mul_routed_weight=True`) 在上游 fuse；shared residual 被 `moe_sum_reduce` 的 `shared_output` 口子吸收 |
 | 12 | all-reduce | — | 单卡跳过 | — |
+
+> ⚠️ **2026-05-24 误标修正**：上表里 #1 / #3 / #4 之前标 ✅ `linear_zeus`，但
+> `sgl_kernel_zeus` 实际**从未注册过** `linear_zeus` 这颗算子（`docs/glm4_moe_ffn_slides.html`
+> 也是同样误标）。整段 GLM-4.7 MoE 端到端 dev stage 里这 3 处 Linear 实际是在
+> host 端跑 `torch.nn.functional.linear`，详见 `dev_glm4_moe_test.py::test_moe_block_full`
+> 第 800-817 行明文："`gate Linear` 与 `shared_experts MLP` 的 GEMM 不是本 stage
+> 的测试对象，我们在 CPU/CUDA 上用纯 torch **预计算**"。这种简化让 MoE block
+> dev script 跑得通，但**实际部署到 GLM5-Next decode 路径时整段 shared / router
+> 仍在 host 上**——见 `glm5next_dsa_block_zeus_flow.md` 的 GAP-3。
+
+## GAP-3 / `linear_bf16` 计划
+
+为了把 #1 / #3 / #4 真的 Zeus 化，需要补一颗 **generic dense bf16 GEMM**。设计如下：
+
+| 新算子 | 签名 | 用途 |
+|---|---|---|
+| **`linear_bf16(input, weight, *, out=None)`** | `[M, K] bf16 × [N, K] bf16 → [M, N] bf16`，fp32 accumulator + RNE store | 替换 #1 / #3 / #4 三处 host Linear |
+
+设计要点：
+- 直接对标 `sgl-kernel-zeus/docs/gemm_normal_dense_fp8xfp8_bf16dst_bf16acc_128x512x512_2core.py`
+  的 dense slab GEMM blueprint，把 fp8 → bf16，accumulator 仍 fp32
+- 复用 `moe_grouped_gemm` 的 N-split 2-core 拓扑：每核拿 `[N/2, K]` weight slab
+- 砍掉 `sorted_ids / expert_ids / mul_routed_weight` 自由度，纯 dense
+- weight 走 LocalMem pack（`kind="weight", Tr=Tc=1`，与 `mhc_pre_norm_split` /
+  `dsa_q_a_proj_norm` 一致）
+- **shape 约束**：`N % (CORE_NUM × BLOCK_N) == 0`；GLM-4.7 的 E=160 不是 256 的
+  倍数，gate Linear 需要 host 端 pad 或 kernel 内 N-tail boundary check
+- **scope v1 不做**：fp8 / int8 量化、per-channel scale、bias fuse、transposed weight
+
+### 这颗 kernel 的连带收益（一颗解多个 GAP）
+
+| 用途 | 当前在哪 | 影响 |
+|---|---|---|
+| MoE router gate Linear | `dev_glm4_moe_test::moe_block_full` host 端 | 本文档 #4 |
+| MoE shared experts gate_up / down | `dev_glm4_moe_test::moe_block_full` host 端 | 本文档 #1 / #3 |
+| **Linear-attn 5 个 projection**（qkv_proj / b_proj / f_a/f_b / g_a/g_b / o_proj） | `dev_kimi_linear_attn_test.py:1060` 明文 TODO | 让 `kimi_delta_attn_decode` 端到端真正全 Zeus |
+| 任意 dense Linear（dense MLP layer 0~2） | 各 dev 脚本 | 进一步消除 host Linear |
+
+也就是说，这一颗 `linear_bf16` 是 **GLM5-Next 走向"纯 Zeus 端到端"的必要条件**，
+不只服务 MoE。
+
+### 备选方案：进一步加一颗 `dense_ffn_swiglu` 融合算子
+
+如果性能 profiling 发现 shared experts 路径的 `[T, 2·sI]` 中间产物 DRAM 流量是
+瓶颈，可以再加一颗：
+
+| 备选算子 | 签名 | 用途 |
+|---|---|---|
+| `dense_ffn_swiglu(x, gate_up_w, down_w, *, out=None)` | `[T,H] →(gate_up)→ [T,2·sI] →(silu_and_mul)→ [T,sI] →(down)→ [T,H]` | 把 gate_up + silu_and_mul + down 融合成一颗 kernel，中间张量留 Lmem 不落 DRAM |
+
+但**先做 `linear_bf16`，确认基础闭环之后再视情况加 `dense_ffn_swiglu`**。理由：
+- `linear_bf16` 已经能让 dev script 全 Zeus 跑通
+- `dense_ffn_swiglu` 只服务 dense MLP / shared experts，复用度低
+- 与 `moe_grouped_gemm` / `moe_sum_reduce` 的演进路径一致：先 split 再 fuse
+
+### 为什么不能把 router + shared FFN 塞进一颗 kernel？
+
+考虑过把 router gate Linear 与 shared experts dense FFN 合成一颗 kernel，但
+**不可行**：
+
+1. **输出张量形态不一**：router → `[T, E=160]`（消费者：`biased_grouped_topk`）；
+   shared FFN → `[T, H]`（消费者：`moe_sum_reduce` residual）。两个 output
+   shape、dtype、下游消费者都不同。
+2. **权重 shape 不一**：`gate_w [E, H]` vs `gate_up_w [2·sI, H]` vs `down_w [H, sI]`，
+   三个 N 维度都不一样，没法做单一 GEMM。
+3. **数据依赖链不同**：shared FFN 是 `gate_up → silu_and_mul → down` 串联；
+   router 是单层 GEMM。塞一颗 kernel 里只能"并行执行两个独立子图"，与"host
+   并发投递两颗 kernel"等价。
+
+故最佳方案就是 `linear_bf16`（A）+ 视性能加 `dense_ffn_swiglu`（B）的两阶段路线。
 
 ## MoE-FFN 计算流（算子组合 + 中间变量传递）
 
@@ -644,3 +714,52 @@ REF 侧走 **一致语义**：`biased_grouped_topk_impl(apply_scale_on_output=Tr
   `routed_scaling_factor` 也 fuse 进了 topk（见 `topk.py:745`）。我们的
   REF / Zeus 两侧要保持一致的 "要/不要 fuse scaling" 选择，避免对齐时被这项
   差异带偏。
+
+### 2026-05-25 · GAP-3 闭环：`moe_block_full` 切到 Zeus `linear_bf16`
+- **背景**：算子表 #1 / #3 / #4 的 `shared gate_up_proj` / `shared down_proj` /
+  `gate Linear` 历史上一直在 host `torch.nn.functional.linear` 上算
+  （`dev_glm4_moe_test.py::test_moe_block_full` 第 800-817 行明文承认），违反
+  `glm5next_dsa_block_zeus_flow.md` GAP-3 的"sublayer 全 Zeus device-resident"
+  目标。本日切到 `sgl_kernel_zeus.linear_bf16`（2026-05-25 同日落地）。
+- **改动**（`dev_glm4_moe_test.py::test_moe_block_full`）：
+  - 3 颗 host Linear 全部改成 Zeus `linear_bf16`：
+    - `gate Linear`: `linear_bf16(x_z, gate_w_lmem) → router_logits_bf16_z` → `.float()` 喂 topk
+    - `shared gate_up`: `linear_bf16(x_z, sh_gu_lmem) → sh_gu_z`
+    - `shared down`:   `linear_bf16(sh_silu_z, sh_dp_lmem) → shared_out_z`
+  - 3 颗 weight 全部 LocalMem 装包：`torch.zeus.local_memory.from_tensor(...,
+    kind="weight", Tr=1, Tc=1)`，与 `mhc_pre_norm_split` / `dsa_q_a_proj_norm`
+    同套路
+  - 中间 `silu_and_mul` 复用现有 `sgl_kernel_zeus.silu_and_mul`
+  - **测试方法学**：REF 与 Zeus **共享同一份 Zeus-computed `router_logits` 和
+    `shared_output`**（Zeus 算出后 `.cpu()` 传入 REF 路径），避免 `linear_bf16`
+    (fp32 acc + bf16 RNE) vs `F.linear` (bf16 acc) 的量化噪声造成 top-k 路由
+    翻转把测试变成"linear_bf16 测试"。`linear_bf16` 的独立正确性由
+    `sgl-kernel-zeus/tests/test_linear_bf16.py` 14/14 PASS 保证。
+- **验收**（torch10_312 env）：
+  - `dev_glm4_moe_test.py --stage moe_block_full`: **PASS**
+    - topk_ids：permutation OK (mismatch_cells=34/64 是 ids 排序差异，集合一致)
+    - **final `max_diff = 4.88e-4`**（与 GAP-3 闭环前 ~5e-4 同量级，无回归）
+    - mean_diff = 5.69e-5
+    - ZEUS final[0, :6] 与 REF final[0, :6] **逐位完全一致**（bf16 精度内）
+  - 全 6 stage 跑全：biased_grouped_topk / glm4_biased_grouped_topk /
+    moe_align_block_size / moe_grouped_gemm / moe_sum_reduce / moe_block_full
+    均 PASS
+- **GAP-3 在 MoE 路径上完全消除**：`test_moe_block_full` 的 Zeus 路径现在是
+  9 颗 sgl-kernel-zeus 算子串接 device-resident：
+  1. `linear_bf16` (gate)
+  2. `linear_bf16` (shared gate_up)
+  3. `silu_and_mul` (shared)
+  4. `linear_bf16` (shared down)
+  5. `biased_grouped_topk`
+  6. `moe_align_block_size_alloc`
+  7. `moe_grouped_gemm` (gemm1)
+  8. `silu_and_mul` (per-expert)
+  9. `moe_grouped_gemm` (gemm2, mul_routed_weight)
+  10. `moe_sum_reduce` (+shared residual fuse)
+
+  整段 MoE-FFN 在 Zeus 上**完全 device-resident**（host 仅做 weight LocalMem
+  pack 一次性初始化 + 输入 residual 的 H→D transfer，无中间 host compute）。
+- **下一步焦点**：把 `dev_glm5next_block_decode_test.py::zeus_moe_decode` 里
+  host 端的 `_moe_router_and_shared_ref` 也切到 `linear_bf16`，让 GLM5-Next
+  整 block decode 真正闭环 GAP-3；之后再用同一颗 kernel 把 Linear-attn 5 个
+  projection 切到 Zeus，让 `linear_attn_block` 也走向完全 device-resident。

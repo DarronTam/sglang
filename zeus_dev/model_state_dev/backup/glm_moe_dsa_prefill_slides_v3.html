@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GLM-MoE-DSA Prefill Path V3 — 吸收路径 / Ragged sparse + Dense fallback</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg:#0d0e1c; --panel:#13152a; --card:#181a32; --border:#272a52;
+  --text:#c8cfe8; --dim:#5a6395; --blue:#4a90e2; --cyan:#38d9a9;
+  --pink:#f06292; --yellow:#ffd166; --green:#69db7c; --purple:#b39ddb;
+  --orange:#ffab76; --red:#ef5350; --mono:'Courier New','Consolas',monospace;
+}
+body { background:var(--bg); color:var(--text); font-family:'Segoe UI',system-ui,sans-serif; height:100vh; overflow:hidden; user-select:none; }
+#deck { width:100vw; height:100vh; position:relative; }
+.slide { position:absolute; inset:0; display:none; flex-direction:column; align-items:center; justify-content:center; padding:28px 56px 64px; gap:10px; }
+.slide.active { display:flex; }
+.slide-tag { position:absolute; top:18px; left:32px; font-size:.7em; color:var(--dim); letter-spacing:.14em; text-transform:uppercase; }
+.slide-num { position:absolute; top:18px; right:32px; font-size:.7em; color:var(--dim); font-family:var(--mono); }
+h1 { font-size:2.4em; font-weight:700; color:#fff; line-height:1.2; text-align:center; }
+h2 { font-size:1.5em; font-weight:600; color:#dde4ff; text-align:center; }
+h3 { font-size:.92em; font-weight:700; margin-bottom:8px; }
+p { font-size:.92em; line-height:1.65; text-align:center; }
+code,.mono { font-family:var(--mono); }
+.sub { font-size:.84em; color:var(--dim); text-align:center; margin-top:-6px; }
+.row { display:flex; align-items:flex-start; gap:14px; } .wrap { flex-wrap:wrap; justify-content:center; }
+.badge { display:inline-block; padding:5px 13px; border-radius:18px; font-size:.76em; font-family:var(--mono); font-weight:600; }
+.b-blue{background:#182450;color:var(--blue);border:1px solid #253570}.b-cyan{background:#0e2530;color:var(--cyan);border:1px solid #1e3540}
+.b-green{background:#0e2818;color:var(--green);border:1px solid #1e3828}.b-yellow{background:#2a2008;color:var(--yellow);border:1px solid #3a3018}
+.b-pink{background:#2a1030;color:var(--pink);border:1px solid #3a2040}.b-purple{background:#1a1030;color:var(--purple);border:1px solid #2a2040}.b-orange{background:#281808;color:var(--orange);border:1px solid #4a2a10}
+.b-red{background:#2a0e0e;color:var(--red);border:1px solid #4a1e1e}
+.box { background:var(--card); border:1px solid var(--border); border-left:3px solid var(--blue); border-radius:7px; padding:11px 16px; font-size:.86em; max-width:1000px; line-height:1.6; }
+.box.warn { border-left-color:var(--red); }
+.box.ok { border-left-color:var(--green); }
+.panel { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px 18px; }
+table.T { border-collapse:collapse; font-family:var(--mono); font-size:.79em; }
+table.T th, table.T td { border:1px solid var(--border); padding:5px 9px; text-align:center; }
+table.T th { background:#1c1f3a; color:var(--dim); font-weight:600; }
+table.T td.l { text-align:left; color:var(--text); }
+table.T td.r { text-align:right; }
+.c-q{background:#1a2050;color:var(--blue)}.c-k{background:#0f2a2a;color:var(--cyan)}.c-v,.c-green{background:#0e2818;color:var(--green)}
+.c-i,.c-purple{background:#18102a;color:var(--purple)}.c-w{background:#2a2010;color:var(--yellow)}.c-o{background:#1e1208;color:var(--orange)}
+.c-b{background:#2a1030;color:var(--pink)}.c-d{background:#111320;color:var(--dim)}.c-r{background:#2a0e0e;color:var(--red)}.hi{outline:2px solid #fff;outline-offset:-2px}
+.formula { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:13px 20px; font-family:var(--mono); font-size:.84em; line-height:1.85; text-align:left; max-width:1080px; }
+.formula .blue{color:var(--blue)}.formula .cyan{color:var(--cyan)}.formula .green{color:var(--green)}.formula .yellow{color:var(--yellow)}.formula .pink{color:var(--pink)}.formula .purple{color:var(--purple)}.formula .orange{color:var(--orange)}.formula .red{color:var(--red)}.formula .dim{color:var(--dim)}
+.ascii { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px 20px; font-family:var(--mono); font-size:.74em; line-height:1.55; white-space:pre; color:var(--text); overflow-x:auto; text-align:left; max-width:1080px; }
+.ascii .q{color:var(--blue);font-weight:700}.ascii .k{color:var(--cyan);font-weight:700}.ascii .v{color:var(--green);font-weight:700}.ascii .i{color:var(--purple);font-weight:700}.ascii .w{color:var(--yellow);font-weight:700}.ascii .o{color:var(--orange);font-weight:700}.ascii .d{color:var(--dim)}.ascii .r{color:var(--red);font-weight:700}.ascii .p{color:var(--pink);font-weight:700}
+#nav{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:14px;background:rgba(19,21,42,.92);backdrop-filter:blur(12px);padding:9px 22px;border-radius:32px;border:1px solid var(--border)}
+#nav button{background:none;border:none;color:var(--text);cursor:pointer;font-size:1.3em;padding:3px 8px;border-radius:6px}#nav button:hover{background:#272a52}#nav button:disabled{color:#2a2d4a;cursor:not-allowed}
+#prog{font-size:.83em;color:var(--dim);min-width:60px;text-align:center;font-family:var(--mono)}#dots{display:flex;gap:6px;align-items:center}.dot{width:7px;height:7px;border-radius:50%;background:var(--border);cursor:pointer}.dot.on{background:var(--blue)}
+.kbar { display:flex; gap:6px; margin-top:8px; }
+.k1 { font-size:.74em; padding:2px 8px; border-radius:4px; font-family:var(--mono); color:var(--dim); border:1px solid var(--border); background:var(--card); }
+</style>
+</head>
+<body>
+<div id="deck">
+
+<!-- 1. Cover -->
+<div class="slide" style="background:radial-gradient(ellipse at 50% 40%, #1a1240 0%, #0d0e1c 70%)">
+  <div class="slide-num"></div>
+  <div style="text-align:center">
+    <div style="font-size:.78em;color:var(--pink);letter-spacing:.18em;text-transform:uppercase;margin-bottom:10px">GLM5-Next DSA · Prefill Path · Slides V3</div>
+    <h1>DSA Prefill Path</h1>
+    <p style="color:#6878aa;margin-top:14px;font-size:1.05em">多 token ragged chunk · 批量写 cache · absorb 默认 + dense fallback</p>
+    <div class="row wrap" style="margin-top:24px;gap:10px">
+      <span class="badge b-blue">N = T = sum(extend_seq_lens)</span>
+      <span class="badge b-purple">ragged metadata</span>
+      <span class="badge b-yellow">causal in current chunk</span>
+      <span class="badge b-red">dense fallback when max_kv_len ≤ 2048</span>
+    </div>
+    <div class="kbar" style="justify-content:center;margin-top:18px">
+      <span class="k1">←/→ 翻页</span><span class="k1">Space 下一页</span>
+    </div>
+  </div>
+</div>
+
+<!-- 2. V3 修正 -->
+<div class="slide">
+  <div class="slide-tag">V1 → V3</div>
+  <h2>Prefill 视角的三个修正</h2>
+  <table class="T" style="margin-top:8px;font-size:.82em">
+    <tr><th>问题</th><th>V1 写法（错）</th><th>V3 写法</th></tr>
+    <tr>
+      <td class="c-r">P4 sparse attention</td>
+      <td class="l"><code>Q [T,32,Dv=128]</code> 直接吃 main K/V，按 32 KV 头算</td>
+      <td class="l">DSA prefill <b>默认也走 MLA absorb</b>；输出 <code>[T,Nh,Rkv=512]</code>（latent）</td>
+    </tr>
+    <tr>
+      <td class="c-r">dense fallback 描述</td>
+      <td class="l">未明确触发条件与张量契约</td>
+      <td class="l">只在 <code>max_kv_len ≤ index_topk=2048</code> 才切 MHA_ONE_SHOT；Blackwell 强制 sparse；输出 <code>[T,Nh,Dv=128]</code></td>
+    </tr>
+    <tr>
+      <td class="c-r">Indexer prep</td>
+      <td class="l">未提 Hadamard</td>
+      <td class="l">P2 同 D2，含 <code>rotate_activation</code> 与 fp8 量化；ragged 形态加 GetKAndS gather</td>
+    </tr>
+  </table>
+  <div class="box ok" style="margin-top:14px">
+    Prefill path 现在是 <span style="color:var(--blue)">7 步 P0–P6</span> + 一条 <span style="color:var(--red)">P4-alt</span> 短序列分支。
+  </div>
+</div>
+
+<!-- 3. config -->
+<div class="slide">
+  <div class="slide-tag">config_16b.json</div>
+  <h2>Prefill 关心的字段</h2>
+  <div class="row wrap" style="margin-top:4px;gap:14px">
+    <div class="panel" style="width:340px">
+      <h3 style="color:var(--blue)">MLA 主路径</h3>
+      <div class="mono" style="font-size:.78em;line-height:1.85">
+        hidden_size H = <span style="color:var(--blue)">2048</span><br>
+        num_attention_heads Nh = <span style="color:var(--blue)">32</span><br>
+        q_lora_rank Rq = <span style="color:var(--blue)">768</span><br>
+        kv_lora_rank Rkv = <span style="color:var(--cyan)">512</span><br>
+        qk_nope_head_dim Dnope = <span style="color:var(--cyan)">128</span><br>
+        qk_rope_head_dim Dro = <span style="color:var(--cyan)">64</span><br>
+        qk_head_dim Dqk = <span style="color:var(--cyan)">192</span><br>
+        v_head_dim Dv = <span style="color:var(--green)">128</span>
+      </div>
+    </div>
+    <div class="panel" style="width:340px">
+      <h3 style="color:var(--purple)">Indexer / DSA</h3>
+      <div class="mono" style="font-size:.78em;line-height:1.85">
+        index_n_heads I = <span style="color:var(--purple)">8</span><br>
+        index_head_dim Di = <span style="color:var(--purple)">128</span><br>
+        index_topk Ktop = <span style="color:var(--purple)">2048</span><br>
+        <span style="color:var(--dim)">↑ 同时也是 dense fallback 阈值</span><br>
+        index_dsa_use_layernorm = <span style="color:var(--green)">true</span>
+      </div>
+    </div>
+    <div class="panel" style="width:340px">
+      <h3 style="color:var(--yellow)">RoPE / Norm</h3>
+      <div class="mono" style="font-size:.78em;line-height:1.85">
+        rope_theta = <span style="color:var(--yellow)">10000</span><br>
+        rope_scaling = <span style="color:var(--dim)">null</span> <span style="color:var(--dim)">(不开 YaRN)</span><br>
+        partial_rotary_factor = <span style="color:var(--yellow)">0.5</span><br>
+        use_qk_norm = <span style="color:var(--green)">true</span><br>
+        max_position = 202752
+      </div>
+    </div>
+  </div>
+  <div class="box" style="margin-top:14px">
+    架构字段：<code>architectures: ["Glm5NextForCausalLM"]</code>，<code>mla: true</code>。
+    DSA 层索引：<code>linear_attn_config.full_attn_layers = [3,7,11,15,19,23]</code>。
+  </div>
+</div>
+
+<!-- 4. Head 四件套 -->
+<div class="slide">
+  <div class="slide-tag">"head 数" 澄清</div>
+  <h2>四种 head；Prefill 唯一会碰到 32-KV-head 的场合是 fallback</h2>
+  <table class="T" style="margin-top:8px;font-size:.78em">
+    <tr><th>名称</th><th>config 字段</th><th>值</th><th class="l">Prefill 路径下角色</th></tr>
+    <tr><td class="c-q">Q 头 (Nh)</td><td><code>num_attention_heads</code></td><td>32</td>
+        <td class="l">q_b_proj 输出 <code>[T,32,Dqk=192]</code>；absorb 后 <code>[T,32,Rkv=512]</code></td></tr>
+    <tr><td class="c-r">GQA KV 头</td><td><code>num_key_value_heads</code></td><td>8</td>
+        <td class="l"><b>MLA/DSA 不使用</b></td></tr>
+    <tr><td class="c-green">潜空间 KV 头 (h_kv)</td><td>—</td><td><b>1</b></td>
+        <td class="l">absorb 分支真正落 cache；<code>[T,1,Rkv+Dro=576]</code> MQA</td></tr>
+    <tr><td class="c-r">decompress 视角 (仅 fallback)</td><td>—</td><td>32</td>
+        <td class="l">★ Prefill 独有：<code>MHA_ONE_SHOT</code> 解 kv_b_proj 得 32 头 K/V，FlashAttention varlen</td></tr>
+    <tr><td class="c-i">Indexer 头 (I)</td><td><code>index_n_heads</code></td><td>8</td>
+        <td class="l">q_idx <code>[T,8,128]</code>；k_idx <code>[T,128]</code></td></tr>
+  </table>
+  <div class="box warn" style="margin-top:12px">
+    Prefill 是<b>唯一会让"32 个 KV head"出现</b>的场景，而且仅限 dense fallback。Decode 永远不会走那条路。
+  </div>
+</div>
+
+<!-- 5. RoPE -->
+<div class="slide">
+  <div class="slide-tag">RoPE 风格</div>
+  <h2>main MLA vs Indexer 的 <code>is_neox_style</code> 默认 <span style="color:var(--red)">反</span> 的</h2>
+  <table class="T" style="margin-top:6px;font-size:.78em">
+    <tr><th>RoPE 路径</th><th>源码（deepseek_v2.py）</th><th>config 未指定时</th><th>结果</th></tr>
+    <tr>
+      <td class="c-q">main MLA Q/K</td>
+      <td class="l"><code>is_neox_style = not getattr(config, "rope_interleave", True)</code> <span style="color:var(--dim)">(l.1244)</span></td>
+      <td><code>rope_interleave=True</code></td>
+      <td class="c-r"><b>False</b><br>(interleave / GPT-J)</td>
+    </tr>
+    <tr>
+      <td class="c-i">Indexer Q/K</td>
+      <td class="l"><code>is_neox_style = not getattr(config, "indexer_rope_interleave", False)</code> <span style="color:var(--dim)">(l.1181)</span></td>
+      <td><code>indexer_rope_interleave=False</code></td>
+      <td class="c-green"><b>True</b><br>(NeoX)</td>
+    </tr>
+  </table>
+  <div class="formula" style="margin-top:14px">
+    Prefill 每 step T 个 token 一起做 RoPE，positions <span class="dim">[T]</span> 来自 ragged metadata。<br>
+    两路 RoPE 要分别核 cos/sin 排布，<b>无论 absorb 还是 fallback 分支都跑同一组 RoPE</b>。
+  </div>
+</div>
+
+<!-- 6. NSA dispatch -->
+<div class="slide">
+  <div class="slide-tag">attention dispatch</div>
+  <h2>Prefill 在 NSA backend 下 — absorb 默认，短序列才 fallback</h2>
+  <div class="ascii">
+<span class="d">// attention_backend_handler.py::handle_attention_nsa</span>
+def <span class="p">handle_attention_nsa</span>(attn, forward_batch):
+    backend = forward_batch.attn_backend
+    if hasattr(backend, "use_mha") and backend.<span class="r">use_mha</span>:
+        return AttnForwardMethod.<span class="r">MHA_ONE_SHOT</span>     <span class="d">// ★ 短序列 prefill</span>
+    return AttnForwardMethod.<span class="q">MLA</span>                  <span class="d">// ★ 长序列 prefill：absorb</span>
+
+<span class="d">// NativeSparseAttnBackend.set_nsa_prefill_impl 决定 use_mha</span>
+self.use_mha = (max_kv_len &lt;= <span class="y">SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD</span>)
+            and not is_blackwell                <span class="d">// Blackwell 强制 sparse</span>
+
+<span class="d">// GLM5 默认阈值</span>
+SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = <span class="y">index_topk = 2048</span>
+  </div>
+  <div class="box ok" style="margin-top:12px">
+    <b>长序列 (≥2048) → absorb sparse；短序列 → dense fallback。</b>
+    Blackwell 上一律 absorb sparse。<span class="mono" style="color:var(--dim)">— server_args.py:1541-1567</span>
+  </div>
+</div>
+
+<!-- 7. kv_b_proj 拆分 -->
+<div class="slide">
+  <div class="slide-tag">absorb matrix</div>
+  <h2>kv_b_proj 离线拆 w_kc / w_vc</h2>
+  <div class="formula">
+    <span class="dim">// deepseek_weight_loader.py:565-610（权重加载阶段）</span><br>
+    w = kv_b_proj.weight   <span class="dim"># shape</span> <span class="yellow">[Nh*(Dnope+Dv), Rkv] = [8192, 512]</span><br>
+    w_kc, w_vc = w.unflatten(0, (-1, Dnope+Dv)).split([<span class="cyan">Dnope</span>, <span class="green">Dv</span>], dim=1)<br>
+    <br>
+    <span class="cyan">w_kc</span>: <span class="yellow">[Nh=32, Rkv=512, Dnope=128]</span>   <span class="dim"># K 吸收</span><br>
+    <span class="green">w_vc</span>: <span class="yellow">[Nh=32, Rkv=512, Dv=128]</span>     <span class="dim"># V 解吸收</span>
+  </div>
+  <div class="box" style="margin-top:12px">
+    Prefill absorb 分支：每 token 走 <code>bmm(q_nope, w_kc)</code> + sparse → <code>bmm(out_latent, w_vc)</code>。<br>
+    Prefill fallback 分支：直接调 <code>kv_b_proj</code> 把 latent 解开成 32 头 K/V，跑标准 FlashAttention，<b>不</b> 用 w_kc/w_vc。
+  </div>
+</div>
+
+<!-- 8. Absorb 4-step math -->
+<div class="slide">
+  <div class="slide-tag">absorb 数学</div>
+  <h2>Prefill 四步流（默认分支）</h2>
+  <div class="formula">
+    <span class="q">[Step 1] P1 — Q 侧 K 吸收</span><br>
+    &nbsp;&nbsp;q_nope = Q[..., :Dnope]                       <span class="dim"># [T, 32, 128]</span><br>
+    &nbsp;&nbsp;<span class="yellow">q_nope_out = bmm(q_nope.T, w_kc).T</span>       <span class="dim"># [T, 32, Rkv=512]</span><br>
+    <br>
+    <span class="cyan">[Step 2] P4 — latent 空间 sparse MQA（ragged）</span><br>
+    &nbsp;&nbsp;q = concat(q_nope_out, q_pe)                  <span class="dim"># [T, 32, 576]</span><br>
+    &nbsp;&nbsp;indices = topk_slots                          <span class="dim"># [T, Ktop=2048] (causal-aware)</span><br>
+    &nbsp;&nbsp;attn_out_latent = flash_mla_sparse_fwd(...)   <span class="dim"># [T, 32, Rkv=512] ★</span><br>
+    <br>
+    <span class="green">[Step 3] P5 — V 解吸收</span><br>
+    &nbsp;&nbsp;<span class="yellow">attn_out = bmm(attn_out_latent.T, w_vc).T</span> <span class="dim"># [T, 32, Dv=128]</span><br>
+    <br>
+    <span class="orange">[Step 4] P6 — o_proj</span><br>
+    &nbsp;&nbsp;out = o_proj(attn_out.reshape(T, Nh*Dv))      <span class="dim"># [T, H=2048]</span>
+  </div>
+</div>
+
+<!-- 9. Prefill flow -->
+<div class="slide">
+  <div class="slide-tag">Prefill 全流程</div>
+  <h2>P0 – P6 + P4-alt（V3）</h2>
+  <div class="ascii">
+hidden [T,H], positions [T], out_cache_loc [T], ragged metadata
+  │
+  ├─ <span class="q">P0 dsa_qkv_a_proj_norm_fused</span>           <span class="d">// 同 D0，T batched</span>
+  ├─ <span class="q">P1 dsa_q_b_proj_split_rope_absorb</span>      <span class="d">// 同 D1；KV 批量写 out_cache_loc</span>
+  ├─ <span class="i">P2 dsa_indexer_prep_store_fused</span>        <span class="d">// 同 D2，T batched + Hadamard</span>
+  │
+  ├─ <span class="w">P3 dsa_prefill_ragged_indexer_topk_fused</span>
+  │    fp8_mqa_logits ragged + GetKAndS(index_k_cache, page_indices)
+  │    可见区 = prefix(req) + causal(当前 chunk)
+  │    -> topk_slots [T, 2048]
+  │
+  ├─ <span class="v">P4 dsa_prefill_sparse_mqa_fused</span>        <span class="r">★ 默认：absorb 后 sparse MQA</span>
+  │    q = concat(q_nope_out, q_pe) [T,32,576]
+  │    flash_mla_sparse_fwd(q, kv_cache, indices=topk_slots, d_v=Rkv)
+  │    -> <span class="v">attn_out_latent [T,32,Rkv=512]</span>
+  │
+  ├─ <span class="r">P4-alt dense_fallback (短序列, max_kv_len ≤ 2048, 非 Blackwell)</span>
+  │    MHA_ONE_SHOT：kv_b_proj 解 latent -> [T,32,Dnope+Dv]
+  │    FlashAttention varlen on full prefix+current
+  │    -> <span class="r">attn_out_dense [T,32,Dv]  // 跳过 V absorb，直接 P6</span>
+  │
+  ├─ <span class="v">P5 dsa_v_absorb</span>   <span class="d">// 仅 absorb 分支</span>
+  │    <span class="w">attn_out = bmm(attn_out_latent, w_vc) [T,32,128]</span>
+  │
+  └─ <span class="o">P6 o_proj</span>: [T, 4096] -> [T, 2048]
+  </div>
+</div>
+
+<!-- 10. Prefill stage contracts -->
+<div class="slide">
+  <div class="slide-tag">stage 合同</div>
+  <h2>每个 stage 的输入 / 输出 / 副作用</h2>
+  <table class="T" style="margin-top:6px;font-size:.74em">
+    <tr><th>stage</th><th class="l">输入</th><th class="l">输出</th><th class="l">side effect</th></tr>
+    <tr><td class="c-q">P0 qkv_a_proj_norm</td><td class="l">hidden [T,2048]</td><td class="l">q_lora_norm [T,768], kv_lora_norm [T,512], k_pe [T,64]</td><td class="l">—</td></tr>
+    <tr><td class="c-q">P1 q_b + absorb-K</td><td class="l">q_lora_norm, kv_lora_norm, k_pe, positions</td><td class="l">q_nope_out [T,32,512], q_pe [T,32,64]</td><td class="l">main_kv_cache[out_cache_loc]</td></tr>
+    <tr><td class="c-i">P2 indexer prep</td><td class="l">hidden, q_lora_norm, positions</td><td class="l">q_idx_fp8 [T,8,128], gate [T,8]</td><td class="l">index_k_cache[out_cache_loc]</td></tr>
+    <tr><td class="c-w">P3 ragged topk</td><td class="l">q_idx_fp8, gate, index_k_cache, ragged metadata</td><td class="l">topk_slots [T, 2048]</td><td class="l">—</td></tr>
+    <tr><td class="c-v">P4 sparse MQA</td><td class="l">q [T,32,576], kv_cache, topk_slots</td><td class="l"><b>attn_out_latent [T,32,512]</b></td><td class="l">—</td></tr>
+    <tr><td class="c-r">P4-alt fallback</td><td class="l">q_nope, q_pe, kv_lora_norm, k_pe, kv_b_proj, ragged</td><td class="l">attn_out_dense [T,32,128]</td><td class="l">—</td></tr>
+    <tr><td class="c-v">P5 v absorb (仅 absorb)</td><td class="l">attn_out_latent, w_vc</td><td class="l">attn_out [T,32,128]</td><td class="l">—</td></tr>
+    <tr><td class="c-o">P6 o_proj</td><td class="l">attn_out [T, 4096]</td><td class="l">out [T, 2048]</td><td class="l">—</td></tr>
+  </table>
+</div>
+
+<!-- 11. Dense fallback detail -->
+<div class="slide">
+  <div class="slide-tag">P4-alt 详解</div>
+  <h2>Dense fallback：什么时候、做什么</h2>
+  <div class="row wrap" style="gap:14px">
+    <div class="panel" style="width:430px;border-left:3px solid var(--red)">
+      <h3 style="color:var(--red)">触发条件</h3>
+      <div class="mono" style="font-size:.8em;line-height:1.8">
+        max_kv_len ≤ <span style="color:var(--yellow)">2048</span>  <span style="color:var(--dim)">(= index_topk)</span><br>
+        AND not is_blackwell<br>
+        AND backend.use_mha == True
+      </div>
+      <div class="box" style="margin-top:8px;border-left-color:var(--dim)">
+        <span style="color:var(--dim)">短序列下 dense 比 sparse + 吸收快——sparse 的 topk + index cache IO 开销不划算。</span>
+      </div>
+    </div>
+    <div class="panel" style="width:430px;border-left:3px solid var(--blue)">
+      <h3 style="color:var(--blue)">做什么</h3>
+      <div class="mono" style="font-size:.8em;line-height:1.8">
+        1. 用 kv_b_proj 解 latent<br>
+        &nbsp;&nbsp;&nbsp;→ K [T, 32, Dnope+Dro=192]<br>
+        &nbsp;&nbsp;&nbsp;→ V [T, 32, Dv=128]<br>
+        2. FlashAttention varlen<br>
+        &nbsp;&nbsp;&nbsp;kv = prefix(cache) + current<br>
+        3. 输出 attn_out [T, 32, 128]<br>
+        4. <b>跳过 P5 V absorb</b>，直进 P6
+      </div>
+    </div>
+  </div>
+  <div class="box warn" style="margin-top:12px">
+    Zeus 端：absorb 分支与 fallback 分支必须分别实现并按阈值切换；REF 测试用例要覆盖两种情况——
+    `prefill_full_path` 跑长序列走 absorb，`dense_fallback_policy` 单测一份短序列对照。
+  </div>
+</div>
+
+<!-- 12. P3 ragged topk -->
+<div class="slide">
+  <div class="slide-tag">P3 详图</div>
+  <h2>Prefill ragged top-k 与 decode paged 的差异</h2>
+  <div class="ascii">
+<span class="d">// decode (D3, 对比):  paged MQA logits</span>
+deep_gemm.<span class="w">fp8_paged_mqa_logits</span>(q_fp8, kv_cache, weights, seqlens, page_table)
+  → 每个 batch 一行 logits [B, max_kv_len]
+  → fast_topk_transform_<span class="w">fused</span>(logits, page_table_1) -> topk_slots [B, 2048]
+
+<span class="d">// prefill (P3): ragged MQA logits + GetKAndS gather</span>
+<span class="p">index_buf_accessor.GetKAndS</span>.execute(pool, buf, page_indices, ...)
+  → 把 index_k_cache 与 scale gather 成连续 [Σseq, 128] + [Σseq, 4]
+deep_gemm.<span class="w">fp8_mqa_logits</span>(q_fp8, key_gathered, weights, ...)
+  → ragged logits [T, max_kv_len]
+  → fast_topk_transform_<span class="w">ragged_fused</span>(logits, page_table, q_seqlens, kv_seqlens)
+                                          <span class="d">// causal mask + visible-span 限制</span>
+  → topk_slots [T, 2048]
+  </div>
+  <div class="box ok" style="margin-top:12px">
+    可见区契约：<b>row r 只能看见同 request 的 prefix(req) + 当前 chunk 中位置 ≤ row_pos 的 token</b>。
+    实现侧用 `nsa_extend_len_cpu` + `extend_prefix_lens` 共同决定 mask。
+  </div>
+</div>
+
+<!-- 13. Decode vs Prefill -->
+<div class="slide">
+  <div class="slide-tag">异同</div>
+  <h2>Decode 与 Prefill 对照（Prefill 视角）</h2>
+  <table class="T" style="margin-top:6px;font-size:.78em">
+    <tr><th>维度</th><th>Decode</th><th>Prefill / absorb</th><th>Prefill / fallback</th></tr>
+    <tr><td>每 step token 数</td><td>1 / req</td><td>chunk 内多 token</td><td>同 absorb</td></tr>
+    <tr><td>dispatch 方法</td><td class="c-q">MLA</td><td class="c-q">MLA</td><td class="c-r">MHA_ONE_SHOT</td></tr>
+    <tr><td>吸收矩阵</td><td class="c-green">w_kc + w_vc</td><td class="c-green">w_kc + w_vc</td><td class="c-r">不用，直接解 kv_b_proj</td></tr>
+    <tr><td>sparse attention kernel</td><td class="c-cyan">flash_mla_with_kvcache</td><td class="c-cyan">flash_mla_sparse_fwd</td><td class="c-r">FlashAttention varlen (dense)</td></tr>
+    <tr><td>topk 来源</td><td>paged MQA logits</td><td>ragged MQA logits + GetKAndS</td><td>—（不算 topk）</td></tr>
+    <tr><td>attention 输出维</td><td>[B,32,<b>Rkv=512</b>]</td><td>[T,32,<b>Rkv=512</b>]</td><td>[T,32,<b>Dv=128</b>]</td></tr>
+    <tr><td>是否调 V absorb</td><td>是</td><td>是</td><td><b>否</b></td></tr>
+    <tr><td>触发条件</td><td>常态</td><td>max_kv_len &gt; 2048</td><td>max_kv_len ≤ 2048；非 Blackwell</td></tr>
+  </table>
+</div>
+
+<!-- 14. P2 indexer -->
+<div class="slide">
+  <div class="slide-tag">P2 详图</div>
+  <h2>Indexer prep — 与 D2 同流程，T batched + Hadamard</h2>
+  <div class="ascii">
+<span class="d">// nsa_indexer.py::_get_q_k_bf16 + forward_indexer + rotate_activation</span>
+
+q_lora_norm [T, 768]                       hidden [T, 2048]
+       │                                          │
+       ▼                                          ▼
+   wq_b GEMM                              wk GEMM
+       │                                          │
+   <span class="i">query [T, 8, 128]</span>                       key [T, 128]
+       │                                          │
+   split(64, 64)                             k_norm  <span class="d">// index_dsa_use_layernorm</span>
+       │                                          │
+   <span class="d">// Indexer RoPE：NeoX 缺省，仅前 64 维</span>     split(64, 64)
+   rotary_emb(q_rope, k_rope, positions)   <span class="d">// positions [T]，ragged</span>
+   ↓                                              ↓
+   write back front 64 dims                  write back front 64 dims
+       │                                          │
+       └────────────┐                ┌────────────┘
+                    ▼                ▼
+              <span class="r">rotate_activation</span>  (Hadamard transform)
+                    │                │
+              <span class="i">q_idx_h</span>           <span class="i">k_idx_h</span>     <span class="r">★ V1 漏写</span>
+                    │                │
+              act_quant(group=128) → q_idx_fp8 [T,8,128] + scale
+                                      k_idx_fp8 [T,128] + scale
+                    │
+              index_k_cache[out_cache_loc] = (k_idx_fp8, scale)  <span class="d">// 批量写</span>
+
+weights_proj(hidden) → gate [T, 8]  (float32, × Nh^-0.5)
+  </div>
+</div>
+
+<!-- 15. Prefill dev stages -->
+<div class="slide">
+  <div class="slide-tag">dev stages</div>
+  <h2>Prefill dev 脚本 stage ↔ V3 子步骤</h2>
+  <table class="T" style="margin-top:6px;font-size:.76em">
+    <tr><th>dev stage 名</th><th>对应</th><th>V1 状态</th><th>V3</th><th class="l">说明</th></tr>
+    <tr><td class="c-q">prefill_qkv_a_proj_norm_fused</td><td>P0</td><td>不存在</td><td>× 新增</td><td class="l">hidden → q_lora_norm + kv_lora_norm + k_pe</td></tr>
+    <tr><td class="c-q">prefill_q_proj_fused</td><td>P1</td><td>✓</td><td><b>△</b></td><td class="l">V1 只覆盖 Q（含 RoPE）；<b>缺 bmm w_kc</b></td></tr>
+    <tr><td class="c-k">prefill_kv_cache_store</td><td>P1 side</td><td>×</td><td>×</td><td class="l">KV latent + k_pe 批量写</td></tr>
+    <tr><td class="c-i">prefill_indexer_prep_store_fused</td><td>P2</td><td>×</td><td>×</td><td class="l">含 Hadamard + FP8 + cache store</td></tr>
+    <tr><td class="c-w">prefill_ragged_indexer_topk_fused</td><td>P3</td><td>×</td><td>×</td><td class="l">ragged causal top-k</td></tr>
+    <tr><td class="c-v">prefill_sparse_mqa_fused</td><td>P4</td><td>命名错</td><td>× 新名</td><td class="l">输出 [T, Nh, <b>Rkv=512</b>]</td></tr>
+    <tr><td class="c-r">dense_fallback_policy</td><td>P4-alt</td><td>×</td><td>×</td><td class="l">max_kv_len ≤ 2048 走 MHA_ONE_SHOT</td></tr>
+    <tr><td class="c-v">prefill_v_absorb</td><td>P5</td><td>不存在</td><td>× 新增</td><td class="l">bmm(out_latent, w_vc) → [T, Nh, Dv]</td></tr>
+    <tr><td class="c-o">prefill_o_proj</td><td>P6</td><td>×</td><td>×</td><td class="l">普通 GEMM</td></tr>
+    <tr><td class="c-d">prefill_full_path</td><td>P0–P6 + alt</td><td>×</td><td>×</td><td class="l">端到端</td></tr>
+  </table>
+</div>
+
+<!-- 16. Prefill priorities + milestones -->
+<div class="slide">
+  <div class="slide-tag">优先级 + 里程碑</div>
+  <h2>Prefill 推荐开发顺序</h2>
+  <div class="row wrap" style="gap:14px">
+    <div class="panel" style="width:520px">
+      <h3 style="color:var(--red)">优先级</h3>
+      <table class="T" style="font-size:.74em;width:100%">
+        <tr><th>P</th><th class="l">任务</th></tr>
+        <tr><td class="c-r">P0</td><td class="l">修 tensor contract：P4 输出改 [T,Nh,Rkv]，加 P5；P4-alt 与 P4 分别建测试</td></tr>
+        <tr><td class="c-r">P0</td><td class="l">架构名映射（is_deepseek_nsa 三选一）</td></tr>
+        <tr><td class="c-w">P1</td><td class="l">P1 含 bmm w_kc + KV 批量写 cache</td></tr>
+        <tr><td class="c-w">P1</td><td class="l">P5 v absorb + P6 o_proj</td></tr>
+        <tr><td class="c-i">P2</td><td class="l">P0 hidden-in fused</td></tr>
+        <tr><td class="c-i">P2</td><td class="l">P2 indexer + Hadamard + FP8 + cache store</td></tr>
+        <tr><td class="c-i">P2</td><td class="l">RoPE 分两组测（main vs Indexer）</td></tr>
+        <tr><td class="c-v">P3</td><td class="l">P3 ragged topk（多 req 不串行、不看未来）</td></tr>
+        <tr><td class="c-v">P3</td><td class="l">P4 sparse MQA</td></tr>
+        <tr><td class="c-v">P3</td><td class="l">P4-alt dense fallback policy</td></tr>
+      </table>
+    </div>
+    <div class="panel" style="width:480px">
+      <h3 style="color:var(--cyan)">里程碑（Prefill 部分）</h3>
+      <table class="T" style="font-size:.74em;width:100%">
+        <tr><th>M</th><th class="l">目标</th></tr>
+        <tr><td class="c-d">M0</td><td class="l">REF PASS；中间张量显式生成</td></tr>
+        <tr><td class="c-d">M0.5</td><td class="l">架构名映射</td></tr>
+        <tr><td class="c-q">M1</td><td class="l">P0 fused projection</td></tr>
+        <tr><td class="c-q">M2</td><td class="l">P1 Q 含 absorb</td></tr>
+        <tr><td class="c-i">M3</td><td class="l">P2 indexer 通路</td></tr>
+        <tr><td class="c-v">M6</td><td class="l">P5 v absorb + P6 o_proj</td></tr>
+        <tr><td class="c-w">M7</td><td class="l">P3 ragged topk</td></tr>
+        <tr><td class="c-v">M8</td><td class="l">P4 sparse + P4-alt fallback 两条都对齐</td></tr>
+        <tr><td class="c-o">M9</td><td class="l">Prefill 单层 [T,H]→[T,H] smoke</td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- 17. Summary -->
+<div class="slide" style="background:radial-gradient(ellipse at 50% 38%, #2a1240 0%, #0d0e1c 70%)">
+  <div class="slide-tag">总结</div>
+  <h2>Prefill V3 一句话</h2>
+  <div class="formula" style="margin-top:18px;font-size:.96em;line-height:2">
+    <span class="green">Prefill 默认与 decode 共用 absorb 路径</span>，只是<br>
+    sparse 调用换成 <span class="cyan">flash_mla_sparse_fwd</span>，top-k 改 ragged，cache 批量写；<br>
+    <span class="red">短序列（max_kv_len ≤ 2048）才切 MHA_ONE_SHOT 走 dense 解 KV</span>。<br>
+    <span class="dim">Indexer 别忘了 Hadamard；可见区按 prefix + causal 当前 chunk 来。</span>
+  </div>
+  <p style="color:var(--dim);margin-top:18px;font-size:.85em">配套：GlmMoeDsa_dev_V3.md · decode 见 glm_moe_dsa_decode_slides_v3.html</p>
+</div>
+
+</div>
+<div id="nav"><button id="bp" onclick="go(-1)">◀</button><div id="dots"></div><div id="prog">1 / 17</div><button id="bn" onclick="go(1)">▶</button></div>
+<script>
+const slides=document.querySelectorAll('.slide');const N=slides.length;let cur=0;const dotsEl=document.getElementById('dots');const progEl=document.getElementById('prog');const bp=document.getElementById('bp');const bn=document.getElementById('bn');
+slides.forEach((sl,i)=>{const n=sl.querySelector('.slide-num');if(n)n.textContent=`${i+1} / ${N}`;});
+slides.forEach((_,i)=>{const d=document.createElement('div');d.className='dot'+(i===0?' on':'');d.onclick=()=>goTo(i);dotsEl.appendChild(d);});
+function goTo(n){slides[cur].classList.remove('active');dotsEl.children[cur].classList.remove('on');cur=Math.max(0,Math.min(N-1,n));slides[cur].classList.add('active');dotsEl.children[cur].classList.add('on');progEl.textContent=`${cur+1} / ${N}`;bp.disabled=cur===0;bn.disabled=cur===N-1;}
+function go(d){goTo(cur+d)}document.addEventListener('keydown',e=>{if(e.key==='ArrowRight'||e.key===' '){e.preventDefault();go(1)}if(e.key==='ArrowLeft'){e.preventDefault();go(-1)}});goTo(0);
+</script>
+</body>
+</html>

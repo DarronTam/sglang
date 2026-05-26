@@ -21,7 +21,7 @@ import torch
 
 
 DEFAULT_CONFIG_PATH = Path(
-    "/datau38020T/Application/tanzh/hf_cache/hub/16b_hf/config.json"
+    "./config_16b.json"
 )
 
 
@@ -394,6 +394,30 @@ def run_zeus_q_proj(hidden_states, positions, weights, cfg):
         num_heads=cfg.num_attention_heads,
         qk_nope_head_dim=cfg.qk_nope_head_dim,
         qk_rope_head_dim=cfg.qk_rope_head_dim,
+        eps=cfg.rms_norm_eps,
+        rope_theta=cfg.rope_theta,
+    )
+
+
+def run_zeus_kv_proj_cache_store(
+    hidden_states, positions, slots, weights, cfg, k_cache, v_cache
+):
+    import torch_zeus  # noqa: F401
+    import sgl_kernel_zeus
+
+    return sgl_kernel_zeus.dsa_kv_proj_cache_store_fused(
+        hidden_states.contiguous().to("zeus"),
+        positions.to(torch.int32).contiguous().to("zeus"),
+        slots.to(torch.int32).contiguous().to("zeus"),
+        weights["kv_a_proj"].contiguous().to("zeus"),
+        weights["kv_a_norm"].contiguous().to("zeus"),
+        weights["kv_b_proj"].contiguous().to("zeus"),
+        k_cache.contiguous().to("zeus"),
+        v_cache.contiguous().to("zeus"),
+        num_heads=cfg.num_attention_heads,
+        qk_nope_head_dim=cfg.qk_nope_head_dim,
+        qk_rope_head_dim=cfg.qk_rope_head_dim,
+        v_head_dim=cfg.v_head_dim,
         eps=cfg.rms_norm_eps,
         rope_theta=cfg.rope_theta,
     )

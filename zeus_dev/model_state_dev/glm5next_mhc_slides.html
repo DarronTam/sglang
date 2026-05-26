@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GLM5-Next mHC Zeus 适配开发追踪</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:     #0d0e1c;
+  --panel:  #13152a;
+  --card:   #181a32;
+  --border: #272a52;
+  --text:   #c8cfe8;
+  --dim:    #68709b;
+  --blue:   #4a90e2;
+  --cyan:   #38d9a9;
+  --pink:   #f06292;
+  --yellow: #ffd166;
+  --green:  #69db7c;
+  --purple: #b39ddb;
+  --orange: #ffab76;
+  --red:    #ef5350;
+  --teal:   #4dd0e1;
+  --mono:   'Courier New', 'Consolas', monospace;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  height: 100vh;
+  overflow: hidden;
+  user-select: none;
+}
+
+#deck { width: 100vw; height: 100vh; position: relative; }
+
+.slide {
+  position: absolute; inset: 0;
+  display: none; flex-direction: column;
+  align-items: center; justify-content: center;
+  padding: 28px 54px 64px; gap: 10px;
+}
+.slide.active { display: flex; }
+
+.slide-tag {
+  position: absolute; top: 18px; left: 32px;
+  font-size: 0.7em; color: var(--dim);
+  letter-spacing: 0.14em; text-transform: uppercase;
+}
+.slide-num {
+  position: absolute; top: 18px; right: 32px;
+  font-size: 0.7em; color: var(--dim); font-family: var(--mono);
+}
+
+h1 { font-size: 2.32em; font-weight: 700; color: #fff; line-height: 1.18; text-align: center; }
+h2 { font-size: 1.58em; font-weight: 650; color: #dde4ff; text-align: center; }
+h3 { font-size: 0.9em; font-weight: 700; margin-bottom: 8px; }
+p  { font-size: 0.92em; line-height: 1.7; text-align: center; }
+code, .mono { font-family: var(--mono); }
+.sub { font-size: 0.84em; color: var(--dim); text-align: center; margin-top: -4px; }
+
+.row { display: flex; align-items: flex-start; gap: 14px; }
+.col { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.wrap { flex-wrap: wrap; justify-content: center; }
+.divider { width: 100%; height: 1px; background: var(--border); }
+
+.badge {
+  display: inline-block;
+  padding: 5px 13px; border-radius: 18px;
+  font-size: 0.76em; font-family: var(--mono); font-weight: 650;
+}
+.b-blue   { background:#182450; color:var(--blue);   border:1px solid #253570; }
+.b-cyan   { background:#0e2530; color:var(--cyan);   border:1px solid #1e3540; }
+.b-green  { background:#0e2818; color:var(--green);  border:1px solid #1e3828; }
+.b-yellow { background:#2a2008; color:var(--yellow); border:1px solid #3a3018; }
+.b-pink   { background:#2a1030; color:var(--pink);   border:1px solid #3a2040; }
+.b-purple { background:#1a1030; color:var(--purple); border:1px solid #2a2040; }
+.b-orange { background:#281808; color:var(--orange); border:1px solid #4a2a10; }
+.b-red    { background:#2c1114; color:var(--red);    border:1px solid #4a2025; }
+
+.box {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--blue);
+  border-radius: 7px;
+  padding: 11px 15px;
+  font-size: 0.86em;
+  line-height: 1.65;
+}
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 17px;
+}
+
+table.T, table.kv {
+  border-collapse: collapse; font-family: var(--mono); font-size: 0.78em;
+}
+table.T th, table.T td, table.kv th, table.kv td {
+  border: 1px solid var(--border); padding: 5px 9px; text-align: center;
+}
+table.T th, table.kv th { background: #1c1f3a; color: var(--dim); font-weight: 650; }
+table.T td.l, table.kv td.l { text-align: left; color: var(--text); }
+.c-q  { background:#1a2050; color:var(--blue); }
+.c-k  { background:#0f2a2a; color:var(--cyan); }
+.c-v  { background:#0e2818; color:var(--green); }
+.c-i  { background:#18102a; color:var(--purple); }
+.c-w  { background:#2a2010; color:var(--yellow); }
+.c-o  { background:#1e1208; color:var(--orange); }
+.c-b  { background:#2a1030; color:var(--pink); }
+.c-r  { background:#2c1114; color:var(--red); }
+.c-d  { background:#111320; color:var(--dim); }
+
+.formula {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 13px 20px;
+  font-family: var(--mono); font-size: 0.84em; line-height: 1.85;
+  text-align: left; max-width: 1000px;
+}
+.formula .blue { color: var(--blue); }
+.formula .cyan { color: var(--cyan); }
+.formula .green { color: var(--green); }
+.formula .yellow { color: var(--yellow); }
+.formula .pink { color: var(--pink); }
+.formula .purple { color: var(--purple); }
+.formula .orange { color: var(--orange); }
+.formula .red { color: var(--red); }
+.formula .dim { color: var(--dim); }
+
+.ascii {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px 20px;
+  font-family: var(--mono); font-size: 0.75em; line-height: 1.55;
+  white-space: pre; color: var(--text);
+  overflow-x: auto; text-align: left; max-width: min(1060px, 100%);
+}
+.ascii .q { color: var(--blue); font-weight: 700; }
+.ascii .k { color: var(--cyan); font-weight: 700; }
+.ascii .v { color: var(--green); font-weight: 700; }
+.ascii .i { color: var(--purple); font-weight: 700; }
+.ascii .w { color: var(--yellow); font-weight: 700; }
+.ascii .o { color: var(--orange); font-weight: 700; }
+.ascii .r { color: var(--red); font-weight: 700; }
+.ascii .d { color: var(--dim); }
+
+.flow {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  gap: 12px;
+  width: min(1050px, 100%);
+}
+.node {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 12px; min-height: 82px;
+}
+.node b { display:block; font-size:0.84em; margin-bottom:5px; color:#fff; }
+.node span { display:block; font-family:var(--mono); color:var(--dim); font-size:0.74em; line-height:1.55; }
+.n-q { border-left: 3px solid var(--blue); }
+.n-k { border-left: 3px solid var(--cyan); }
+.n-v { border-left: 3px solid var(--green); }
+.n-i { border-left: 3px solid var(--purple); }
+.n-o { border-left: 3px solid var(--orange); }
+.n-r { border-left: 3px solid var(--red); }
+
+#nav {
+  position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 14px;
+  background: rgba(19, 21, 42, 0.92);
+  backdrop-filter: blur(12px);
+  padding: 9px 22px; border-radius: 32px;
+  border: 1px solid var(--border);
+}
+#nav button {
+  background: none; border: none; color: var(--text);
+  cursor: pointer; font-size: 1.3em; padding: 3px 8px;
+  border-radius: 6px;
+}
+#nav button:hover { background: #272a52; }
+#nav button:disabled { color: #2a2d4a; cursor: not-allowed; }
+#prog { font-size: 0.83em; color: var(--dim); min-width: 54px; text-align:center; font-family:var(--mono); }
+#dots { display:flex; gap:6px; align-items:center; }
+.dot { width:7px; height:7px; border-radius:50%; background:var(--border); cursor:pointer; }
+.dot.on { background: var(--blue); }
+</style>
+</head>
+
+<body>
+<div id="deck">
+
+<!-- 1 -->
+<div class="slide">
+  <div class="slide-num">1 / 11</div>
+  <div style="text-align:center">
+    <div style="font-size:0.78em; color:var(--cyan); letter-spacing:0.18em; text-transform:uppercase; margin-bottom:10px">
+      zeus_dev · GLM5-Next mHC
+    </div>
+    <h1>GLM5-Next mHC<br>Zeus 适配开发追踪</h1>
+    <p style="color:#7682b5; margin-top:12px; font-size:1em">
+      多流 residual → pre(norm·split·sinkhorn·apply) → sublayer → post
+    </p>
+    <div class="row wrap" style="margin-top:22px; gap:10px">
+      <span class="badge b-blue">HyperConnection</span>
+      <span class="badge b-purple">N = 4 streams</span>
+      <span class="badge b-cyan">Sinkhorn ×20</span>
+      <span class="badge b-green">fp32 params</span>
+      <span class="badge b-yellow">attn + mlp 双 wrap</span>
+    </div>
+    <p style="margin-top:28px; font-size:0.78em; color:#394066">
+      → / Space 下一页 · ← 上一页 · 点击小圆点跳转
+    </p>
+  </div>
+</div>
+
+<!-- 2 -->
+<div class="slide">
+  <div class="slide-tag">scope</div><div class="slide-num">2 / 11</div>
+  <h2>切片边界：包在 sublayer 外的多流残差容器</h2>
+  <div class="row wrap" style="margin-top:10px; align-items:stretch">
+    <div class="box" style="width:430px; border-left-color:var(--green)">
+      <b style="color:#fff">起点</b><br>
+      <span class="mono" style="color:var(--green)">residual [T, N=4, H]</span><br>
+      block 入口的多流残差（flatten <span class="mono">[T, N·H]</span>）。
+    </div>
+    <div class="box" style="width:430px; border-left-color:var(--orange)">
+      <b style="color:#fff">终点</b><br>
+      <span class="mono" style="color:var(--orange)">residual_out [T, N·H]</span><br>
+      sublayer 处理后 <span class="mono">hc_post</span> 回写的新多流残差。
+    </div>
+    <div class="box" style="width:430px; border-left-color:var(--purple)">
+      <b style="color:#fff">方法</b><br>
+      stage 化 <span class="mono">REF vs Zeus</span>。REF 内联复刻 prerelease
+      <span class="mono">functional.py</span> 的 torch fallback，禁止 silent fallback。
+    </div>
+    <div class="box" style="width:430px; border-left-color:var(--cyan)">
+      <b style="color:#fff">核心思想</b><br>
+      sublayer 永远只看 <span class="mono">单流 [T,H]</span>；多流 mixing 全在
+      <span class="mono">pre / post</span> 里完成。
+    </div>
+  </div>
+  <div class="box" style="margin-top:12px; border-left-color:var(--yellow); max-width:900px">
+    REF 来源 = <span class="mono">HyperConnection → hc_pre/hc_post → _mhc_*_torch</span>
+    （即 <span class="mono">SGLANG_OPT_USE_TORCH_MHC=True</span> 的真实部署 fallback），
+    让 GLM5-Next 生产路径成为唯一 golden，不依赖外部 ref 包。
+  </div>
+</div>
+
+<!-- 3 -->
+<div class="slide">
+  <div class="slide-tag">config</div><div class="slide-num">3 / 11</div>
+  <h2>两套配置合表：仅 H / norm_weight 不同，mHC 形态一致</h2>
+  <table class="T" style="margin-top:8px">
+    <tr><th>字段</th><th>GLM5-Next-16B</th><th>GLM5-Next</th><th>说明</th></tr>
+    <tr><td class="c-b">H</td><td>2048</td><td>4096</td><td class="l">单流宽度 hidden_size</td></tr>
+    <tr><td class="c-i">N</td><td>4</td><td>4</td><td class="l">mhc_num_residual_streams（硬锁 4）</td></tr>
+    <tr><td class="c-w">mix_hc</td><td>24</td><td>24</td><td class="l">N·(2+N) = pre4+post4+comb16</td></tr>
+    <tr><td class="c-w">d_model</td><td>8192</td><td>16384</td><td class="l">N·H（mapping 输入维度）</td></tr>
+    <tr><td class="c-v">sinkhorn_iters</td><td>20</td><td>20*</td><td class="l">*Next 缺省→HyperConnection 默认 20</td></tr>
+    <tr><td class="c-o">post_mult_value</td><td>2</td><td>2.0*</td><td class="l">*Next 缺省→默认 2.0</td></tr>
+    <tr><td class="c-r">no_norm_weight</td><td>true</td><td>false*</td><td class="l">唯一结构差异：16B 旁路 RMSNorm weight</td></tr>
+    <tr><td class="c-d">hc_eps</td><td>1e-6</td><td>1e-6*</td><td class="l">Sinkhorn / pre sigmoid eps</td></tr>
+    <tr><td class="c-d">mhc_tau</td><td>1.0</td><td>0.05</td><td class="l">GLM 扩展，<b>悬空</b>（REF 未用）</td></tr>
+    <tr><td class="c-d">hres_vwnstyle</td><td>false</td><td>true</td><td class="l">GLM 扩展，<b>悬空</b></td></tr>
+  </table>
+  <div class="box" style="margin-top:12px; border-left-color:var(--red); max-width:940px">
+    <b style="color:#fff">注意</b>：<span class="mono">mhc_tau</span> /
+    <span class="mono">hres_vwnstyle</span> 在 prerelease repo
+    <span class="mono">functional.py</span> / <span class="mono">dsv4_mhc.py</span> 里
+    <b>无对应分支</b>，等上游 HF 建模代码发布再补；当前 REF 留参数槽。
+  </div>
+</div>
+
+<!-- 4 -->
+<div class="slide">
+  <div class="slide-tag">placement</div><div class="slide-num">4 / 11</div>
+  <h2>HyperConnection 在 decoder layer 的位置</h2>
+  <div class="ascii">residual_in <span class="r">[T, N·H]</span>
+   │  <span class="q">attn_hc.pre_forward</span>  ──▶ layer_input <span class="o">[T,H]</span>   (h_res, h_post 暂存)
+   ▼
+ <span class="q">self_attn</span>(layer_input)        DSA decode  /  Linear-attn decode
+   │  <span class="q">attn_hc.post_forward</span> ──▶ residual_mid <span class="r">[T, N·H]</span>
+   ▼
+   │  <span class="v">mlp_hc.pre_forward</span>   ──▶ layer_input <span class="o">[T,H]</span>   (h_res, h_post 暂存)
+   ▼
+ <span class="v">mlp</span>(layer_input)              MoE  /  dense MLP
+   │  <span class="v">mlp_hc.post_forward</span>  ──▶ residual_out <span class="r">[T, N·H]</span>
+   ▼
+residual_out ──▶ 下一层</div>
+  <div class="box" style="margin-top:14px; border-left-color:var(--purple); max-width:920px">
+    每层两个 <span class="mono">HyperConnection</span>（attn-side + mlp-side），权重独立。
+    调度由 <span class="mono">MHCLayerCommunicator.MHCState</span> 编排
+    （glm5_next.py:480-503 / communicator_mhc.py:50-79）。
+  </div>
+</div>
+
+<!-- 5 -->
+<div class="slide">
+  <div class="slide-tag">data flow</div><div class="slide-num">5 / 11</div>
+  <h2>一个 HyperConnection 的 pre / post 往返</h2>
+  <div class="flow">
+    <div class="node n-i" style="grid-column: span 2"><b>(K1) mhc_pre_norm_split ★融合 #1+#2</b><span>BLOCK_T 1-pass：RMSNorm(flatten N·H, fp32) + F.linear(fn fp32) → mixes[T,24]
+→ x·scale+base → sigmoid → split: pre[T,4,1] / post[T,4,1] / comb[T,4,4]
+（mixes 不落 DRAM）</span></div>
+    <div class="node n-v"><b>(K2) sinkhorn</b><span>comb logits →
+doubly-stochastic
+repeat = 20</span></div>
+    <div class="node n-o"><b>(K3) apply_mix</b><span>(residual×pre).sum(stream)
+→ layer_input [T,H] bf16</span></div>
+    <div class="node n-q"><b>SUBLAYER</b><span>单流 [T,H]
+attn: DSA / Linear-attn
+mlp : MoE / dense</span></div>
+    <div class="node n-r" style="grid-column: span 3"><b>(K4) mhc_post</b><span>out[t,n,h] = post·x_sub  +  Σ_m comb[t,m,n]·residual[t,m,h]   （fp32 accum → 单次 bf16 RNE）  →  residual_out [T, N·H] bf16</span></div>
+  </div>
+  <div class="box" style="margin-top:16px; border-left-color:var(--cyan); max-width:920px">
+    <span class="mono">pre_forward</span> = (K1)→(K2)→(K3)，返回
+    <span class="mono">layer_input</span> + 暂存 <span class="mono">h_res(comb) / h_post(post)</span>；
+    <span class="mono">post_forward</span> = (5)，把 sublayer 单流输出 scatter 回 N 条流。
+  </div>
+</div>
+
+<!-- 6 -->
+<div class="slide">
+  <div class="slide-tag">pre detail</div><div class="slide-num">6 / 11</div>
+  <h2>K1 mhc_pre_norm_split：24 维 mixes（融合 #1+#2, BLOCK_T 1-pass）</h2>
+  <div class="formula">
+mixes = <span class="purple">RMSNorm</span>(residual.flatten(N·H).<span class="cyan">float()</span>) @ <span class="yellow">fn</span>ᵀ      <span class="dim"># fn:[24, N·H] fp32</span><br>
+        <span class="dim"># 16B: fn 直接用；Next: fn = fn * norm_weight</span><br><br>
+m = mixes·<span class="yellow">scale</span> + <span class="yellow">base</span>            <span class="dim"># scale[3] 广播为 [4|4|16], base[24]</span><br>
+<span class="blue">pre </span> = sigmoid(m[:, 0:4 ]) + <span class="dim">pre_eps</span>          <span class="dim"># [T,4,1]  ∈ (eps, 1+eps)</span><br>
+<span class="green">post</span> = sigmoid(m[:, 4:8 ]) · <span class="dim">post_mult(=2)</span>    <span class="dim"># [T,4,1]  ∈ (0, 2)</span><br>
+<span class="red">comb</span> = m[:, 8:24].view(4,4)                <span class="dim"># [T,4,4]  raw logits → Sinkhorn</span><br><br>
+layer_input = (<span class="blue">pre</span> · residual).sum(stream).<span class="cyan">bfloat16()</span>  <span class="dim"># [T,H]</span>
+  </div>
+  <div class="row wrap" style="margin-top:14px; gap:10px">
+    <span class="badge b-purple">fn / scale / base / norm_weight 全 fp32</span>
+    <span class="badge b-cyan">pre/post/comb 是 per-token 动态</span>
+    <span class="badge b-blue">pre 给 apply_mix · post/comb 给 post</span>
+    <span class="badge b-yellow">BLOCK_T 1-pass · mixes[T,24] 不落 DRAM</span>
+  </div>
+</div>
+
+<!-- 7 — K1 双核并行 split-K -->
+<div class="slide">
+  <div class="slide-tag">K1 2-core</div><div class="slide-num">7 / 11</div>
+  <h2>K1 双核并行：device 2-core 推荐 split-K 12/12</h2>
+  <div class="row wrap" style="gap:14px; align-items:stretch; margin-top:6px">
+    <div class="box" style="flex:1; min-width:440px; border-left-color:var(--cyan)">
+      <b style="color:#fff">为什么不切 T，切 K？</b><br>
+      <span class="mono">fn[24, N·H] fp32</span> ≈ <b>0.75 MB (16B) / 1.5 MB (Next)</b>，每层静态、每次调用读一次。<br>
+      <span class="mono">residual[T, N·H] bf16</span> ≈ <b>16 KB·T (16B) / 32 KB·T (Next)</b>。<br>
+      decode 单步 T 小（常 ≤ 16），<b>fn 主导 DRAM 带宽</b>。切 K → 每核 fn 流量减半；切 T → 两核都拉全 fn，浪费一半。<br>
+      <span class="dim"># 临界 T ≈ 48；T ≥ 48 时（prefill）才反转为切 T 更优。</span>
+    </div>
+    <div class="box" style="flex:1; min-width:440px; border-left-color:var(--green)">
+      <b style="color:#fff">12 / 12 是唯一均衡分法</b><br>
+      <table class="T" style="font-size:0.78em; margin-top:6px">
+        <tr><th>切法</th><th>GEMM 行</th><th>平衡</th></tr>
+        <tr><td><b>12 / 12</b> ★</td><td class="l">12 / 12</td><td class="c-d">1 : 1</td></tr>
+        <tr><td>8 / 16 (pre+post / comb)</td><td class="l">8 / 16</td><td class="c-r">1 : 2</td></tr>
+        <tr><td>4 / 20 (pre / 其它)</td><td class="l">4 / 20</td><td class="c-r">1 : 5</td></tr>
+      </table>
+      <span class="dim" style="font-size:0.85em">post-process 异构（core0 含 sigmoid，core1 全 elementwise），但 GEMM 主导 → 不平衡 &lt; 5%。</span>
+    </div>
+  </div>
+  <div class="formula" style="margin-top:14px; font-size:0.82em">
+<span class="purple">core 0</span>  <span class="dim">── 12 行 GEMM (dims 0..11) ───────── 异构 post-process ── 写 disjoint ─</span><br>
+&nbsp;&nbsp;load  residual[t,:]<br>
+&nbsp;&nbsp;rsqrt = rsqrt(mean(x²)+eps)        <span class="dim"># ← 与 core1 冗余</span><br>
+&nbsp;&nbsp;mixes_local[0..11] = fn[0..11,:] · x · rsqrt<br>
+&nbsp;&nbsp;&nbsp;&nbsp;dims 0..3  → <span class="blue">pre</span>  (σ + eps)         → write <span class="blue">pre[t,:]</span><br>
+&nbsp;&nbsp;&nbsp;&nbsp;dims 4..7  → <span class="green">post</span> (σ · 2)            → write <span class="green">post[t,:]</span><br>
+&nbsp;&nbsp;&nbsp;&nbsp;dims 8..11 → <span class="red">comb</span> row 0 (scale+base) → write <span class="red">comb_logits[t,0,:]</span><br><br>
+<span class="purple">core 1</span>  <span class="dim">── 12 行 GEMM (dims 12..23) ──────── 同构 post-process ── 写 disjoint ─</span><br>
+&nbsp;&nbsp;load  residual[t,:]<br>
+&nbsp;&nbsp;rsqrt = rsqrt(mean(x²)+eps)        <span class="dim"># ← 与 core0 冗余</span><br>
+&nbsp;&nbsp;mixes_local[12..23] = fn[12..23,:] · x · rsqrt<br>
+&nbsp;&nbsp;&nbsp;&nbsp;dims 12..23 → <span class="red">comb</span> rows 1..3 (scale+base 同构)<br>
+&nbsp;&nbsp;&nbsp;&nbsp;                                       → write <span class="red">comb_logits[t,1:4,:]</span>
+  </div>
+  <div class="row wrap" style="margin-top:12px; gap:10px">
+    <span class="badge b-yellow">fn 流量减半 · 输出写盘 disjoint</span>
+    <span class="badge b-cyan">rsqrt 两核冗余算 ≈ +4% reduce / 0 barrier</span>
+    <span class="badge b-purple">BLOCK_T 内循环不变 · tile-invariance 保留</span>
+    <span class="badge b-blue">T ≥ ~48 (prefill) 才切 T</span>
+  </div>
+</div>
+
+<!-- 8 -->
+<div class="slide">
+  <div class="slide-tag">sinkhorn</div><div class="slide-num">8 / 11</div>
+  <h2>Sinkhorn-Knopp：投影到 Birkhoff polytope</h2>
+  <div class="formula">
+<span class="dim"># 首轮特殊：softmax 而非 exp，且只做列归一</span><br>
+x = comb.<span class="cyan">softmax(-1)</span> + eps<br>
+x = x / (x.sum(<span class="blue">-2</span>, keepdim=True) + eps)     <span class="dim"># 列归一</span><br><br>
+<span class="dim"># 之后 (repeat-1) 轮交替 行 → 列</span><br>
+for _ in range(repeat - 1):<br>
+&nbsp;&nbsp;x = x / (x.sum(<span class="green">-1</span>, keepdim=True) + eps)   <span class="dim"># 行归一</span><br>
+&nbsp;&nbsp;x = x / (x.sum(<span class="blue">-2</span>, keepdim=True) + eps)   <span class="dim"># 列归一</span><br><br>
+<span class="dim"># 共 2·repeat − 1 次 reduce（不是 2·repeat！）</span>
+  </div>
+  <div class="row wrap" style="margin-top:14px; gap:10px; align-items:stretch">
+    <div class="box" style="width:440px; border-left-color:var(--green)">
+      <b style="color:#fff">不变量</b>：收敛后 <span class="mono">comb[t]</span> 是
+      doubly-stochastic —— 行和≈1、列和≈1、全非负。
+    </div>
+    <div class="box" style="width:440px; border-left-color:var(--yellow)">
+      <b style="color:#fff">迭代数敏感</b>：20 iter 下
+      <span class="mono">|row_sum−1|≈1e-6</span>；10 iter 下≈1e-3。config 走谁用谁。
+    </div>
+  </div>
+</div>
+
+<!-- 8 -->
+<div class="slide">
+  <div class="slide-tag">post detail</div><div class="slide-num">9 / 11</div>
+  <h2>mhc_post：scatter 回 streams + fp32 单 RNE</h2>
+  <div class="formula">
+out[t,n,h] = <span class="green">post</span>[t,n]·<span class="orange">x_sub</span>[t,h]<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;+ Σ<sub>m</sub> <span class="red">comb</span>[t,m,n]·<span class="red">residual</span>[t,m,h]<br><br>
+<span class="dim"># einsum('tmn,tmh->tnh', comb, residual.float())</span><br>
+return (x.<span class="cyan">float()</span>·post + term2).<span class="cyan">bfloat16()</span>   <span class="dim"># fp32 accum → 单次 RNE</span>
+  </div>
+  <div class="row wrap" style="margin-top:14px; gap:10px; align-items:stretch">
+    <div class="box" style="width:440px; border-left-color:var(--cyan)">
+      <b style="color:#fff">精度路径</b>：与 <span class="mono">moe_sum_reduce</span> 一致——
+      fp32 累加后只做一次 bf16 RNE，比独立 bf16 加法少一次舍入。
+    </div>
+    <div class="box" style="width:440px; border-left-color:var(--green)">
+      <b style="color:#fff">sanity</b>：<span class="mono">post=0, comb=I</span> 时
+      <span class="mono">out ≡ residual</span>（原样 propagate 回 streams）。
+    </div>
+  </div>
+</div>
+
+<!-- 9 -->
+<div class="slide">
+  <div class="slide-tag">operators</div><div class="slide-num">10 / 11</div>
+  <h2>算子表（Zeus kernel 规划）· 5 颗 K0..K4</h2>
+  <table class="T" style="margin-top:8px; font-size:0.76em">
+    <tr><th>K</th><th>算子</th><th>shape</th><th>难度</th><th>Zeus 现状</th></tr>
+    <tr><td>K0</td><td class="c-d">mhc_expand</td><td class="l">[T,H]→[T,N·H]</td><td>易</td><td class="c-r">TODO (非热路径)</td></tr>
+    <tr><td>K1</td><td class="c-i">mhc_pre_norm_split ★融合 #1+#2</td><td class="l">[T,N,H]bf16→pre/post/comb fp32</td><td>最难</td><td class="c-r">TODO · BLOCK_T 1-pass</td></tr>
+    <tr><td>K2</td><td class="c-v">mhc_sinkhorn</td><td class="l">[T,4,4]→[T,4,4]</td><td>中</td><td class="c-r">TODO</td></tr>
+    <tr><td>K3</td><td class="c-o">mhc_pre_apply_mix</td><td class="l">[T,N,H]×[T,N,1]→[T,H]</td><td>易</td><td class="c-r">TODO</td></tr>
+    <tr><td>K4</td><td class="c-r">mhc_post</td><td class="l">x+res+post+comb→[T,N·H]</td><td>中</td><td class="c-r">TODO ← 首颗</td></tr>
+    <tr><td>—</td><td class="c-d">mhc_pre (fused)</td><td class="l">K1·K2·K3 大融合</td><td>—</td><td class="c-d">long-term</td></tr>
+  </table>
+  <div class="box" style="margin-top:12px; border-left-color:var(--yellow); max-width:940px">
+    <b style="color:#fff">2026-05-23 拆分调整</b>：原 #1 <span class="mono">pre_norm_fn</span> +
+    #2 <span class="mono">split_mixes</span> 合为一颗 <span class="mono">K1 pre_norm_split</span>
+    —— 二者皆 per-token，BLOCK_T 的 T 循环作 1-pass，<span class="mono">mixes[T,24]</span> 留寄存器不落 DRAM。<br>
+    <b style="color:#fff">落地顺序</b>：<span class="mono">mhc_post</span> →
+    <span class="mono">sinkhorn</span> → <span class="mono">pre_apply_mix</span> →
+    <span class="mono">pre_norm_split</span>（含 fp32 split-K GEMM，最重）。
+  </div>
+</div>
+
+<!-- 10 -->
+<div class="slide">
+  <div class="slide-tag">dev stages</div><div class="slide-num">11 / 11</div>
+  <h2>Dev 脚本与开发状态</h2>
+  <table class="T" style="margin-top:8px; font-size:0.72em">
+    <tr><th>stage</th><th>kernel</th><th>REF 不变量自检</th><th>Zeus 现状</th></tr>
+    <tr><td class="c-d">mhc_expand</td><td>K0</td><td class="l">N 条流初始恒等</td><td class="c-r">TODO</td></tr>
+    <tr><td class="c-i">mhc_pre_norm_fn</td><td>K1 子步 a</td><td class="l">shape [T,24] / dtype fp32</td><td class="c-d">debug</td></tr>
+    <tr><td class="c-w">mhc_pre_split_mixes</td><td>K1 子步 b</td><td class="l">pre∈(eps,1+eps), post∈(0,2)</td><td class="c-d">debug</td></tr>
+    <tr><td class="c-i">mhc_pre_norm_split ★</td><td>K1</td><td class="l">融合==顺序两步(bit) + tile-invariance</td><td class="c-r">TODO</td></tr>
+    <tr><td class="c-v">mhc_sinkhorn</td><td>K2</td><td class="l">doubly-stochastic + 非负</td><td class="c-r">TODO</td></tr>
+    <tr><td class="c-o">mhc_pre_apply_mix</td><td>K3</td><td class="l">uniform pre 时 ≈ 单流</td><td class="c-r">TODO</td></tr>
+    <tr><td class="c-q">mhc_pre</td><td>K1·K2·K3</td><td class="l">comb doubly-stochastic</td><td class="c-r">TODO</td></tr>
+    <tr><td class="c-r">mhc_post</td><td>K4</td><td class="l">post=0,comb=I → out≈residual</td><td class="c-r">TODO</td></tr>
+    <tr><td class="c-q">mhc_sublayer_wrap</td><td>—</td><td class="l">pre→identity→post 闭合</td><td class="c-r">TODO</td></tr>
+    <tr><td class="c-o">mhc_layer_full</td><td>—</td><td class="l">双 wrap 后 N 条流不再恒等</td><td class="c-r">TODO</td></tr>
+  </table>
+  <div class="formula" style="margin-top:12px">
+python zeus_dev/model_state_dev/dev_glm5next_mhc_test.py --config next --stage mhc_layer_full<br>
+默认 <span class="yellow">mode=both</span>：REF 先跑（16B+Next 全 PASS）；Zeus kernel 未落地打印 <span class="red">SKIP/TODO</span>。
+  </div>
+</div>
+
+</div>
+
+<div id="nav">
+  <button id="bp" onclick="go(-1)">◀</button>
+  <div id="dots"></div>
+  <div id="prog">1 / 10</div>
+  <button id="bn" onclick="go(1)">▶</button>
+</div>
+
+<script>
+const slides = document.querySelectorAll('.slide');
+const N = slides.length;
+let cur = 0;
+const dotsEl = document.getElementById('dots');
+const progEl = document.getElementById('prog');
+const bp = document.getElementById('bp');
+const bn = document.getElementById('bn');
+
+slides.forEach((_, i) => {
+  const d = document.createElement('div');
+  d.className = 'dot' + (i === 0 ? ' on' : '');
+  d.onclick = () => goTo(i);
+  dotsEl.appendChild(d);
+});
+
+function goTo(n) {
+  slides[cur].classList.remove('active');
+  dotsEl.children[cur].classList.remove('on');
+  cur = Math.max(0, Math.min(N - 1, n));
+  slides[cur].classList.add('active');
+  dotsEl.children[cur].classList.add('on');
+  progEl.textContent = `${cur + 1} / ${N}`;
+  bp.disabled = cur === 0;
+  bn.disabled = cur === N - 1;
+}
+
+function go(d) { goTo(cur + d); }
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); go(1); }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); go(-1); }
+});
+
+let tx = 0;
+document.addEventListener('touchstart', e => { tx = e.touches[0].clientX; });
+document.addEventListener('touchend', e => {
+  const dx = e.changedTouches[0].clientX - tx;
+  if (Math.abs(dx) > 40) go(dx < 0 ? 1 : -1);
+});
+
+goTo(0);
+</script>
+</body>
+</html>

@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GLM5-Next 整 transformer block (decode) Zeus 适配开发追踪</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:     #0d0e1c;
+  --panel:  #13152a;
+  --card:   #181a32;
+  --border: #272a52;
+  --text:   #c8cfe8;
+  --dim:    #68709b;
+  --blue:   #4a90e2;
+  --cyan:   #38d9a9;
+  --pink:   #f06292;
+  --yellow: #ffd166;
+  --green:  #69db7c;
+  --purple: #b39ddb;
+  --orange: #ffab76;
+  --red:    #ef5350;
+  --teal:   #4dd0e1;
+  --mono:   'Courier New', 'Consolas', monospace;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  height: 100vh;
+  overflow: hidden;
+  user-select: none;
+}
+
+#deck { width: 100vw; height: 100vh; position: relative; }
+
+.slide {
+  position: absolute; inset: 0;
+  display: none; flex-direction: column;
+  align-items: center; justify-content: center;
+  padding: 28px 54px 64px; gap: 10px;
+}
+.slide.active { display: flex; }
+
+.slide-tag {
+  position: absolute; top: 18px; left: 32px;
+  font-size: 0.7em; color: var(--dim);
+  letter-spacing: 0.14em; text-transform: uppercase;
+}
+.slide-num {
+  position: absolute; top: 18px; right: 32px;
+  font-size: 0.7em; color: var(--dim); font-family: var(--mono);
+}
+
+h1 { font-size: 2.32em; font-weight: 700; color: #fff; line-height: 1.18; text-align: center; }
+h2 { font-size: 1.58em; font-weight: 650; color: #dde4ff; text-align: center; }
+h3 { font-size: 0.9em; font-weight: 700; margin-bottom: 8px; }
+p  { font-size: 0.92em; line-height: 1.7; text-align: center; }
+code, .mono { font-family: var(--mono); }
+.sub { font-size: 0.84em; color: var(--dim); text-align: center; margin-top: -4px; }
+
+.row { display: flex; align-items: flex-start; gap: 14px; }
+.col { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.wrap { flex-wrap: wrap; justify-content: center; }
+.divider { width: 100%; height: 1px; background: var(--border); }
+
+.badge {
+  display: inline-block;
+  padding: 5px 13px; border-radius: 18px;
+  font-size: 0.76em; font-family: var(--mono); font-weight: 650;
+}
+.b-blue   { background:#182450; color:var(--blue);   border:1px solid #253570; }
+.b-cyan   { background:#0e2530; color:var(--cyan);   border:1px solid #1e3540; }
+.b-green  { background:#0e2818; color:var(--green);  border:1px solid #1e3828; }
+.b-yellow { background:#2a2008; color:var(--yellow); border:1px solid #3a3018; }
+.b-pink   { background:#2a1030; color:var(--pink);   border:1px solid #3a2040; }
+.b-purple { background:#1a1030; color:var(--purple); border:1px solid #2a2040; }
+.b-orange { background:#281808; color:var(--orange); border:1px solid #4a2a10; }
+.b-red    { background:#2c1114; color:var(--red);    border:1px solid #4a2025; }
+
+.box {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--blue);
+  border-radius: 7px;
+  padding: 11px 15px;
+  font-size: 0.86em;
+  line-height: 1.65;
+}
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 17px;
+}
+
+table.T, table.kv {
+  border-collapse: collapse; font-family: var(--mono); font-size: 0.78em;
+}
+table.T th, table.T td, table.kv th, table.kv td {
+  border: 1px solid var(--border); padding: 5px 9px; text-align: center;
+}
+table.T th, table.kv th { background: #1c1f3a; color: var(--dim); font-weight: 650; }
+table.T td.l, table.kv td.l { text-align: left; color: var(--text); }
+.c-q  { background:#1a2050; color:var(--blue); }
+.c-k  { background:#0f2a2a; color:var(--cyan); }
+.c-v  { background:#0e2818; color:var(--green); }
+.c-i  { background:#18102a; color:var(--purple); }
+.c-w  { background:#2a2010; color:var(--yellow); }
+.c-o  { background:#1e1208; color:var(--orange); }
+.c-b  { background:#2a1030; color:var(--pink); }
+.c-r  { background:#2c1114; color:var(--red); }
+.c-d  { background:#111320; color:var(--dim); }
+
+.formula {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 13px 20px;
+  font-family: var(--mono); font-size: 0.84em; line-height: 1.85;
+  text-align: left; max-width: 1000px;
+}
+.formula .blue { color: var(--blue); }
+.formula .cyan { color: var(--cyan); }
+.formula .green { color: var(--green); }
+.formula .yellow { color: var(--yellow); }
+.formula .pink { color: var(--pink); }
+.formula .purple { color: var(--purple); }
+.formula .orange { color: var(--orange); }
+.formula .red { color: var(--red); }
+.formula .dim { color: var(--dim); }
+
+.ascii {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px 20px;
+  font-family: var(--mono); font-size: 0.75em; line-height: 1.55;
+  white-space: pre; color: var(--text);
+  overflow-x: auto; text-align: left; max-width: min(1060px, 100%);
+}
+.ascii .q { color: var(--blue); font-weight: 700; }
+.ascii .k { color: var(--cyan); font-weight: 700; }
+.ascii .v { color: var(--green); font-weight: 700; }
+.ascii .i { color: var(--purple); font-weight: 700; }
+.ascii .w { color: var(--yellow); font-weight: 700; }
+.ascii .o { color: var(--orange); font-weight: 700; }
+.ascii .r { color: var(--red); font-weight: 700; }
+.ascii .d { color: var(--dim); }
+
+.flow {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  gap: 12px;
+  width: min(1050px, 100%);
+}
+.node {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 12px; min-height: 82px;
+}
+.node b { display:block; font-size:0.84em; margin-bottom:5px; color:#fff; }
+.node span { display:block; font-family:var(--mono); color:var(--dim); font-size:0.74em; line-height:1.55; }
+.n-q { border-left: 3px solid var(--blue); }
+.n-k { border-left: 3px solid var(--cyan); }
+.n-v { border-left: 3px solid var(--green); }
+.n-i { border-left: 3px solid var(--purple); }
+.n-o { border-left: 3px solid var(--orange); }
+.n-r { border-left: 3px solid var(--red); }
+
+#nav {
+  position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 14px;
+  background: rgba(19, 21, 42, 0.92);
+  backdrop-filter: blur(12px);
+  padding: 9px 22px; border-radius: 32px;
+  border: 1px solid var(--border);
+}
+#nav button {
+  background: none; border: none; color: var(--text);
+  cursor: pointer; font-size: 1.3em; padding: 3px 8px;
+  border-radius: 6px;
+}
+#nav button:hover { background: #272a52; }
+#nav button:disabled { color: #2a2d4a; cursor: not-allowed; }
+#prog { font-size: 0.83em; color: var(--dim); min-width: 54px; text-align:center; font-family:var(--mono); }
+#dots { display:flex; gap:6px; align-items:center; }
+.dot { width:7px; height:7px; border-radius:50%; background:var(--border); cursor:pointer; }
+.dot.on { background: var(--blue); }
+</style>
+</head>
+
+<body>
+<div id="deck">
+
+<!-- 1 -->
+<div class="slide">
+  <div class="slide-num">1 / 10</div>
+  <div style="text-align:center">
+    <div style="font-size:0.78em; color:var(--cyan); letter-spacing:0.18em; text-transform:uppercase; margin-bottom:10px">
+      zeus_dev · GLM5-Next block decode
+    </div>
+    <h1>GLM5-Next 整 transformer block<br>(decode) Zeus 适配开发追踪</h1>
+    <p style="color:#7682b5; margin-top:12px; font-size:1em">
+      hybrid attention（KDA + DSA）× mHC 多流残差 wrapper 的 block 级组装
+    </p>
+    <div class="row wrap" style="margin-top:22px; gap:10px">
+      <span class="badge b-blue">Glm5NextDecoderLayer</span>
+      <span class="badge b-cyan">Linear-attn (KDA)</span>
+      <span class="badge b-purple">DSA</span>
+      <span class="badge b-pink">mHC ×2</span>
+      <span class="badge b-green">decode only</span>
+    </div>
+    <p style="margin-top:24px; font-size:0.82em; color:#7682b5">
+      "目前主要差 mHC" —— attention/MoE 已对齐，本次补 block 级 mHC 组装
+    </p>
+    <p style="margin-top:18px; font-size:0.78em; color:#394066">
+      → / Space 下一页 · ← 上一页 · 点击小圆点跳转
+    </p>
+  </div>
+</div>
+
+<!-- 2 -->
+<div class="slide">
+  <div class="slide-tag">scope</div><div class="slide-num">2 / 10</div>
+  <h2>切片边界：一整层 decode，重点验证 mHC 组装</h2>
+  <div class="row wrap" style="margin-top:10px; align-items:stretch">
+    <div class="box" style="width:430px; border-left-color:var(--green)">
+      <b style="color:#fff">起点</b><br>
+      <span class="mono" style="color:var(--green)">residual [T, N=4, H]</span><br>
+      block 入口的多流残差（flatten <span class="mono">[T, N·H]</span>）。
+    </div>
+    <div class="box" style="width:430px; border-left-color:var(--orange)">
+      <b style="color:#fff">终点</b><br>
+      <span class="mono" style="color:var(--orange)">residual_out [T, N·H]</span><br>
+      一整层处理后的多流残差（喂下一层）。
+    </div>
+    <div class="box" style="width:430px; border-left-color:var(--purple)">
+      <b style="color:#fff">重点</b><br>
+      不重复 kernel 级对拍，只验证 <span class="mono">mHC × {KDA, DSA} × MLP</span>
+      的 block 级组装闭合。
+    </div>
+    <div class="box" style="width:430px; border-left-color:var(--cyan)">
+      <b style="color:#fff">方法</b><br>
+      REF 复用子模块 golden（import dsa / mhc 模块）+ 内联 KDA decode REF；
+      Zeus block kernel 全 <span class="mono">SKIP/TODO</span>。
+    </div>
+  </div>
+</div>
+
+<!-- 3 -->
+<div class="slide">
+  <div class="slide-tag">sub-modules</div><div class="slide-num">3 / 10</div>
+  <h2>顶层文档：串起 4 个已对齐子模块</h2>
+  <table class="T" style="margin-top:8px">
+    <tr><th>子模块</th><th>子文档</th><th>子脚本</th><th>状态</th></tr>
+    <tr><td class="c-k">Linear-attn (KDA)</td><td class="l">kimi_linear_attn_dev.md</td><td class="l">dev_kimi_linear_attn_test.py</td><td class="c-v">✅ 已对齐</td></tr>
+    <tr><td class="c-q">DSA decode</td><td class="l">glm5next_dsa_decode_dev.md</td><td class="l">dev_glm5next_dsa_decode_test.py</td><td class="c-v">✅ 已对齐</td></tr>
+    <tr><td class="c-o">MoE-FFN</td><td class="l">glm4_moe_ffn_dev.md</td><td class="l">dev_glm4_moe_test.py</td><td class="c-v">✅ 已对齐</td></tr>
+    <tr><td class="c-b">mHC ← 本次新增</td><td class="l">glm5next_mhc_dev.md</td><td class="l">dev_glm5next_mhc_test.py</td><td class="c-w">🆕 REF PASS</td></tr>
+    <tr><td class="c-r">整 block 组装</td><td class="l">glm5next_block_decode_dev.md</td><td class="l">dev_glm5next_block_decode_test.py</td><td class="c-w">🆕 本文</td></tr>
+  </table>
+  <div class="box" style="margin-top:14px; border-left-color:var(--green); max-width:920px">
+    <b style="color:#fff">缺口收口</b>：之前 attention / MoE 各算子已逐一对齐，唯独
+    把它们拼成 <span class="mono">Glm5NextDecoderLayer</span> 的 <b>mHC 多流容器</b>
+    缺位 —— 本次补齐后，单层 decode 的 REF 组装完整闭合。
+  </div>
+</div>
+
+<!-- 4 -->
+<div class="slide">
+  <div class="slide-tag">topology</div><div class="slide-num">4 / 10</div>
+  <h2>GLM5-Next 是 hybrid attention 模型</h2>
+  <table class="T" style="margin-top:8px">
+    <tr><th>字段</th><th>GLM5-Next-16B</th><th>GLM5-Next</th><th>说明</th></tr>
+    <tr><td class="c-d">num_hidden_layers</td><td>27</td><td>45</td><td class="l">总层数</td></tr>
+    <tr><td class="c-k">Linear-attn (KDA) 层</td><td>21</td><td>34</td><td class="l">大多数层</td></tr>
+    <tr><td class="c-q">DSA (full-attn) 层</td><td>6</td><td>11</td><td class="l">full_attn_layers</td></tr>
+    <tr><td class="c-d">first_k_dense_replace</td><td>1</td><td>3</td><td class="l">前 k 层 dense MLP</td></tr>
+    <tr><td class="c-o">MoE 层</td><td>其余</td><td>其余</td><td class="l">独立于 attn 类型</td></tr>
+    <tr><td class="c-b">mhc / N</td><td>true / 4</td><td>true / 4</td><td class="l">每层包 2 个 HyperConnection</td></tr>
+  </table>
+  <div class="box" style="margin-top:12px; border-left-color:var(--purple); max-width:940px">
+    <b style="color:#fff">路由规则</b>：<span class="mono">layer_id ∈ full_attn_layers</span>
+    → DSA；否则 → Linear-attn (KDA)。attention 类型与 MLP/MoE 类型
+    <b>相互独立</b>。
+  </div>
+</div>
+
+<!-- 5 -->
+<div class="slide">
+  <div class="slide-tag">assembly</div><div class="slide-num">5 / 10</div>
+  <h2>一层 decode 的组装顺序（MHCLayerCommunicator）</h2>
+  <div class="ascii">residual_in <span class="r">[T, N=4, H]</span>
+   │  <span class="q">attn_hc.pre</span>   ──▶ layer_input <span class="o">[T,H]</span>
+   ▼
+ self_attn(layer_input)   ┌─ layer ∈ full_attn → <span class="q">DSA decode</span>
+   │                      └─ else             → <span class="k">Linear-attn decode</span>
+   │  <span class="q">attn_hc.post</span>  ──▶ residual_mid <span class="r">[T, N·H]</span>
+   ▼
+   │  <span class="v">mlp_hc.pre</span>    ──▶ layer_input <span class="o">[T,H]</span>
+   ▼
+ mlp(layer_input)         ┌─ dense layer → <span class="v">SwiGLU(clamp)</span>
+   │                      └─ else        → <span class="o">MoE</span>
+   │  <span class="v">mlp_hc.post</span>   ──▶ residual_out <span class="r">[T, N·H]</span>
+   ▼
+residual_out ──▶ 下一层</div>
+  <div class="box" style="margin-top:14px; border-left-color:var(--cyan); max-width:940px">
+    <b style="color:#fff">关键</b>：sublayer 永远只看 <span class="mono">单流 [T,H]</span>；
+    多流 mixing 全在 mHC <span class="mono">pre/post</span> 完成 ⇒ 换 attention 类型
+    不影响 mHC wrap（完全解耦）。
+  </div>
+</div>
+
+<!-- 6 -->
+<div class="slide">
+  <div class="slide-tag">KDA sublayer</div><div class="slide-num">6 / 10</div>
+  <h2>Linear-attention (KDA) decode sublayer</h2>
+  <div class="formula">
+layer_input <span class="orange">[B,H]</span><br>
+ ├─ qkv_proj   → mixed_qkv [B, 3·proj]    <span class="dim">(q|k|v 融合)</span><br>
+ ├─ b_proj     → beta / f_b(f_a) → forget_gate / g_b(g_a) → g_proj<br>
+ ↓ <span class="cyan">decode</span><br>
+ conv1d_update(mixed_qkv)+silu → q,k,v    <span class="dim">(单步 per-channel conv)</span><br>
+ g_gate = <span class="green">−exp(A_log)</span>·softplus(forget_gate+dt_bias) ; beta=sigmoid(beta)<br>
+ ↓ 单步 delta-rule（S 先 decay 再 readout）<br>
+ q̂=l2norm(q)·scale ; k̂=l2norm(k)<br>
+ S = S·exp(g_gate) ; v̂=k̂·S ; S += beta·(v−v̂)⊗k̂ ; o = q̂·S<br>
+ ↓<br>
+ o = <span class="purple">rms_norm_gated</span>(o, g_proj, sigmoid) ; out = o_proj(o.flatten())  <span class="orange">[B,H]</span>
+  </div>
+  <div class="row wrap" style="margin-top:12px; gap:10px">
+    <span class="badge b-cyan">16B: 32 heads × 72</span>
+    <span class="badge b-purple">Next: 64 heads × 128</span>
+    <span class="badge b-blue">conv state + recurrent state 原位推进</span>
+  </div>
+  <p class="sub" style="margin-top:8px">kernel 级对拍见 dev_kimi_linear_attn_test.py::kimi_delta_attn_decode</p>
+</div>
+
+<!-- 7 -->
+<div class="slide">
+  <div class="slide-tag">DSA sublayer</div><div class="slide-num">7 / 10</div>
+  <h2>DSA decode sublayer（复用 dsa 模块 REF）</h2>
+  <div class="ascii">layer_input <span class="o">[B,H]</span>
+  ┌─ <span class="q">#0</span>  q_a/kv_a proj + RMSNorm        → q_lora, latent_kv[slot]
+  ├─ <span class="q">#1</span>  q_main（MLA absorb, Dro=0）     → q_new [B,Nh,Rkv]
+  ├─ <span class="i">#2</span>  Indexer Q/K（Hadamard + fp8）   → q_body, k_body, weights
+  ├─ <span class="i">#3</span>  index logits（GEMM→gate→scale）
+  ├─ <span class="i">#4</span>  local topK（≤Ktop）
+  ├─ <span class="k">#7</span>  latent gather（owner filter）
+  ├─ <span class="v">#8</span>  sparse MQA partial（FA-v2）
+  └─ <span class="o">#10</span> V absorb + o_proj              → out <span class="o">[B,H]</span></div>
+  <div class="box" style="margin-top:14px; border-left-color:var(--purple); max-width:940px">
+    本脚本把 mHC 的 <span class="mono">layer_input</span> 作为 DSA 的
+    <span class="mono">hidden</span> 喂入，cp=1 no-CP decode，输出
+    <span class="mono">[B,H]</span> 交回 <span class="mono">attn_hc.post</span>。
+    详见 <span class="mono">glm5next_dsa_decode_dev.md</span>。
+  </div>
+</div>
+
+<!-- 8 -->
+<div class="slide">
+  <div class="slide-tag">mHC wrap</div><div class="slide-num">8 / 10</div>
+  <h2>mHC：把单流 sublayer 包成多流残差</h2>
+  <div class="flow">
+    <div class="node n-i"><b>attn_hc.pre</b><span>residual[T,N,H]
+→ layer_input[T,H]
+(暂存 h_res, h_post)</span></div>
+    <div class="node n-q"><b>self_attn</b><span>单流 [T,H]
+KDA / DSA decode
+→ attn_out[T,H]</span></div>
+    <div class="node n-r"><b>attn_hc.post</b><span>scatter 回 N 流
+→ residual_mid
+[T, N·H]</span></div>
+    <div class="node n-v"><b>mlp_hc.pre</b><span>residual_mid
+→ layer_input[T,H]
+(暂存 h_res, h_post)</span></div>
+    <div class="node n-v"><b>mlp</b><span>单流 [T,H]
+SwiGLU / MoE
+→ mlp_out[T,H]</span></div>
+    <div class="node n-r" style="grid-column: span 3"><b>mlp_hc.post</b><span>scatter 回 N 流 → residual_out [T, N·H]  ·  fp32 accum + 单次 bf16 RNE  ·  comb 是 doubly-stochastic 混合矩阵 ⇒ N 条流不再恒等</span></div>
+  </div>
+  <div class="box" style="margin-top:16px; border-left-color:var(--pink); max-width:920px">
+    每层 2 个 <span class="mono">HyperConnection</span>（attn-side / mlp-side），权重独立。
+    mHC 内部 5 步（norm_fn / split / sinkhorn / apply / post）见
+    <span class="mono">glm5next_mhc_dev.md</span> + <span class="mono">glm5next_mhc_slides.html</span>。
+  </div>
+</div>
+
+<!-- 9 -->
+<div class="slide">
+  <div class="slide-tag">dev stages</div><div class="slide-num">9 / 10</div>
+  <h2>Dev 脚本与开发状态</h2>
+  <table class="T" style="margin-top:8px; font-size:0.74em">
+    <tr><th>stage</th><th>内容</th><th>REF 自检</th><th>子算子 Zeus</th><th>本脚本</th></tr>
+    <tr><td class="c-k">linear_attn_decode</td><td class="l">Linear-attn sublayer 单跑</td><td class="l">shape + state 推进</td><td class="c-v">✅ kimi 通</td><td class="c-d">暂 REF</td></tr>
+    <tr><td class="c-q">dsa_decode</td><td class="l">DSA sublayer 单跑</td><td class="l">shape</td><td class="c-v">✅ dsa nocp 通</td><td class="c-d">暂 REF</td></tr>
+    <tr><td class="c-v">mlp_decode</td><td class="l">dense SwiGLU MLP</td><td class="l">shape</td><td class="c-v">✅ silu/MoE 通</td><td class="c-d">暂 REF</td></tr>
+    <tr><td class="c-i">linear_attn_block</td><td class="l">mHC[ KDA + MLP ] 整 block</td><td class="l">闭合 + 混流</td><td class="c-r">⏳ 仅缺 mHC</td><td class="c-d">暂 REF</td></tr>
+    <tr><td class="c-i">dsa_block</td><td class="l">mHC[ DSA + MLP ] 整 block</td><td class="l">闭合 + 混流</td><td class="c-r">⏳ 仅缺 mHC</td><td class="c-d">暂 REF</td></tr>
+    <tr><td class="c-o">decode_layer_full</td><td class="l">按 full_attn_layers 路由</td><td class="l">路由 + 闭合</td><td class="c-r">⏳ 仅缺 mHC</td><td class="c-d">暂 REF</td></tr>
+  </table>
+  <div class="box" style="margin-top:12px; border-left-color:var(--green); max-width:960px; font-size:0.82em">
+    <b style="color:#fff">还差什么</b>：三类 sublayer 的 Zeus 子算子<b>都已对拍通过</b>
+    （kimi decode / moe_block_full / dsa decode_full_nocp 实测 PASS）；
+    <b>唯一缺 mHC 的 5 颗 K0..K4 kernel</b>（2026-05-23 已把原 #1+#2 融合）。block 级端到端纯 Zeus 只被 mHC 阻塞。
+  </div>
+</div>
+
+<!-- 10 -->
+<div class="slide">
+  <div class="slide-tag">status</div><div class="slide-num">10 / 10</div>
+  <h2>当前状态 & 下一步</h2>
+  <div class="row wrap" style="margin-top:10px; align-items:stretch">
+    <div class="box" style="width:460px; border-left-color:var(--green)">
+      <b style="color:#fff">✅ 已完成（REF）</b><br>
+      6 stage × 2 配置（16B + Next）REF 全 PASS。<br>
+      <span class="mono">decode_layer_full</span> 路由验证：layer 3→DSA、layer 0→KDA。
+    </div>
+    <div class="box" style="width:460px; border-left-color:var(--yellow)">
+      <b style="color:#fff">🆕 本次补齐</b><br>
+      block 级 mHC 组装 = 之前 attention/MoE 对齐后的最后一块拼图。<br>
+      mHC REF 内联复刻 prerelease functional.py。
+    </div>
+    <div class="box" style="width:460px; border-left-color:var(--red)">
+      <b style="color:#fff">⏳ Zeus TODO</b><br>
+      5 颗 K0..K4 <span class="mono">mhc_*</span> kernel（见 glm5next_mhc_dev.md；
+      K1 = 融合 norm_fn + split_mixes, BLOCK_T 1-pass），
+      落地后把 block REF 段逐步替换为 Zeus 调用。
+    </div>
+    <div class="box" style="width:460px; border-left-color:var(--cyan)">
+      <b style="color:#fff">🎯 终点</b><br>
+      mHC kernel 就绪 → block 级端到端 REF-vs-Zeus 对拍 → 多层堆叠 →
+      纯 Zeus（无 CUDA）整模型 decode。
+    </div>
+  </div>
+</div>
+
+</div>
+
+<div id="nav">
+  <button id="bp" onclick="go(-1)">◀</button>
+  <div id="dots"></div>
+  <div id="prog">1 / 10</div>
+  <button id="bn" onclick="go(1)">▶</button>
+</div>
+
+<script>
+const slides = document.querySelectorAll('.slide');
+const N = slides.length;
+let cur = 0;
+const dotsEl = document.getElementById('dots');
+const progEl = document.getElementById('prog');
+const bp = document.getElementById('bp');
+const bn = document.getElementById('bn');
+
+slides.forEach((_, i) => {
+  const d = document.createElement('div');
+  d.className = 'dot' + (i === 0 ? ' on' : '');
+  d.onclick = () => goTo(i);
+  dotsEl.appendChild(d);
+});
+
+function goTo(n) {
+  slides[cur].classList.remove('active');
+  dotsEl.children[cur].classList.remove('on');
+  cur = Math.max(0, Math.min(N - 1, n));
+  slides[cur].classList.add('active');
+  dotsEl.children[cur].classList.add('on');
+  progEl.textContent = `${cur + 1} / ${N}`;
+  bp.disabled = cur === 0;
+  bn.disabled = cur === N - 1;
+}
+
+function go(d) { goTo(cur + d); }
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); go(1); }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); go(-1); }
+});
+
+let tx = 0;
+document.addEventListener('touchstart', e => { tx = e.touches[0].clientX; });
+document.addEventListener('touchend', e => {
+  const dx = e.changedTouches[0].clientX - tx;
+  if (Math.abs(dx) > 40) go(dx < 0 ? 1 : -1);
+});
+
+goTo(0);
+</script>
+</body>
+</html>
