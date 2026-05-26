@@ -216,6 +216,35 @@ class Glm5NextDsaAttn:
 
         seq_lens = torch.full((B,), S_hist, dtype=torch.int32)
 
+        # K_local gather output buffers — pre-zeroed LocalMem (native mode),
+        # 跨 step 复用同一组 pool 指针.
+        # 动机: dsa_latent_k_gather_paged sim 跳过 invalid slot 的写入 (cp > 1
+        # 时非本核 token 不写入 c0/c1; cp = 1 时无 invalid case 但 contract
+        # 一致), 依赖 caller 端 buffer 是 zero-init 才能保证 sparse_mqa_partial
+        # 的算术 mask 把 invalid 位置乘 0 时仍是有限值. 临时 alloc 的 device
+        # buffer 含未初始化内存, 可能让 invalid 位置出现 NaN/Inf -> 算术 mask
+        # × 0 = NaN, 污染整条 attn 输出.
+        # 解法: 一次性 CPU zeros → from_tensor(kind='native') memcpy 到 LocalMem,
+        # 后续 forward 直接复用这 4 个 LocalMem; gather 的 C++ wrapper 走
+        # isLocalMem 路径, copyFromLocalMemSlice 把当前 LocalMem 内容 (= zero)
+        # 拷到 tmp, sim 只覆盖 valid slot, copyToLocalMemSlice 写回 — invalid
+        # slot 一直保持 zero, 永不引入 NaN.
+        Ktop = cfg.Ktop
+        zero_K   = torch.zeros(B, Ktop, Rkv, dtype=torch.bfloat16)
+        zero_K_T = torch.zeros(B, Rkv, Ktop, dtype=torch.bfloat16)
+        k_local_c0_lmem   = torch.zeus.local_memory.from_tensor(
+            zero_K,   kind="native", Tr=1, Tc=1,
+        )
+        k_local_c1_lmem   = torch.zeus.local_memory.from_tensor(
+            zero_K,   kind="native", Tr=1, Tc=1,
+        )
+        k_local_t_c0_lmem = torch.zeus.local_memory.from_tensor(
+            zero_K_T, kind="native", Tr=1, Tc=1,
+        )
+        k_local_t_c1_lmem = torch.zeus.local_memory.from_tensor(
+            zero_K_T, kind="native", Tr=1, Tc=1,
+        )
+
         return {
             "latent_kv_pool":   latent_pool,
             "index_body_pool":  body_pool,
@@ -223,6 +252,11 @@ class Glm5NextDsaAttn:
             "block_table":      block_table,
             "seq_lens":         seq_lens,
             "page_size":        int(page_size),
+            # K_local gather LocalMem pool (zero-init, 跨 step 复用)
+            "k_local_c0":       k_local_c0_lmem,
+            "k_local_c1":       k_local_c1_lmem,
+            "k_local_t_c0":     k_local_t_c0_lmem,
+            "k_local_t_c1":     k_local_t_c1_lmem,
         }
 
     # ── Zeus forward (paged) ───────────────────────────────────
@@ -279,6 +313,7 @@ class Glm5NextDsaAttn:
         seq_lens_z = paged_state["seq_lens"]
         page_size = paged_state["page_size"]
         max_logical_s = page_size * block_table_z.shape[1]
+        positions_z = torch.arange(max_logical_s, dtype=torch.int32).to("zeus")
 
         # #1  q_a_proj + RMSNorm → q_lora
         q_lora_z = sgl_kernel_zeus.dsa_q_a_proj_norm(
@@ -337,7 +372,6 @@ class Glm5NextDsaAttn:
 
         # #7  local top-K (cp=1 → IS global top-K). Output is **logical** position
         # in [0, max_logical_s); -inf positions naturally lose to valid ones.
-        positions_z = torch.arange(max_logical_s, dtype=torch.int32).to("zeus")
         _top_lg_z, top_pos_z = sgl_kernel_zeus.dsa_local_topk_radix(
             logits_z, positions_z, Ktop=cfg.Ktop,
         )
@@ -347,11 +381,19 @@ class Glm5NextDsaAttn:
             top_pos_z, block_table_z, page_size=page_size,
         )
 
-        # #9  paged gather. Returns 6 device buffers (per-core c0/c1 broadcast).
-        # No CPU loop, no D2H, all on device.
-        K_c0, K_c1, K_T_c0, K_T_c1, m_c0, m_c1 = (
+        # #9  paged gather. K_local c0/c1/T_c0/T_c1 复用 paged_state 里 init 时
+        # 创建的 zero-init LocalMem pool (kind='native'), 跨 step 不重新分配,
+        # invalid slot 始终保持 zero (避免 sparse_mqa 的乘 0 mask 撞上未初始化
+        # NaN). masks 由 sim 写满, 用临时 device buffer 即可.
+        K_c0   = paged_state["k_local_c0"]
+        K_c1   = paged_state["k_local_c1"]
+        K_T_c0 = paged_state["k_local_t_c0"]
+        K_T_c1 = paged_state["k_local_t_c1"]
+        _, _, _, _, m_c0, m_c1 = (
             sgl_kernel_zeus.dsa_latent_k_gather_paged(
                 phys_slot_z, latent_pool_z,
+                k_local_c0=K_c0, k_local_c1=K_c1,
+                k_local_t_c0=K_T_c0, k_local_t_c1=K_T_c1,
             )
         )
 
