@@ -25,6 +25,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.marlin_utils import (
     apply_awq_marlin_linear,
     awq_to_marlin_zero_points,
@@ -60,15 +61,25 @@ if _is_npu:
     import torch_npu
 
 if _is_cuda:
-    from sgl_kernel import awq_dequantize, awq_marlin_moe_repack, awq_marlin_repack
+    from sglang.jit_kernel.awq_dequantize import awq_dequantize
+    from sglang.jit_kernel.awq_marlin_repack import (
+        awq_marlin_moe_repack,
+        awq_marlin_repack,
+    )
+    from sglang.srt.utils.custom_op import register_custom_op_from_extern
 
+    awq_dequantize = register_custom_op_from_extern(
+        awq_dequantize,
+        fake_impl=lambda qweight, scales, qzeros: qweight.new_empty(
+            qweight.shape[:-1] + (qweight.shape[-1] * 8,), dtype=scales.dtype
+        ),
+    )
 
 elif _is_hip:
     from sglang.srt.layers.quantization.awq_triton import (
         awq_dequantize_triton as awq_dequantize,
     )
 
-    warnings.warn(f"HIP does not support fused_marlin_moe currently.")
 elif _is_xpu:
     from sgl_kernel import awq_dequantize
 
@@ -196,8 +207,11 @@ class AWQMarlinConfig(QuantizationConfig):
         lm_head_quantized: bool,
         modules_to_not_convert: Optional[list[str]],
         full_config: dict[str, Any],
+        linear_fp8_config: Optional[Any] = None,
     ) -> None:
         super().__init__()
+        if _is_hip:
+            warnings.warn(f"HIP does not support fused_marlin_moe currently.")
         self.pack_factor = 32 // weight_bits  # packed into int32
         self.group_size = group_size
         self.zero_point = zero_point
@@ -205,6 +219,7 @@ class AWQMarlinConfig(QuantizationConfig):
         self.weight_bits = weight_bits
         self.modules_to_not_convert = modules_to_not_convert or []
         self.full_config = full_config
+        self.linear_fp8_config = linear_fp8_config
 
         if self.weight_bits not in self.TYPE_MAP:
             raise ValueError(
@@ -255,6 +270,24 @@ class AWQMarlinConfig(QuantizationConfig):
         modules_to_not_convert = cls.get_from_keys_or(
             config, ["modules_to_not_convert"], None
         )
+
+        # GLM NOTE: Parse linear_fp8_config if present (for mixed quantization scenarios)
+        # Format: {"activation_scheme": "dynamic", "fmt": "e4m3",
+        #          "quant_method": "fp8", "weight_block_size": [128, 128]}
+        linear_fp8_config = None
+        if "linear_fp8_config" in config:
+            from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+            fp8_cfg = config["linear_fp8_config"]
+            # Check if it's fp8 format based on quant_method field
+            is_fp8 = fp8_cfg.get("quant_method") == "fp8"
+            linear_fp8_config = Fp8Config(
+                is_checkpoint_fp8_serialized=is_fp8,
+                activation_scheme=fp8_cfg.get("activation_scheme", "dynamic"),
+                ignored_layers=fp8_cfg.get("ignored_layers"),
+                weight_block_size=fp8_cfg.get("weight_block_size"),
+            )
+
         return cls(
             weight_bits,
             group_size,
@@ -262,6 +295,7 @@ class AWQMarlinConfig(QuantizationConfig):
             lm_head_quantized,
             modules_to_not_convert,
             config,
+            linear_fp8_config=linear_fp8_config,
         )
 
     @classmethod
@@ -299,6 +333,8 @@ class AWQMarlinConfig(QuantizationConfig):
         ):
             if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
                 return UnquantizedLinearMethod()
+            if self.linear_fp8_config is not None:
+                return Fp8LinearMethod(self.linear_fp8_config)
             # Check if the layer is supported by AWQMarlin.
             if not check_marlin_supports_layer(layer, self.group_size):
                 logger.warning_once(
@@ -627,8 +663,8 @@ class AWQLinearAscendMethod(AWQLinearMethod):
         qzeros_tmp = -(qzeros_tmp - 8)
         qzeros_tmp = qzeros_tmp.to(layer.scales.data.dtype)
 
-        layer.qzeros = torch.nn.Parameter(qzeros_tmp, requires_grad=False)
-        layer.qweight = torch.nn.Parameter(qweight_tmp, requires_grad=False)
+        layer.zeros = torch.nn.Parameter(qzeros_tmp, requires_grad=False)
+        layer.weight = torch.nn.Parameter(qweight_tmp, requires_grad=False)
 
     def apply(
         self,
@@ -636,9 +672,9 @@ class AWQLinearAscendMethod(AWQLinearMethod):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        qweight = layer.qweight
+        qweight = layer.weight
         scales = layer.scales
-        qzeros = layer.qzeros
+        qzeros = layer.zeros
         pack_factor = self.quant_config.pack_factor
         out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])
@@ -946,18 +982,6 @@ class AWQMoEAscendMethod(AWQMoEMethod):
 
 # Register fake implementations for torch.compile support
 if _is_cuda:
-
-    @register_fake_if_exists("sgl_kernel::awq_dequantize")
-    def _(
-        qweight,
-        scales,
-        qzeros,
-        ch_axis,
-        group_size,
-        num_bits,
-    ):
-        out_shape = qweight.shape[:-1] + (qweight.shape[-1] * 32 // num_bits,)
-        return qweight.new_empty(out_shape, dtype=scales.dtype)
 
     @register_fake_if_exists("sgl_kernel::awq_marlin_repack")
     def _(b_q_weight, size_k, size_n, num_bits):

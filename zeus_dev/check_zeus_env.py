@@ -10,10 +10,20 @@ import sys
 from pathlib import Path
 
 
-EXPECTED_TORCH = "2.9.1"
-EXPECTED_TORCHVISION = "0.24.1"
+EXPECTED_TORCH = "2.10.0"
+EXPECTED_TORCHVISION = "0.25.0"
 EXPECTED_TORCHAO = "0.9.0"
-KNOWN_PYTORCH_BUILDS = {"cpu", "cu118", "cu121", "cu124", "cu126", "cu128", "rocm6.3"}
+KNOWN_PYTORCH_BUILDS = {
+    "cpu",
+    "cu118",
+    "cu121",
+    "cu124",
+    "cu126",
+    "cu128",
+    "cu129",
+    "rocm6.3",
+    "xpu",
+}
 
 
 def fail(message: str) -> None:

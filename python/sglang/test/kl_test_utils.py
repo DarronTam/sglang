@@ -1,6 +1,7 @@
 import inspect
 import json
 import os
+import random
 
 import numpy as np
 import requests
@@ -79,8 +80,9 @@ def get_input_ids(
             break
         text = format_longbench_v2_example(example)
         tokens = tokenizer.encode(text)
-        # Truncate to max_tokens
-        input_ids.append(tokens[:max_prompt_tokens])
+        # Truncate to a random length between 0.5x and 1.5x of max_prompt_tokens
+        truncate_len = int(max_prompt_tokens * random.uniform(0.5, 1.5))
+        input_ids.append(tokens[:truncate_len])
 
     # Save to local cache
     with open(cache_file, "w") as f:
@@ -206,7 +208,7 @@ def test_input_output_logprobs_match_helper(
 def test_input_output_logprobs_match_prefill_cache_hit_helper(
     base_url, ACC_THRESHOLDS, model_name, max_samples=None, max_new_tokens=8192
 ):
-    server_info = requests.get(base_url + "/get_server_info").json()
+    server_info = requests.get(base_url + "/server_info").json()
     if server_info["disable_radix_cache"]:
         print("Radix cache is disabled, skipping test")
         return
@@ -259,7 +261,7 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
 def test_input_output_logprobs_match_decode_cache_hit_helper(
     base_url, ACC_THRESHOLDS, model_name, max_samples=None, max_new_tokens=8192
 ):
-    server_info = requests.get(base_url + "/get_server_info").json()
+    server_info = requests.get(base_url + "/server_info").json()
     if server_info["disable_radix_cache"]:
         print("Radix cache is disabled, skipping test")
         return

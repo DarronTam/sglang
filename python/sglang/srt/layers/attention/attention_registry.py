@@ -104,9 +104,22 @@ def create_triton_backend(runner):
 
 @register_attention_backend("zeus")
 def create_zeus_backend(runner):
-    from sglang.srt.layers.attention.zeus_backend import ZeusAttnBackend
+    from sglang.srt.hardware_backend.zeus.attention.zeus_backend import (
+        ZeusAttnBackend,
+    )
 
     return ZeusAttnBackend(runner)
+
+
+@register_attention_backend("zeus_mla")
+def create_zeus_mla_backend(runner):
+    if not runner.use_mla_backend:
+        raise ValueError("zeus_mla backend can only be used with MLA models.")
+    from sglang.srt.hardware_backend.zeus.attention.zeus_mla_backend import (
+        ZeusMLABackend,
+    )
+
+    return ZeusMLABackend(runner)
 
 
 @register_attention_backend("torch_native")
@@ -192,24 +205,32 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
     assert not (
         runner.hybrid_gdn_config is not None and runner.use_mla_backend
     ), "hybrid_gdn can only be used with non-MLA models."
-
     if cfg := runner.mambaish_config:
         from sglang.srt.layers.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-            GDNAttnBackend,
             HybridLinearAttnBackend,
-            KimiLinearAttnBackend,
             Mamba2AttnBackend,
+        )
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+        from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+        from sglang.srt.layers.attention.linear.lightning_backend import (
+            LightningAttentionBackend,
+        )
+        from sglang.srt.layers.attention.linear.utils import (
+            initialize_linear_attn_config,
         )
         from sglang.srt.utils import is_blackwell, is_npu
 
         check_environments()
+        initialize_linear_attn_config(runner.server_args)
         if runner.hybrid_gdn_config is not None:
             if is_blackwell():
                 assert (
                     runner.server_args.attention_backend == "triton"
                     or runner.server_args.attention_backend == "trtllm_mha"
-                ), "triton or trtllm_mha backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend triton or --attention-backend trtllm_mha to specify the backend."
+                    or runner.server_args.attention_backend == "fa4"
+                    or runner.server_args.attention_backend == "flashinfer"
+                ), "triton, trtllm_mha, fa4, or flashinfer backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend to specify the backend."
             if is_npu():
                 assert (
                     runner.server_args.attention_backend == "ascend"
@@ -219,7 +240,11 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         elif runner.mamba2_config is not None:
             linear_attn_backend = Mamba2AttnBackend(runner)
         elif runner.kimi_linear_config is not None:
-            linear_attn_backend = KimiLinearAttnBackend(runner)
+            linear_attn_backend = KDAAttnBackend(runner)
+        elif runner.glm_linear_config is not None:
+            linear_attn_backend = KDAAttnBackend(runner)
+        elif runner.hybrid_lightning_config is not None:
+            linear_attn_backend = LightningAttentionBackend(runner)
         else:
             raise ValueError(
                 "Expected hybrid GDN or NemotronH models, but got unknown model."

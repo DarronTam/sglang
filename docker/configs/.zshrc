@@ -1,5 +1,9 @@
 export ZSH="/root/.oh-my-zsh"
 
+if [[ -z "$TERM" || "$TERM" == dumb ]]; then
+    export TERM=xterm-256color
+fi
+
 # Theme
 ZSH_THEME="robbyrussell"
 
@@ -11,12 +15,29 @@ plugins=(
     zsh-syntax-highlighting
 )
 
-source $ZSH/oh-my-zsh.sh
+if [[ -f "$ZSH/oh-my-zsh.sh" ]]; then
+    source "$ZSH/oh-my-zsh.sh"
+else
+    autoload -Uz compinit && compinit
+fi
+
+autoload -Uz colors && colors
+
+export CLICOLOR=1
+if command -v dircolors >/dev/null 2>&1; then
+    eval "$(dircolors -b)"
+fi
+
+zstyle ':completion:*' list-colors "${(s.:.)LS_COLORS}"
 
 # Aliases
-alias ll='ls -alF'
-alias la='ls -A'
-alias l='ls -CF'
+alias ls='ls --color=auto'
+alias ll='ls -alF --color=auto'
+alias la='ls -A --color=auto'
+alias l='ls -CF --color=auto'
+alias grep='grep --color=auto'
+alias egrep='egrep --color=auto'
+alias fgrep='fgrep --color=auto'
 alias vi='vim'
 
 # Enhanced history

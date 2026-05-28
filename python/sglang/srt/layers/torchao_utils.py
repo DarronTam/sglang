@@ -45,8 +45,7 @@ def apply_torchao_config_to_model(
     if torchao_config == "" or torchao_config is None:
         return model
 
-    # Lazy import to suppress some warnings and avoid pulling torchao when
-    # no torchao config is requested (e.g. pure-zeus / cpu environments).
+    # Lazy import to suppress some warnings
     from torchao.quantization import (
         float8_dynamic_activation_float8_weight,
         float8_weight_only,

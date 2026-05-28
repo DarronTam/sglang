@@ -2,6 +2,7 @@ from functools import lru_cache
 from typing import Optional, Union
 
 import torch
+from sgl_kernel.debug_utils import maybe_wrap_debug_kernel
 
 try:
     from sgl_kernel import flash_ops
@@ -9,11 +10,6 @@ except:
     raise ImportError(
         "Can not import FA3 in sgl_kernel. Please check your installation."
     )
-
-try:
-    from ._fa4_interface import flash_attn_varlen_func as flash_attn_varlen_func_v4
-except ImportError:
-    flash_attn_varlen_func_v4 = None
 
 
 @lru_cache(maxsize=1)
@@ -36,6 +32,7 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+@maybe_wrap_debug_kernel
 def flash_attn_with_kvcache(
     q,
     k_cache,
@@ -68,6 +65,8 @@ def flash_attn_with_kvcache(
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     sinks=None,
+    score_mod=None,
+    aux_tensors=None,
     ver=3,
 ):
     """
@@ -113,10 +112,12 @@ def flash_attn_with_kvcache(
     Note: Does not support backward pass.
 
     Arguments:
-        q: (batch_size, seqlen, nheads, headdim)
+        q: (batch_size, seqlen, nheads, headdim). Pass None to skip Q@K^T (MLA-no-rope /
+            only_qv mode, requires qv); the C++ side allocates an internal placeholder.
         k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no page_table,
             or (num_blocks, page_block_size, nheads_k, headdim) if there's a page_table (i.e. paged KV cache)
-            page_block_size must be a multiple of 256.
+            page_block_size must be a multiple of 256. Pass None alongside q=None to skip K
+            traffic entirely (only_qv mode); a placeholder is allocated internally.
         v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim_v) if there's no page_table,
             or (num_blocks, page_block_size, nheads_k, headdim_v) if there's a page_table (i.e. paged KV cache)
         k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate
@@ -149,6 +150,8 @@ def flash_attn_with_kvcache(
            to automatically determine the number of splits.
            Don't change this unless you know what you are doing.
         return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
+        score_mod [optional]: A callable that takes the attention scores and applies a modification.
+        aux_tensors [optional]: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
 
     Return:
         out: (batch_size, seqlen, nheads, headdim).
@@ -156,51 +159,31 @@ def flash_attn_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
-    if ver == 4:
-        assert (
-            flash_attn_varlen_func_v4 is not None
-        ), "FA4 is not available, please check your installation."
-        # Using `(-1, -1)` as no sliding window causes correctness issues for FA4.
-        assert (
-            k is None and v is None
-        ), "FA4 does not support updating KV cache in-place."
-        assert (
-            rotary_cos is None and rotary_sin is None and rotary_seqlens is None
-        ), "FA4 does not support rotary embedding."
-        assert (
-            cache_batch_idx is None and cache_leftpad is None
-        ), "FA4 does not support non-consecutive batch indices or left padding."
-        assert (
-            q_descale is None and k_descale is None and v_descale is None
-        ), "FA4 does not support descale."
 
-        if window_size == (-1, -1):
-            window_size = (None, None)
-        return flash_attn_varlen_func_v4(
-            q=q,
-            k=k_cache,
-            v=v_cache,
-            cu_seqlens_q=cu_seqlens_q,
-            seqused_k=cache_seqlens,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            softcap=softcap,
-            pack_gqa=pack_gqa,
-            return_softmax_lse=return_softmax_lse,
-            learnable_sink=sinks,
-            page_table=page_table,
-        )
+    # MLA-no-rope path: when the layer has no rope head dim, caller passes q=None
+    # and/or k_cache=None. We forward head_dim==0 sentinel tensors to the C++
+    # side, which detects the sentinel and routes to the "Qv@V only" kernel
+    # (the kernel never reads Q / K_cache contents in that mode).
+    if q is None or k_cache is None:
+        if qv is None or v_cache is None:
+            raise ValueError(
+                "When q or k_cache is None (MLA-no-rope path), both qv and v_cache must be provided"
+            )
+        if k_cache is None:
+            k_cache = v_cache.new_empty((*v_cache.shape[:-1], 0))
+        if q is None:
+            q = qv.new_empty((*qv.shape[:-1], 0))
 
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
-    assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+    # NOTE: v_cache.stride(-1) == 1 is intentionally NOT asserted here; v_cache
+    # may be V_colmajor (stride(-3)==1) and is auto-contiguified below.
     if softmax_scale is None:
         softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
             -0.5
         )
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(
-            (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
+            (q.shape[0],), cache_seqlens, dtype=torch.int32, device=v_cache.device
         )
         cache_seqlens = maybe_contiguous(cache_seqlens)
 
@@ -261,6 +244,7 @@ def flash_attn_with_kvcache(
     return (out, softmax_lse, *rest) if return_softmax_lse else out
 
 
+@maybe_wrap_debug_kernel
 def flash_attn_varlen_func(
     q,
     k,
@@ -286,32 +270,10 @@ def flash_attn_varlen_func(
     sm_margin=0,
     return_softmax_lse=False,
     sinks=None,
+    score_mod=None,
+    aux_tensors=None,
     ver=3,
 ):
-    if ver == 4:
-        assert (
-            flash_attn_varlen_func_v4 is not None
-        ), "FA4 is not available, please check your installation."
-        # Using `(-1, -1)` as no sliding window causes correctness issues for FA4.
-        if window_size == (-1, -1):
-            window_size = (None, None)
-        return flash_attn_varlen_func_v4(
-            q,
-            k,
-            v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            seqused_q=seqused_q,
-            seqused_k=seqused_k,
-            page_table=page_table,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            softcap=softcap,
-            pack_gqa=pack_gqa,
-            learnable_sink=sinks,
-            return_softmax_lse=return_softmax_lse,
-        )
 
     if not is_fa3_supported():
         raise NotImplementedError(
@@ -367,3 +329,66 @@ def flash_attn_varlen_func(
     )
 
     return (out, softmax_lse, *rest) if return_softmax_lse else out
+
+
+def get_scheduler_metadata(
+    batch_size: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    num_heads: int,
+    num_heads_k: int,
+    headdim: int,
+    cache_seqlens: torch.Tensor,
+    qkv_dtype=torch.bfloat16,
+    headdim_v: Optional[int] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    leftpad_k: Optional[torch.Tensor] = None,
+    page_size: Optional[int] = None,
+    max_seqlen_k_new: int = 0,
+    causal: bool = False,
+    window_size=(-1, -1),
+    attention_chunk: int = 0,
+    has_softcap: bool = False,
+    num_splits: int = 0,
+    pack_gqa: Optional[bool] = None,
+    sm_margin: int = 0,
+):
+    """Precompute FA3 tile scheduling metadata.
+
+    Call this once per batch (not per layer) and pass the result as
+    scheduler_metadata to flash_attn_with_kvcache / flash_attn_varlen_func.
+    This avoids the prepare_varlen_num_blocks kernel running on every layer.
+    """
+    cache_seqlens = maybe_contiguous(cache_seqlens)
+    if headdim_v is None:
+        headdim_v = headdim
+
+    return torch.ops.sgl_kernel.get_scheduler_metadata(
+        batch_size,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_heads,
+        num_heads_k,
+        headdim,
+        headdim_v,
+        qkv_dtype,
+        cache_seqlens,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_k_new,
+        seqused_q,
+        leftpad_k,
+        page_size,
+        max_seqlen_k_new,
+        causal,
+        window_size[0],
+        window_size[1],
+        attention_chunk,
+        has_softcap,
+        num_splits,
+        pack_gqa,
+        sm_margin,
+    )

@@ -3,8 +3,10 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import time
 import uuid
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 import jinja2
@@ -28,6 +30,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     FunctionResponse,
     LogProbs,
     MessageProcessingResult,
+    SglExt,
     ToolCall,
     ToolCallProcessingResult,
     ToolChoice,
@@ -36,7 +39,10 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
+    process_cached_tokens_details_from_ret,
     process_hidden_states_from_ret,
+    process_routed_experts_from_ret,
+    should_include_usage,
     to_openai_style_logprobs,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
@@ -55,8 +61,36 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _extract_max_dynamic_patch(request: ChatCompletionRequest):
+    img_vals = []
+    vid_vals = []
+    for msg in request.messages or []:
+        content = getattr(msg, "content", None)
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            # pydantic object or dict type
+            if getattr(part, "type", None) == "image_url":
+                iu = getattr(part, "image_url", None)
+                mdp = getattr(iu, "max_dynamic_patch", None) if iu else None
+                if mdp is not None:
+                    img_vals.append(int(mdp))
+            elif getattr(part, "type", None) == "video_url":
+                vu = getattr(part, "video_url", None)
+                mdp = getattr(vu, "max_dynamic_patch", None) if vu else None
+                if mdp is not None:
+                    vid_vals.append(int(mdp))
+
+    # TODO(yuan-luo): per-item max_dynamic_patch for both image and video
+    img_max_dynamic_patch = min(img_vals) if img_vals else None
+    vid_max_dynamic_patch = min(vid_vals) if vid_vals else None
+    return img_max_dynamic_patch, vid_max_dynamic_patch
+
+
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
+
+    _default_sampling_params_logged = False
 
     def __init__(
         self,
@@ -72,10 +106,14 @@ class OpenAIServingChat(OpenAIServingBase):
         self.default_sampling_params = (
             self.tokenizer_manager.model_config.get_default_sampling_params()
         )
-        if self.default_sampling_params:
+        if (
+            self.default_sampling_params
+            and not OpenAIServingChat._default_sampling_params_logged
+        ):
             logger.info(
                 f"Using default chat sampling params from model generation config: {self.default_sampling_params}",
             )
+            OpenAIServingChat._default_sampling_params_logged = True
 
         # Check if the model is a GPT-OSS model
         self.is_gpt_oss = (
@@ -86,14 +124,131 @@ class OpenAIServingChat(OpenAIServingBase):
 
         self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
 
+        self.init_glm()
+
+    def init_glm(self):
+        # Decoding constraint module
+        self._glm_constraint_module = None
+        self._glm_special_token_config = None
+        self._ignore_decoding_constraint_exception = (
+            self.tokenizer_manager.server_args.glm_ignore_decoding_constraint_exception
+        )
+        # Map tool_call_parser to chat_template_version
+        _parser_to_version = {
+            "glm45": "glm45",
+            "glm45stream": "glm45",
+            "glm47": "glm47",
+            "glm5": "glm47",
+            "glm5stream": "glm47",
+        }
+        self._glm_chat_template_version = _parser_to_version.get(
+            self.tool_call_parser
+        )
+
+        constraint_module_path = (
+            self.tokenizer_manager.server_args.glm_decoding_constraint_module
+        )
+        if constraint_module_path:
+            if self.tool_call_parser and self._glm_chat_template_version is None:
+                raise ValueError(
+                    f"Unsupported tool_call_parser '{self.tool_call_parser}' for decoding constraint. "
+                    f"Supported parsers: {list(_parser_to_version.keys())}"
+                )
+            self._load_glm_constraint_module(constraint_module_path)
+
+    def _handle_last_assistant_message(
+        self,
+        messages: List[Dict[str, Any]],
+        request: ChatCompletionRequest,
+    ) -> tuple[List[Dict[str, Any]], Optional[str]]:
+        """
+        Handle continue_final_message feature: separate final assistant message.
+
+        If continue_final_message is enabled and the last message is from assistant,
+        extract its content and remove it from the message list.
+        If continue_final_message is False and the last message is from assistant,
+        convert it to a user message to ensure the last message is always from user.
+
+        Only processes text-based content (strings), ignoring multimodal content (lists).
+
+        Args:
+            messages: List of message dictionaries
+            request: ChatCompletionRequest with continue_final_message flag
+
+        Returns:
+            Tuple of (processed_messages, assistant_prefix)
+            - processed_messages: Messages with last assistant message handled appropriately
+            - assistant_prefix: Content of the last assistant message (string only), or None
+        """
+        assistant_prefix = None
+        if messages and messages[-1].get("role") == "assistant":
+            last_content = messages[-1].get("content")
+            # Only process string content, ignore multimodal content (lists)
+            if isinstance(last_content, str):
+                if request.continue_final_message:
+                    # Extract content and remove the assistant message
+                    assistant_prefix = last_content
+                    messages = messages[:-1]
+                else:
+                    # Convert the last assistant message to user message
+                    messages[-1] = {"role": "user", "content": last_content}
+        return messages, assistant_prefix
+
+    def _append_assistant_prefix_to_prompt_ids(
+        self, prompt_ids: List[int], assistant_prefix: str
+    ) -> List[int]:
+        """
+        Append assistant prefix to prompt_ids.
+
+        Args:
+            prompt_ids: Current prompt token IDs
+            assistant_prefix: Assistant message content to append
+
+        Returns:
+            Updated prompt_ids with assistant prefix appended
+        """
+        encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
+        if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
+            encoded = encoded[1:]
+        return prompt_ids + encoded
+
     def _use_dpsk_v32_encoding(self) -> bool:
         has_chat_template = (
             self.tokenizer_manager.tokenizer is not None
             and self.tokenizer_manager.tokenizer.chat_template is not None
         )
-        architectures = self.tokenizer_manager.server_args.get_hf_config().architectures
+        architectures = self.tokenizer_manager.model_config.hf_config.architectures
         is_dpsk_v32 = "DeepseekV3" in architectures[0] if architectures else False
         return not has_chat_template and is_dpsk_v32
+
+    def _load_glm_constraint_module(self, module_path: str):
+        """Load constraint module and initialize special token config."""
+        import importlib
+
+        module = importlib.import_module(module_path)
+
+        if not hasattr(module, "generation_constraint"):
+            raise AttributeError(
+                f"Module {module_path} missing 'generation_constraint'"
+            )
+        if not hasattr(module, "get_special_token_config"):
+            raise AttributeError(
+                f"Module {module_path} missing 'get_special_token_config'"
+            )
+
+        self._glm_constraint_module = module
+        self._glm_special_token_config = module.get_special_token_config(
+            self.tokenizer_manager.tokenizer
+        )
+        logger.info(f"Loaded decoding constraint module: {module_path}")
+
+    def _get_glm_enable_thinking(self, request: ChatCompletionRequest) -> bool:
+        """Get enable_thinking for constraint, default True."""
+        if request.chat_template_kwargs:
+            val = request.chat_template_kwargs.get("enable_thinking")
+            if val is not None:
+                return bool(val)
+        return True
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -133,7 +288,7 @@ class OpenAIServingChat(OpenAIServingBase):
             max_output_tokens
             and server_context_length
             and max_output_tokens > server_context_length
-        ):
+        ) and not self.tokenizer_manager.server_args.allow_auto_truncate:
             return (
                 f"max_completion_tokens is too large: {max_output_tokens}."
                 f"This model supports at most {server_context_length} completion tokens."
@@ -156,6 +311,11 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.chat_template_kwargs
             else None
         )
+        if self.is_gpt_oss and reasoning_effort == "none":
+            raise ValueError(
+                f"Harmony does not support reasoning effort {reasoning_effort}"
+            )
+
         if reasoning_effort is not None:
             request.reasoning_effort = reasoning_effort
 
@@ -164,6 +324,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
+
+        request._prompt_ids = processed_messages.prompt_ids
+        request._constraint_string = processed_messages.constraint_string
 
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
@@ -184,17 +347,16 @@ class OpenAIServingChat(OpenAIServingBase):
         # Extract custom labels from raw request headers
         custom_labels = self.extract_custom_labels(raw_request)
 
+        # Extract routed_dp_rank from header (has higher priority than body)
+        effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
+            raw_request, request.routed_dp_rank
+        )
+
         # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
-        if lora_path:
-            first_adapter = (
-                lora_path
-                if isinstance(lora_path, str)
-                else next((a for a in lora_path if a), None)
-            )
-            if first_adapter:
-                self._validate_lora_enabled(first_adapter)
-
+        img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
+            request
+        )
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
@@ -211,14 +373,20 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
-            data_parallel_rank=request.data_parallel_rank,
+            routed_dp_rank=effective_routed_dp_rank,
+            disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
             return_hidden_states=request.return_hidden_states,
+            return_routed_experts=request.return_routed_experts,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             require_reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,
+            routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            image_max_dynamic_patch=img_max_dynamic_patch,
+            video_max_dynamic_patch=vid_max_dynamic_patch,
+            max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
         )
 
         return adapted_request, request
@@ -231,7 +399,40 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.is_gpt_oss:
             request.skip_special_tokens = False
 
+        self._patch_mistral_skip_special_tokens(request)
+
         tool_call_constraint = None
+        constraint_string = None
+
+        # Check if decoding constraint module is enabled
+        if self._glm_constraint_module is not None and request.enable_constraint:
+            enable_thinking = self._get_glm_enable_thinking(request)
+
+            # Extract functions from tools (None if no tools)
+            functions = None
+            if request.tools and request.tool_choice != "none":
+                request.skip_special_tokens = False
+                functions = [tool.function for tool in request.tools]
+
+            # Generate EBNF
+            try:
+                ebnf_grammar = self._glm_constraint_module.generation_constraint(
+                    enable_thinking=enable_thinking,
+                    functions=functions,
+                    special_tokens=self._glm_special_token_config,
+                    chat_template_version=self._glm_chat_template_version,
+                    root_name="root",
+                )
+                tool_call_constraint = ("ebnf", ebnf_grammar)
+                constraint_string = ebnf_grammar
+            except Exception:
+                if not self._ignore_decoding_constraint_exception:
+                    raise
+                import traceback
+                logger.error(
+                    "Failed to generate decoding constraint, proceeding without constraint.\n%s",
+                    traceback.format_exc(),
+                )
 
         # Apply chat template and its stop strings
         tools = None
@@ -239,23 +440,33 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
                 tools = [
-                    item.function.model_dump()
+                    item.model_dump()
                     for item in request.tools
                     if item.function.name == request.tool_choice.function.name
                 ]
             else:
-                tools = [item.function.model_dump() for item in request.tools]
-            if self.tool_call_parser:
+                tools = [item.model_dump() for item in request.tools]
+            # Only use FunctionCallParser if decoding constraint module is not enabled
+            if self.tool_call_parser and self._glm_constraint_module is None:
                 parser = FunctionCallParser(request.tools, self.tool_call_parser)
                 tool_call_constraint = parser.get_structure_constraint(
-                    request.tool_choice
+                    request.tool_choice,
+                    parallel_tool_calls=request.parallel_tool_calls,
                 )
             # Handle JSON schema constraint directly for required or named tool choice
-            if request.tool_choice == "required" or isinstance(
-                request.tool_choice, ToolChoice
+            if (
+                self._glm_constraint_module is None
+                and (
+                    request.tool_choice == "required"
+                    or isinstance(request.tool_choice, ToolChoice)
+                )
+                # GLM NOTE: For glm toolcall parser, JsonArrayParser is not available
+                and "glm" not in self.tool_call_parser
             ):
                 json_schema = get_json_schema_constraint(
-                    request.tools, request.tool_choice
+                    request.tools,
+                    request.tool_choice,
+                    parallel_tool_calls=request.parallel_tool_calls,
                 )
                 tool_call_constraint = ("json_schema", json_schema)
 
@@ -266,6 +477,7 @@ class OpenAIServingChat(OpenAIServingBase):
             result = self._apply_conversation_template(request, is_multimodal)
 
         result.tool_call_constraint = tool_call_constraint
+        result.constraint_string = constraint_string
         return result
 
     def _apply_jinja_template(
@@ -293,12 +505,39 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             messages = request.messages
             messages = [msg.model_dump() for msg in messages]
+
+            for msg in messages:
+                if msg.get("content") is None:
+                    msg["content"] = ""
+                processed_msg = process_content_for_template_format(
+                    msg,
+                    template_content_format,
+                    image_data,
+                    video_data,
+                    audio_data,
+                    modalities,
+                    use_dpsk_v32_encoding=self.use_dpsk_v32_encoding,
+                )
+                msg.update(processed_msg)
+
+            # Handle continue_final_message: separate final assistant message
+            messages, assistant_prefix = self._handle_last_assistant_message(
+                messages, request
+            )
+
+            if messages[0]["role"] != "system":
+                # insert an empty system prompt to help render tool system prompt
+                messages.insert(0, {"role": "system", "content": ""})
             if request.tools:
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
-            real_input = encode_messages(
-                messages, thinking_mode=thinking_mode, drop_thinking=False
-            )
+            real_input = encode_messages(messages, thinking_mode=thinking_mode)
             prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+
+            # Append assistant prefix if continue_final_message is enabled
+            if assistant_prefix:
+                prompt_ids = self._append_assistant_prefix_to_prompt_ids(
+                    prompt_ids, assistant_prefix
+                )
         else:
             for message in request.messages:
                 if message.content is None:
@@ -329,41 +568,42 @@ class OpenAIServingChat(OpenAIServingBase):
                         if "arguments" in item["function"] and isinstance(
                             item["function"]["arguments"], str
                         ):
-                            item["function"]["arguments"] = orjson.loads(
-                                item["function"]["arguments"]
-                            )
+                            try:
+                                _args = orjson.loads(item["function"]["arguments"])
+                                item["function"]["arguments"] = (
+                                    _args if isinstance(_args, dict) else {}
+                                )
+                            except:
+                                item["function"]["arguments"] = {}
 
                 openai_compatible_messages.append(processed_msg)
 
-            # Handle assistant prefix for continue_final_message
-            assistant_prefix = None
-            if (
-                openai_compatible_messages
-                and openai_compatible_messages[-1]["role"] == "assistant"
-            ):
-                if request.continue_final_message:
-                    assistant_prefix = openai_compatible_messages[-1]["content"]
-                    openai_compatible_messages = openai_compatible_messages[:-1]
+            # Handle continue_final_message: separate final assistant message
+            openai_compatible_messages, assistant_prefix = (
+                self._handle_last_assistant_message(openai_compatible_messages, request)
+            )
+
+            extra_template_kwargs = {}
+            if request.reasoning_effort is not None:
+                extra_template_kwargs["reasoning_effort"] = request.reasoning_effort
+            if request.chat_template_kwargs:
+                extra_template_kwargs.update(request.chat_template_kwargs)
 
             try:
+                # TODO(somefive): use more accurate truncation strategy
                 prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
                     tokenize=True,
                     add_generation_prompt=True,
                     tools=tools,
-                    reasoning_effort=request.reasoning_effort,
-                    **(
-                        request.chat_template_kwargs
-                        if request.chat_template_kwargs
-                        else {}
-                    ),
+                    return_dict=False,
+                    **extra_template_kwargs,
                 )
             except Exception as e:
-                # If the first attempt fails, try transforming the tools format
-                # This handles models like Mistral that have a different tools input format
-                # that is not compatible with OpenAI's apply_chat_template tool_call format
+                # If the first attempt fails, try with flat function-only format.
+                # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
                 tools = (
-                    [t if "function" in t else {"function": t} for t in tools]
+                    [t["function"] if "function" in t else t for t in tools]
                     if tools
                     else None
                 )
@@ -373,26 +613,19 @@ class OpenAIServingChat(OpenAIServingBase):
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
-                        reasoning_effort=request.reasoning_effort,
-                        **(
-                            request.chat_template_kwargs
-                            if request.chat_template_kwargs
-                            else {}
-                        ),
+                        return_dict=False,
+                        **extra_template_kwargs,
                     )
                 except jinja2.TemplateError as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
                     # should be treated as client errors (400 BadRequest)
                     raise ValueError(str(template_error)) from template_error
 
+            # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:
-                encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
-                if (
-                    encoded
-                    and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id
-                ):
-                    encoded = encoded[1:]
-                prompt_ids += encoded
+                prompt_ids = self._append_assistant_prefix_to_prompt_ids(
+                    prompt_ids, assistant_prefix
+                )
 
             if is_multimodal:
                 prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
@@ -482,10 +715,25 @@ class OpenAIServingChat(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: ChatCompletionRequest,
         raw_request: Request,
-    ) -> StreamingResponse:
+    ) -> Union[StreamingResponse, ErrorResponse]:
         """Handle streaming chat completion request"""
+        generator = self._generate_chat_stream(adapted_request, request, raw_request)
+
+        # Kick-start the generator to trigger validation before HTTP 200 is sent.
+        # If validation fails (e.g., context length exceeded), we can still return
+        # a proper HTTP 400 error response instead of streaming it as SSE payload.
+        try:
+            first_chunk = await generator.__anext__()
+        except ValueError as e:
+            return self.create_error_response(str(e))
+
+        async def prepend_first_chunk():
+            yield first_chunk
+            async for chunk in generator:
+                yield chunk
+
         return StreamingResponse(
-            self._generate_chat_stream(adapted_request, request, raw_request),
+            prepend_first_chunk(),
             media_type="text/event-stream",
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
@@ -510,37 +758,75 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Usage tracking
         prompt_tokens = {}
+        reasoning_tokens = {}
         completion_tokens = {}
         cached_tokens = {}
         hidden_states = {}
+        routed_experts = {}
+        output_ids_dict = {}  # For return_tokens
 
+        stream_started = False
         try:
+            include_usage, continuous_usage_stats = should_include_usage(
+                request.stream_options,
+                self.tokenizer_manager.server_args.stream_response_default_include_usage,
+            )
+
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ):
                 index = content.get("index", 0)
 
-                prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
-                completion_tokens[index] = content["meta_info"]["completion_tokens"]
+                # GLM NOTE: collect incremental token IDs if return_token_ids
+                if request.return_token_ids:
+                    incremental_output_ids = content.get("output_ids", [])
+                    if index not in output_ids_dict:
+                        output_ids_dict[index] = []
+                    output_ids_dict[index].extend(incremental_output_ids)
+
+                prompt_tokens[index] = content["meta_info"].get("prompt_tokens", 0)
+                completion_tokens[index] = content["meta_info"].get(
+                    "completion_tokens", 0
+                )
+                reasoning_tokens[index] = content["meta_info"].get(
+                    "reasoning_tokens", 0
+                )
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
+                routed_experts[index] = content["meta_info"].get("routed_experts", None)
 
                 # Handle logprobs
                 choice_logprobs = None
                 if request.logprobs:
-                    choice_logprobs = self._process_streaming_logprobs(
-                        content, n_prev_tokens.get(index, 0)
-                    )
-                    n_prev_tokens[index] = len(
-                        content["meta_info"]["output_token_logprobs"]
-                    )
+                    n_prev_token = n_prev_tokens.get(index, 0)
+                    total_output_logprobs = content["meta_info"][
+                        "output_token_logprobs_length"
+                    ]
+                    if n_prev_token < total_output_logprobs:
+                        choice_logprobs = self._process_streaming_logprobs(
+                            content, n_prev_token, total_output_logprobs
+                        )
+                    n_prev_tokens[index] = total_output_logprobs
 
-                finish_reason = content["meta_info"]["finish_reason"]
+                finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # Track finish_reason for each index
                 if finish_reason_type:
-                    finish_reasons[index] = finish_reason
+                    # If the abort is from scheduler.
+                    if finish_reason_type == "abort" and os.getenv("GLM_USE_ABORT_FINISH_REASON", "0") == "0":
+                        code = finish_reason.get(
+                            "status_code", HTTPStatus.INTERNAL_SERVER_ERROR
+                        )
+                        error = self.create_streaming_error_response(
+                            finish_reason.get("message", "Generation aborted."),
+                            code.name,
+                            code.value,
+                        )
+                        yield f"data: {error}\n\n"
+                        break
+                    else:
+                        finish_reasons[index] = finish_reason
 
                 # First chunk with role
                 if is_firsts.get(index, True):
@@ -559,9 +845,13 @@ class OpenAIServingChat(OpenAIServingBase):
                         model=request.model,
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
+                    stream_started = True
 
                 stream_buffer = stream_buffers.get(index, "")
-                delta = content["text"][len(stream_buffer) :]
+                if self.tokenizer_manager.server_args.incremental_streaming_output:
+                    delta = content["text"]
+                else:
+                    delta = content["text"][len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
 
                 # Handle reasoning content
@@ -573,6 +863,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=DeltaMessage(reasoning_content=reasoning_text),
+                            logprobs=choice_logprobs,
                             finish_reason=None,
                         )
                         chunk = ChatCompletionStreamResponse(
@@ -583,12 +874,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
 
                         # Add usage stats if continuous_usage_stats is enabled
-                        if (
-                            request.stream_options
-                            and request.stream_options.continuous_usage_stats
-                        ):
+                        if continuous_usage_stats:
                             chunk.usage = UsageProcessor.calculate_token_usage(
                                 prompt_tokens=prompt_tokens.get(index, 0),
+                                reasoning_tokens=reasoning_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
                             )
 
@@ -603,10 +892,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     async for chunk in self._process_tool_call_stream(
                         index,
                         delta,
+                        choice_logprobs,
                         parser_dict,
                         content,
                         request,
                         has_tool_calls,
+                        continuous_usage_stats,
                     ):
                         if chunk:
                             yield chunk
@@ -638,12 +929,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
 
                         # Add usage stats if continuous_usage_stats is enabled
-                        if (
-                            request.stream_options
-                            and request.stream_options.continuous_usage_stats
-                        ):
+                        if continuous_usage_stats:
                             chunk.usage = UsageProcessor.calculate_token_usage(
                                 prompt_tokens=prompt_tokens.get(index, 0),
+                                reasoning_tokens=reasoning_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
                             )
 
@@ -705,25 +994,56 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
+            if request.return_routed_experts and routed_experts:
+                # Get first non-None routed_experts value
+                first_routed_experts = next(
+                    (v for v in routed_experts.values() if v is not None), None
+                )
+                if first_routed_experts is not None:
+                    routed_experts_chunk = ChatCompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=int(time.time()),
+                        choices=[],  # sglext is at response level
+                        model=request.model,
+                        sglext=SglExt(routed_experts=first_routed_experts),
+                    )
+                    yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
+
             # Additional usage chunk
-            if request.stream_options and request.stream_options.include_usage:
+            if include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
+                    reasoning_tokens,
                     completion_tokens,
-                    cached_tokens,
+                    cached_tokens=cached_tokens,
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )
+
+                # GLM NOTE: prepare metadata with token IDs if return_token_ids
+                metadata = None
+                if request.return_token_ids and output_ids_dict:
+                    prompt_ids = getattr(request, "_prompt_ids", None)
+                    metadata = {}
+                    if prompt_ids is not None and not isinstance(prompt_ids, str):
+                        metadata["input_ids"] = prompt_ids
+                    metadata["output_ids"] = [
+                        output_ids_dict.get(i, []) for i in range(request.n)
+                    ]
+
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
                     choices=[],  # Empty choices array as per OpenAI spec
                     model=request.model,
                     usage=usage,
+                    metadata=metadata,
                 )
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
         except ValueError as e:
+            if not stream_started:
+                raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
 
@@ -763,6 +1083,19 @@ class OpenAIServingChat(OpenAIServingBase):
         """Build chat completion response from generation results"""
         choices = []
 
+        # Build sglext at response level (from first ret_item, as these are per-request)
+        first_ret = ret[0]
+        routed_experts = process_routed_experts_from_ret(first_ret, request)
+        cached_tokens_details = process_cached_tokens_details_from_ret(
+            first_ret, request
+        )
+        response_sglext = None
+        if routed_experts or cached_tokens_details:
+            response_sglext = SglExt(
+                routed_experts=routed_experts,
+                cached_tokens_details=cached_tokens_details,
+            )
+
         for idx, ret_item in enumerate(ret):
             # Process logprobs
             choice_logprobs = None
@@ -788,6 +1121,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         model_type=reasoning_parser,
                         stream_reasoning=False,
                         force_reasoning=is_force_reasoning,
+                        request=request,
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
                 except Exception as e:
@@ -840,13 +1174,33 @@ class OpenAIServingChat(OpenAIServingBase):
             enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
         )
 
+        metadata = {"weight_version": ret[0]["meta_info"]["weight_version"]}
+
+        # Return constraint EBNF if requested
+        if request.return_constraint:
+            constraint = getattr(request, "_constraint_string", None)
+            if constraint is not None:
+                metadata["constraint"] = constraint
+
+        # GLM NOTE: return token IDs if return_token_ids
+        if request.return_token_ids:
+            prompt_ids = getattr(request, "_prompt_ids", None)
+            if prompt_ids is not None and not isinstance(prompt_ids, str):
+                metadata["input_ids"] = prompt_ids
+            output_ids_list = []
+            for ret_item in ret:
+                output_ids = ret_item.get("output_ids", [])
+                output_ids_list.append(output_ids)
+            metadata["output_ids"] = output_ids_list
+
         return ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
             created=created,
             model=request.model,
             choices=choices,
             usage=usage,
-            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            metadata=metadata,
+            sglext=response_sglext,
         )
 
     def _process_logprobs_tokens(
@@ -932,8 +1286,16 @@ class OpenAIServingChat(OpenAIServingBase):
         """Process tool calls in the response"""
 
         # Handle required or named tool choice
-        if tool_choice == "required" or (
-            isinstance(tool_choice, ToolChoice) and tool_choice.type == "function"
+        if (
+            (
+                tool_choice == "required"
+                or (
+                    isinstance(tool_choice, ToolChoice)
+                    and tool_choice.type == "function"
+                )
+            )
+            # GLM NOTE: For glm toolcall parser, JsonArrayParser is not available
+            and "glm" not in self.tool_call_parser
         ):
             # Set finish reason to tool_calls since we're processing tool calls
             if finish_reason["type"] == "stop":
@@ -1001,15 +1363,18 @@ class OpenAIServingChat(OpenAIServingBase):
         return ToolCallProcessingResult(None, text, finish_reason)
 
     def _process_streaming_logprobs(
-        self, content: Dict[str, Any], n_prev_token: int
+        self,
+        content: Dict[str, Any],
+        n_prev_token: int,
+        total_output_logprobs: int,
     ) -> ChoiceLogprobs:
         """Process logprobs for streaming response"""
         logprobs = to_openai_style_logprobs(
             output_token_logprobs=content["meta_info"]["output_token_logprobs"][
-                n_prev_token:
+                n_prev_token:total_output_logprobs
             ],
             output_top_logprobs=content["meta_info"].get("output_top_logprobs", [])[
-                n_prev_token:
+                n_prev_token:total_output_logprobs
             ],
         )
 
@@ -1034,6 +1399,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 self.reasoning_parser,
                 request.stream_reasoning,
                 is_force_reasoning,
+                request,
             )
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
@@ -1058,20 +1424,54 @@ class OpenAIServingChat(OpenAIServingBase):
                 idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
         return idx
 
+    def _patch_mistral_skip_special_tokens(
+        self, request: ChatCompletionRequest
+    ) -> None:
+        """Mistral uses special tokens ([THINK]/[/THINK]) for reasoning markers,
+        which get stripped when skip_special_tokens=True."""
+        if (
+            self.reasoning_parser in ["mistral"]
+            and request.reasoning_effort is not None
+            and request.reasoning_effort != "none"
+        ):
+            request.skip_special_tokens = False
+
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
-        """Judge whether the request needs reasoning"""
+        """Judge whether the request needs reasoning for hybrid reasoning models
+        NOTE: This is predefined based on model's chat template
+        """
         if not self.reasoning_parser:
             return False
         if self.reasoning_parser in ["deepseek-v3"]:
+            # Models that require explicit enable thinking (thinking=True)
             return (
                 request.chat_template_kwargs is not None
                 and request.chat_template_kwargs.get("thinking") is True
             )
-        if self.reasoning_parser in ["qwen3", "glm45"]:
-            # qwen3 and glm45 are reasoning by default
+        if self.reasoning_parser in ["kimi_k2"]:
+            # Models that thinking by default, and can be disabled by setting thinking=False
             return (
                 not request.chat_template_kwargs
-                or request.chat_template_kwargs.get("enable_thinking", True) is True
+                or request.chat_template_kwargs.get("thinking") is not False
+            )
+        if self.reasoning_parser in ["qwen3", "glm45", "glm5", "nemotron_3", "interns1"]:
+            # Models that thinking by default, and can be disabled by setting enable_thinking=False
+            return (
+                not request.chat_template_kwargs
+                or request.chat_template_kwargs.get("enable_thinking") is not False
+            )
+        if self.reasoning_parser in ["mimo"]:
+            # Models that require explicit enable thinking (enable_thinking=True)
+            return (
+                request.chat_template_kwargs is not None
+                and request.chat_template_kwargs.get("enable_thinking") is True
+            )
+        if self.reasoning_parser in ["mistral"]:
+            # Mistral models only reason when reasoning_effort is explicitly
+            # set to a value other than None/"none" (typically "high").
+            return (
+                request.reasoning_effort is not None
+                and request.reasoning_effort != "none"
             )
         return True  # default
 
@@ -1079,16 +1479,26 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         index: int,
         delta: str,
+        logprobs: Dict[str, Any],
         parser_dict: Dict[int, FunctionCallParser],
         content: Dict[str, Any],
         request: ChatCompletionRequest,
         has_tool_calls: Dict[int, bool],
+        continuous_usage_stats: bool = False,
     ):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
             # Use JSON detector directly for required or named tool choice
-            if request.tool_choice == "required" or isinstance(
-                request.tool_choice, ToolChoice
+            if (
+                (
+                    request.tool_choice == "required"
+                    or isinstance(
+                        request.tool_choice,
+                        ToolChoice,
+                    )
+                )
+                # GLM NOTE: For glm toolcall parser, JsonArrayParser is not available
+                and "glm" not in self.tool_call_parser
             ):
                 parser_dict[index] = JsonArrayParser()
             else:
@@ -1111,6 +1521,7 @@ class OpenAIServingChat(OpenAIServingBase):
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
                 delta=DeltaMessage(content=normal_text),
+                logprobs=logprobs,
                 finish_reason=None,
             )
             chunk = ChatCompletionStreamResponse(
@@ -1121,12 +1532,14 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
             # Add usage stats if continuous_usage_stats is enabled
-            if request.stream_options and request.stream_options.continuous_usage_stats:
+            if continuous_usage_stats:
                 prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
                 chunk.usage = UsageProcessor.calculate_token_usage(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
+                    reasoning_tokens=reasoning_tokens,
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
@@ -1161,6 +1574,7 @@ class OpenAIServingChat(OpenAIServingBase):
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
                 delta=DeltaMessage(tool_calls=[tool_call]),
+                logprobs=logprobs,
                 finish_reason=None,
             )
             chunk = ChatCompletionStreamResponse(
@@ -1171,12 +1585,14 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
             # Add usage stats if continuous_usage_stats is enabled
-            if request.stream_options and request.stream_options.continuous_usage_stats:
+            if continuous_usage_stats:
                 prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
                 chunk.usage = UsageProcessor.calculate_token_usage(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
+                    reasoning_tokens=reasoning_tokens,
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"

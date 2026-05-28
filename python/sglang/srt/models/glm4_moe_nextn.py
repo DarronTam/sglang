@@ -14,6 +14,7 @@
 
 """Inference-only GLM-4.5, GLM-4.6 Speculative Decoding."""
 
+import contextlib
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -22,6 +23,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.environ import temp_set_env
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -34,7 +36,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +60,7 @@ class Glm4MoeModelNextN(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
             prefix=add_prefix("embed_tokens", prefix),
         )
 
@@ -126,7 +128,15 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.quant_config = quant_config
+        if is_npu():
+            # NOTE(GLM-fix): Guard https://github.com/sgl-project/sglang/pull/22315
+            # which actually breaks speculative decoding for existing models.
+            self.needs_quant_draft = (
+                get_global_server_args().speculative_draft_model_quantization
+            )
+            quant_config = quant_config if self.needs_quant_draft else None
+        else:
+            self.needs_quant_draft = True if quant_config else False
         self.model = Glm4MoeModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -150,7 +160,19 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch)
+        # Support unquant speculative draft model
+        if self.needs_quant_draft:
+            cxt = contextlib.nullcontext()
+        else:
+            unquant_patch = {
+                "SGLANG_DEEPEP_BF16_DISPATCH": "1",
+                "DEEP_NORMAL_MODE_USE_INT8_QUANT": "0",
+            }
+            cxt = temp_set_env(allow_sglang=True, **unquant_patch)
+
+        with cxt:
+            hidden_states = self.model(input_ids, positions, forward_batch)
+
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )

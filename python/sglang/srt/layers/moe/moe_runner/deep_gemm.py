@@ -20,6 +20,7 @@ from sglang.srt.utils import (
     ceil_div,
     dispose_tensor,
     get_bool_env_var,
+    is_cuda,
     is_hip,
     is_npu,
     is_zeus,
@@ -40,10 +41,11 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_cuda = is_cuda()
 _is_zeus = is_zeus()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if not (_is_npu or _is_hip or _is_zeus):
+if not (_is_npu or _is_hip or _is_zeus) and _is_cuda:
     from sgl_kernel import silu_and_mul
 
 
@@ -53,7 +55,7 @@ _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
-@torch.compile
+@torch.compile(disable=_is_hip or _is_npu)
 def _cast_to_e8m0_with_rounding_up(x: torch.Tensor) -> torch.Tensor:
     temp = x.to(torch.float32).view(torch.int32)
     exp = torch.bitwise_right_shift(temp, 23)
@@ -114,6 +116,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         super().__init__(config)
         assert self.config.activation == "silu"
         assert self.config.is_gated
+        self.swiglu_clamp_limit = self.config.swiglu_clamp_limit
 
     def run(
         self,
@@ -176,6 +179,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
+
+        if self.swiglu_clamp_limit is not None:
+            gateup_output = _apply_swiglu_clamp_limit(
+                gateup_output, swiglu_clamp_limit=self.swiglu_clamp_limit
+            )
 
         down_input = torch.empty(
             (
@@ -269,6 +277,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         )
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
+
+        if self.swiglu_clamp_limit is not None:
+            gateup_output = _apply_swiglu_clamp_limit(
+                gateup_output, swiglu_clamp_limit=self.swiglu_clamp_limit
+            )
 
         # Act
         scale_block_size = 128
@@ -612,3 +625,15 @@ def post_permute_deep_gemm_to_deepep_normal(
         topk_ids=running_state["topk_ids"],
         topk_weights=running_state["topk_weights"],
     )
+
+
+def _apply_swiglu_clamp_limit(
+    gateup_output: torch.Tensor, swiglu_clamp_limit: float
+) -> torch.Tensor:
+    """Asymmetric clamp on swiglu pre-activation: gate to (-inf, lim], up to [-lim, lim].
+    Operates in-place on the last dim and accepts any leading shape."""
+    half = gateup_output.shape[-1] // 2
+    flat = gateup_output.view(-1, gateup_output.shape[-1])
+    flat[:, :half].clamp_(max=swiglu_clamp_limit)
+    flat[:, half:].clamp_(min=-swiglu_clamp_limit, max=swiglu_clamp_limit)
+    return gateup_output

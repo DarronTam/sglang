@@ -1,88 +1,74 @@
 #!/usr/bin/env bash
 
-set -euo pipefail
+set -u
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_BIN="${PYTHON:-python}"
+TEST_ROOT="${TEST_ROOT:-/workspace/sglang/zeus_dev}"
+REPO_ROOT="${REPO_ROOT:-/workspace/sglang}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-cd "$SCRIPT_DIR"
+export PYTHONPATH="${REPO_ROOT}/python:${PYTHONPATH:-}"
 
-usage() {
-  cat <<'EOF'
-Usage: ./run_test.sh [target]
+passed=()
+failed=()
 
-Targets:
-  all     Run all related test scripts (default)
-  smoke   Run lightweight graph capture tests
-  s1      Run test_zeus_graph_s1.py
-  e2e     Run test_zeus_graph_e2e.py
-  glm4    Run dev_glm4_moe_test.py
-  kimi    Run dev_kimi_linear_attn_test.py
-  list    Show available targets
-  help    Show this help
+mapfile -d '' py_files < <(
+  find "${TEST_ROOT}" \
+    -type d -name "__pycache__" -prune -o \
+    -type f -name "*.py" -print0 | sort -z
+)
 
-Examples:
-  ./run_test.sh
-  ./run_test.sh smoke
-  ./run_test.sh e2e
-EOF
-}
+total="${#py_files[@]}"
 
-run_py() {
-  local name="$1"
-  local script="$2"
+if [[ "${total}" -eq 0 ]]; then
+  echo "No Python scripts found under ${TEST_ROOT}"
+  exit 0
+fi
 
-  echo ""
-  echo "========== [START] ${name} =========="
-  "$PYTHON_BIN" "$script"
-  echo "========== [ PASS] ${name} =========="
-}
+echo "Found ${total} Python scripts under ${TEST_ROOT}"
+echo "Using Python: ${PYTHON_BIN}"
+echo
 
-run_smoke() {
-  run_py "S1 Graph Capture" "test_zeus_graph_s1.py"
-}
+for script in "${py_files[@]}"; do
+  rel_path="${script#"${TEST_ROOT}/"}"
 
-run_all() {
-  run_py "S1 Graph Capture" "test_zeus_graph_s1.py"
-  run_py "E2E Graph Validation" "test_zeus_graph_e2e.py"
-  run_py "GLM4 MoE Stage Align" "dev_glm4_moe_test.py"
-  run_py "Kimi Linear Attn Stage Align" "dev_kimi_linear_attn_test.py"
-}
+  echo
+  echo "*** Running script: ${rel_path} ***"
+  echo
 
-TARGET="${1:-all}"
+  (
+    cd "${TEST_ROOT}" || exit 1
+    "${PYTHON_BIN}" "${script}"
+  )
+  status=$?
 
-case "$TARGET" in
-  all)
-    run_all
-    ;;
-  smoke)
-    run_smoke
-    ;;
-  s1)
-    run_py "S1 Graph Capture" "test_zeus_graph_s1.py"
-    ;;
-  e2e)
-    run_py "E2E Graph Validation" "test_zeus_graph_e2e.py"
-    ;;
-  glm4)
-    run_py "GLM4 MoE Stage Align" "dev_glm4_moe_test.py"
-    ;;
-  kimi)
-    run_py "Kimi Linear Attn Stage Align" "dev_kimi_linear_attn_test.py"
-    ;;
-  list)
-    echo "Available targets: all smoke s1 e2e glm4 kimi"
-    ;;
-  help|-h|--help)
-    usage
-    ;;
-  *)
-    echo "Unknown target: $TARGET"
-    echo ""
-    usage
-    exit 1
-    ;;
-esac
+  if [[ "${status}" -eq 0 ]]; then
+    echo "[PASS] ${rel_path}"
+    passed+=("${rel_path}")
+  else
+    echo "[FAIL] ${rel_path} (exit code: ${status})"
+    failed+=("${rel_path} (exit code: ${status})")
+  fi
 
-echo ""
-echo "All requested tests finished."
+  echo
+done
+
+echo "============================================================"
+echo "Summary"
+echo "============================================================"
+echo "Total:  ${total}"
+echo "Passed: ${#passed[@]}"
+echo "Failed: ${#failed[@]}"
+
+if [[ "${#failed[@]}" -eq 0 ]]; then
+  echo
+  echo "All Python scripts passed."
+  exit 0
+fi
+
+echo
+echo "Failed scripts:"
+for item in "${failed[@]}"; do
+  echo "  - ${item}"
+done
+
+exit 1

@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 # `zeus_index_dtype(device)`. This guard catches regressions at the boundary.
 _ZEUS_INT32_FORWARD_FIELDS = (
     "input_ids",
+    "req_pool_indices",
     "positions",
     "mrope_positions",
     "seq_lens",
@@ -80,6 +81,10 @@ class ZeusGraphRunner(CudaGraphRunner):
 
     def _cache_loc_dtype(self):
         # Zeus attention kernels use int32 indices
+        return torch.int32
+
+    def _index_dtype(self):
+        # Zeus embedding and graph capture require int32 index buffers.
         return torch.int32
 
     def replay_prepare(

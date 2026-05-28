@@ -18,9 +18,9 @@ from typing import List, Optional, Tuple
 import torch
 
 from .base_grammar_backend import (
-    INVALID_GRAMMAR_OBJ,
     BaseGrammarBackend,
     BaseGrammarObject,
+    InvalidGrammarObject,
 )
 
 
@@ -29,6 +29,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         super().__init__()
         self.grammar = grammar
         self.think_end_id = think_end_id
+        self.accepted_tokens = []
         # -1    means thinking has not ended yet
         # 0     means just ended thinking in the last token
         # +     means number of tokens after thinking ended
@@ -52,6 +53,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def accept_token(self, token: int):
         if self.tokens_after_think_end >= 0:
             self.grammar.accept_token(token)
+        self.accepted_tokens.append(token)
         self.transfer_state(token)
 
     def is_terminated(self):
@@ -73,6 +75,8 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         if self.tokens_after_think_end >= 0:
             self.grammar.fill_vocab_mask(vocab_mask, idx)
+        else:
+            vocab_mask.fill_(-1)
 
     def move_vocab_mask(self, vocab_mask: torch.Tensor, device) -> torch.Tensor:
         return self.grammar.move_vocab_mask(vocab_mask, device)
@@ -117,7 +121,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
     ) -> Optional[BaseGrammarObject]:
         ret = self.grammar_backend._init_value_dispatch(key, reasoning)
         # avoid wrapping invalid grammar, so that the scheduler can detect it
-        if ret is None or ret is INVALID_GRAMMAR_OBJ:
+        if ret is None or isinstance(ret, InvalidGrammarObject):
             return ret
         obj = ReasonerGrammarObject(ret, self.think_end_id)
         obj.maybe_init_reasoning(reasoning)

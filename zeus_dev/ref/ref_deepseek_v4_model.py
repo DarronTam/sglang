@@ -9,7 +9,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from kernel import act_quant, fp4_act_quant, fp8_gemm, fp4_gemm, sparse_attn, hc_split_sinkhorn
+from ref_deepseek_v4_kernel import act_quant, fp4_act_quant, fp8_gemm, fp4_gemm, sparse_attn, hc_split_sinkhorn
 
 
 world_size = 1
@@ -245,10 +245,18 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = F
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
-    """Applies randomized Hadamard rotation to spread information across dims before FP8 quant."""
+    """Applies Hadamard rotation to spread information across dims before FP8 quant."""
     assert x.dtype == torch.bfloat16
-    from fast_hadamard_transform import hadamard_transform
-    return hadamard_transform(x, scale=x.size(-1) ** -0.5)
+    try:
+        from fast_hadamard_transform import hadamard_transform
+    except ImportError:
+        from sglang.jit_kernel.hadamard import hadamard_transform
+
+    hidden_size = x.size(-1)
+    assert (
+        hidden_size & (hidden_size - 1)
+    ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
+    return hadamard_transform(x, scale=hidden_size ** -0.5)
 
 
 @lru_cache(1)
@@ -814,7 +822,7 @@ if __name__ == "__main__":
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
     torch.manual_seed(0)
-    args = ModelArgs(n_hash_layers=0)
+    args = ModelArgs(n_hash_layers=0, dtype="bf16", scale_dtype="fp32", scale_fmt=None, expert_dtype=None)
     x = torch.randint(0, args.vocab_size, (2, 128))
     model = Transformer(args)
 
