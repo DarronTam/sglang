@@ -31,11 +31,12 @@ if is_npu():
     import torch_npu
 
 if is_zeus():
+    # sgl-kernel-zeus consolidated all sampling ops into the single fused
+    # `sampling_from_logits` (commit 9584f6c). The old top_k/top_p/min_p
+    # renorm + sample-from-probs entry points were removed; the zeus sampling
+    # path in this file only ever calls `sampling_from_logits`, so importing
+    # the others would just break at import time.
     from sgl_kernel_zeus import (
-        min_p_sampling_from_probs as zeus_min_p_sampling_from_probs,
-        top_k_renorm_prob as zeus_top_k_renorm_prob,
-        top_k_top_p_sampling_from_probs as zeus_top_k_top_p_sampling_from_probs,
-        top_p_renorm_prob as zeus_top_p_renorm_prob,
         sampling_from_logits as zeus_sampling_from_logits,
     )
 

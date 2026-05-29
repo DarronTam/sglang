@@ -62,12 +62,26 @@ def load_raw_config(which: str) -> dict:
 
 # ── Compare ─────────────────────────────────────────────────────
 def compare_tensors(name, ref, got, atol: float = 5e-3, rtol: float = 5e-3) -> bool:
-    """统一的对拍打印（与 dev_glm4_moe_test 一致）.
+    """统一的对拍打印 (与 dev_glm4_moe_test.compare_tensors 保持一致).
 
-    Lazy import 是为了让本模块在没有 sglang 的环境也能 import.
+    早期版本通过 lazy `import dev_glm4_moe_test` 复用,但该模块顶层会 import
+    `sglang.srt.server_args`,进而触发 fla/utils 在 import 期探测 triton driver
+    并打 "Triton is not supported" warning. compare_tensors 自身只有几行
+    `torch.allclose` + 打印, 没必要把 sglang 拖进来 — 直接内联.
     """
-    import dev_glm4_moe_test as moe_dev
-    return moe_dev.compare_tensors(name, ref, got, atol=atol, rtol=rtol)
+    a = ref.detach().float().cpu()
+    b = got.detach().float().cpu()
+    if a.shape != b.shape:
+        print(f"  [{name}] SHAPE MISMATCH: ref={a.shape} got={b.shape}")
+        return False
+    abs_diff = (a - b).abs()
+    close = torch.allclose(a, b, atol=atol, rtol=rtol)
+    status = "PASS" if close else "DIFF"
+    print(
+        f"  [{name}] {status} | max_diff={abs_diff.max().item():.6e} "
+        f"mean_diff={abs_diff.mean().item():.6e} shape={list(a.shape)}"
+    )
+    return close
 
 
 # ── Zeus chain availability ────────────────────────────────────
