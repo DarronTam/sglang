@@ -42,10 +42,10 @@ NUM_LAYERS = 2
 os.environ["ZEUS_DECODE_DUMP_PATH"] = DUMP_PATH
 os.environ["ZEUS_DECODE_NUM_LAYERS"] = str(NUM_LAYERS)
 
-assert os.path.exists(DUMP_PATH), (
-    f"先在 CUDA 上跑 dump_glm5_next_prefill_cache.py 生成 {DUMP_PATH}，"
-    f"再把文件拷到 Zeus host 同样路径"
-)
+if not os.path.exists(DUMP_PATH):
+    print(f"[SKIP] prefill dump not found: {DUMP_PATH}")
+    print("[SKIP] Run dump_glm5_next_prefill_cache.py on a CUDA host first.")
+    raise SystemExit(0)
 
 
 def _run_scheduler_with_inject_hook(*args, **kwargs):

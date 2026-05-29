@@ -38,7 +38,9 @@ import torch
 # ── REF import (bypass ref_tile_kernels_torch/__init__.py's broader imports) ──
 _THIS_DIR = Path(__file__).resolve().parent
 _ZEUS_DEV_DIR = _THIS_DIR.parent
-_REF_MHC_PATH = _ZEUS_DEV_DIR / "ref" / "ref_tile_kernels_torch" / "mhc.py"
+_REF_MHC_PATH = (
+    _ZEUS_DEV_DIR / "dev_backup" / "ref" / "ref_tile_kernels_torch" / "mhc.py"
+)
 _spec = importlib.util.spec_from_file_location("_ref_mhc", _REF_MHC_PATH)
 ref_mhc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ref_mhc)
@@ -173,7 +175,7 @@ def test_mhc_expand(cfg, num_tokens=16, seed=42):
         print_zeus_skip("mhc_expand")
         return zeus_skip_result(), None
 
-    out_z = kernel(hidden.to("zeus"), mhc)
+    out_z = kernel(hidden.to("zeus"), n=mhc).cpu().view(T, mhc, H)
     ok = compare_tensors("mhc_expand", out_ref, out_z)
     return ok, None
 
@@ -349,7 +351,7 @@ def test_mhc_sinkhorn(cfg, num_tokens=16, seed=42):
         print_zeus_skip("mhc_sinkhorn / sinkhorn_normalize")
         return zeus_skip_result(ok_ds and ok_nn), comb_ref
 
-    comb_z = kernel(comb_logits.to("zeus"), repeat, eps)
+    comb_z = kernel(comb_logits.to("zeus"), repeat=repeat, eps=eps)
     ok_num = compare_tensors("mhc_sinkhorn/numerical", comb_ref, comb_z,
                              atol=5e-5, rtol=5e-5)
     return (ok_ds and ok_nn and ok_num), comb_ref

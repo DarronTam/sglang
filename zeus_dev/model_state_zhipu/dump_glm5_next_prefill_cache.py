@@ -62,6 +62,11 @@ def main():
     print(f"  NUM_LAYERS  = {NUM_LAYERS} (0 = all)")
     print()
 
+    if not os.path.exists(MODEL_PATH):
+        print(f"[SKIP] MODEL_PATH not found: {MODEL_PATH}")
+        print("[SKIP] This CUDA dump script requires the 16B model path.")
+        return
+
     class _DumpEngine(Engine):
         run_scheduler_process_func = staticmethod(_run_scheduler_with_dump_hook)
 

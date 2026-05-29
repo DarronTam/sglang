@@ -47,7 +47,9 @@ _dummy_args.rl_on_policy_target = None
 sglang.srt.server_args.get_global_server_args = lambda *a, **kw: _dummy_args
 
 
-CONFIG_PATH = Path(__file__).parent / "config.json"
+CONFIG_PATH = (
+    Path(__file__).resolve().parents[1] / "model_state_dev" / "config_glm4.json"
+)
 REF_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
