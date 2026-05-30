@@ -1010,7 +1010,15 @@ class LogitsProcessor(nn.Module):
     ) -> torch.Tensor:
         if logits_metadata.next_token_logits_buffer is not None:
             logits_buffer = logits_metadata.next_token_logits_buffer
-            assert logits_buffer.dtype == torch.float
+            # On Zeus the buffer matches the model dtype (bf16) so the captured
+            # `copy_` stays on the dtype-matching device-side fast path and is
+            # recorded into the graph; a float32 buffer would force a
+            # dtype-converting CPU-bounce copy that is not captured, freezing
+            # decode logits at capture-time values. Other backends keep float32.
+            assert logits_buffer.dtype in (torch.float, logits.dtype), (
+                f"next_token_logits_buffer dtype {logits_buffer.dtype} "
+                f"is incompatible with logits dtype {logits.dtype}"
+            )
             logits_buffer.copy_(logits[:, : self.vocab_size])
             logits = logits_buffer
         else:

@@ -189,7 +189,15 @@ class DecodeInputBuffers(ForwardInputBuffers):
             )
             next_token_logits_buffer = torch.zeros(
                 (max_num_token, vocab_size),
-                dtype=torch.float,
+                # Zeus chip rule: a `copy_` writing logits (bf16, from
+                # lm_head) into a float32 buffer crosses dtypes and falls
+                # into the synchronous CPU-bounce path, which is *not*
+                # recorded into the captured graph. The buffer would then
+                # hold capture-time logits at every replay, decode logits
+                # collapse to a fixed token. Match the model dtype on Zeus
+                # so the copy stays on the dtype-matching D2D fast path
+                # (zenlMemcpy, captured). Other backends keep float32.
+                dtype=dtype if torch.device(device).type == "zeus" else torch.float,
             )
             mamba_track_indices = (
                 torch.zeros((max_bs,), dtype=index_dtype)
