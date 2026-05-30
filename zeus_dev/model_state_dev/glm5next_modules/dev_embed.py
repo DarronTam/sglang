@@ -11,9 +11,9 @@ module ``Glm5NextEmbed``, 暴露 ``__init__`` + ``forward`` (REF host bf16) +
 
 Chain (decode-only, 单 device, TP=1):
   - input_ids[T] int64       (host, 由调度器给出)
-  - embed_w[V, H] bf16       (LocalMem 之外: Zeus op `embedding` 直接吃 plain
-                              device tensor, 不走 LocalMem pack)
-  - REF:   out = embed_w[ids]           (torch index_select)
+  - embed_w[V, H] bf16       打成 Lmem / 2core / dense (按 feature 列切两核, 每核
+                              各一半 col; 真实 V≈155K 走不了 GDG 的 16-bit 轴)
+  - REF:   out = embed_w[ids]                                  (torch index_select)
   - Zeus:  out = sgl_kernel_zeus.embedding(ids_z, embed_w_z)   → [T, H] bf16
 
 不做的事:
@@ -26,11 +26,18 @@ Chain (decode-only, 单 device, TP=1):
   python glm5next_modules/dev_embed.py                  # 16b / both
   python glm5next_modules/dev_embed.py --config next    # next / both
   python glm5next_modules/dev_embed.py --mode zeus
+  python glm5next_modules/dev_embed.py --triton_forward # REF / Zeus-simC / Zeus-Triton 三路对拍
+
+三路对拍 (``--triton_forward``):
+  - forward             REF host bf16 index_select                        (golden A)
+  - forward_zeus        Zeus C++ Lmem 2core dense (sgl_kernel_zeus)        (golden B)
+  - forward_zeus_triton Zeus Triton-JIT Lmem 2core dense (sgl_kernel_zeus_triton)
+  三者皆 pure row-gather, 应当 bit-exact.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -72,6 +79,58 @@ def load_cfg(which: str) -> Glm5NextEmbedConfig:
     return Glm5NextEmbedConfig.from_json(config_path(which), name=which)
 
 
+# ── sgl-kernel-zeus-triton (sibling JIT package) ────────────────
+# Editable-installed alongside sgl_kernel_zeus (`pip install -e
+# sgl-kernel-zeus-triton`), so it imports directly — no sys.path bootstrap.
+# Guarded so the basic REF/Zeus test still runs when it isn't installed.
+try:
+    import sgl_kernel_zeus_triton
+except Exception:
+    sgl_kernel_zeus_triton = None
+
+
+def _triton_view_axis(embed) -> int:
+    """Triton kernel 的 weight-view W 轴 = NUM_ROWS*(COL_PER_CORE//64), 必须 < 65536
+    (16-bit BR descriptor). 从已 pack 的 ``_embed_w_z`` shape 读取 (含 padding)."""
+    total_rows, col_per_core = embed._embed_w_z.shape
+    return (total_rows // 2) * (col_per_core // 64)
+
+
+def _run_triton_three_way(embed, input_ids, cfg, args) -> bool:
+    """REF / Zeus-simC / Zeus-Triton 三路 bit-exact 对拍 (Lmem 2core dense).
+
+    三路 (整张 vocab, pure row-gather, 应当 bit-exact):
+      - REF          forward            host bf16 index_select
+      - Zeus-simC    forward_zeus       C++ Lmem 2core dense
+      - Zeus-Triton  forward_zeus_triton Triton-JIT Lmem 2core dense
+
+    仅在 ``cfg.V < MAX_NUM_ROWS`` (65536) 时调用 (caller 已判断); Triton 权重
+    在 ``__init__`` 已 pack 整表.
+    """
+    ids_z = input_ids.to("zeus")
+    ref = embed.forward(input_ids)               # golden A (host)
+    simc = embed.forward_zeus(ids_z).cpu()       # golden B (C++ Lmem)
+    tri = embed.forward_zeus_triton(ids_z).cpu()  # under test (Triton)
+
+    print(f"  ZEUS-TRITON out shape={tuple(tri.shape)} dtype={tri.dtype}")
+    print(f"  ZEUS-TRITON out[0,:4] = "
+          f"{[round(v,4) for v in tri[0,:4].float().tolist()]}")
+    finite_t = torch.isfinite(tri).all().item()
+    shape_ok_t = (tri.shape == (args.num_tokens, cfg.H)
+                  and tri.dtype == torch.bfloat16)
+    print(f"  ZEUS-TRITON finite={finite_t} shape_ok={shape_ok_t}")
+
+    c_tri_ref = compare_tensors(
+        f"embed.{args.config}.triton-vs-REF", ref, tri, atol=0.0, rtol=0.0)
+    c_tri_simc = compare_tensors(
+        f"embed.{args.config}.triton-vs-simC", simc, tri, atol=0.0, rtol=0.0)
+    # golden 自洽: REF vs simC 也应一致
+    c_ref_simc = compare_tensors(
+        f"embed.{args.config}.REF-vs-simC", ref, simc, atol=0.0, rtol=0.0)
+
+    return bool(finite_t and shape_ok_t and c_tri_ref and c_tri_simc and c_ref_simc)
+
+
 def estimate_ref_memory_gb(cfg: Glm5NextEmbedConfig) -> float:
     """REF 权重显存估算 (GB).
 
@@ -104,9 +163,12 @@ class Glm5NextEmbed:
             torch.randn(cfg.V, cfg.H, generator=g, dtype=torch.float32) * scale
         ).to(torch.bfloat16)
 
-        # Zeus device-resident state — lazy
-        self._zeus_packed = False
-        self._embed_w_z: Optional[torch.Tensor] = None
+        # Zeus device-resident weight — ONE eager Lmem 2core dense pack, shared
+        # by both the C++ sim-C op and the Triton-JIT op (等价生产
+        # layer.__init__ 一次性 to('zeus')).
+        self._embed_w_z = None
+        if ZEUS_IMPORT_ERROR is None:
+            self._pack_zeus()
 
     # ── REF forward ─────────────────────────────────────────────
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -116,23 +178,29 @@ class Glm5NextEmbed:
         """
         return self.embed_w[input_ids.long()]
 
-    # ── Zeus pack (lazy) ────────────────────────────────────────
+    # ── Zeus pack (eager) ───────────────────────────────────────
     def _pack_zeus(self) -> None:
-        if ZEUS_IMPORT_ERROR is not None:
-            raise RuntimeError(f"Zeus runtime unavailable: {ZEUS_IMPORT_ERROR}")
-        # `embedding` op 吃 plain device tensor, 不需要 LocalMem pack
-        self._embed_w_z = self.embed_w.to("zeus")
-        self._zeus_packed = True
+        """把整张 embed table 打成 **Lmem / 2core / dense** (列切两核, 每核各一半
+        col, GEMM dense weight 7D tiled). 同一份 packed 权重被 C++ sim-C op 和
+        Triton-JIT op 共用 (sgl_kernel_zeus.pack_weight)."""
+        self._embed_w_z = sgl_kernel_zeus.pack_weight(self.embed_w)
 
     # ── Zeus forward ────────────────────────────────────────────
     def forward_zeus(self, input_ids_z: torch.Tensor) -> torch.Tensor:
-        """Zeus embedding lookup.
+        """Zeus embedding lookup (C++ sim-C Lmem 2core dense).
 
         ``input_ids_z: [T] int64 (zeus)  ->  [T, H] bf16 (zeus)``
         """
-        if not self._zeus_packed:
-            self._pack_zeus()
         return sgl_kernel_zeus.embedding(input_ids_z, self._embed_w_z)
+
+    # ── Zeus Triton-JIT forward ─────────────────────────────────
+    def forward_zeus_triton(self, input_ids_z: torch.Tensor) -> torch.Tensor:
+        """Zeus embedding lookup via the Triton-JIT kernel — SAME packed weight
+        as :meth:`forward_zeus`. Only valid for NUM_ROWS < 65536 (16-bit BR axis).
+
+        ``input_ids_z: [T] int64 (zeus)  ->  [T, H] bf16 (zeus)``
+        """
+        return sgl_kernel_zeus_triton.embedding(input_ids_z, self._embed_w_z)
 
 
 # ── Stage runner ────────────────────────────────────────────────
@@ -145,6 +213,10 @@ def _run_stage(args) -> Optional[bool]:
     print(f"Stage: {args.config} (real shape)")
     print("=" * 60)
     cfg = load_cfg(args.config)
+    if args.vocab is not None:
+        cfg = replace(cfg, V=args.vocab)  # override row num (e.g. 跑 triton 三路用小 V)
+    if args.hidden is not None:
+        cfg = replace(cfg, H=args.hidden)  # override hidden_size H
     ref_mem = estimate_ref_memory_gb(cfg)
     print(f"  cfg: V={cfg.V} H={cfg.H}")
     print(f"  REF memory estimate: {ref_mem:.2f} GB "
@@ -208,21 +280,75 @@ def _run_stage(args) -> Optional[bool]:
                 traceback.print_exc()
                 zeus_ok = False
 
+    # ── Zeus Triton-JIT (三路对拍) ────────────────────────────
+    # 仅当 --triton_forward 时跑第三路, 与 REF (golden A) / Zeus-simC (golden B)
+    # 做 bit-exact 三路比较.
+    triton_ok: Optional[bool] = None
+    if getattr(args, "triton_forward", False):
+        if not zeus_chain_available(*_ZEUS_OPS_REQUIRED):
+            print(f"  ZEUS-TRITON: SKIP (chain unavailable: {ZEUS_IMPORT_ERROR})")
+        elif sgl_kernel_zeus_triton is None:
+            print("  ZEUS-TRITON: SKIP (sgl_kernel_zeus_triton not installed: "
+                  "`pip install -e sgl-kernel-zeus-triton`)")
+        elif _triton_view_axis(embed) >= sgl_kernel_zeus.MAX_NUM_ROWS:
+            # 16-bit BR 轴: weight-view = NUM_ROWS*(H//128) 必须 < 65536
+            _v = _triton_view_axis(embed)
+            _vmax = sgl_kernel_zeus.MAX_NUM_ROWS // (cfg.H // 128)
+            print(f"  ZEUS-TRITON: SKIP (NOT SUPPORTED: weight-view 轴 "
+                  f"NUM_ROWS*(H//128)={_v} >= {sgl_kernel_zeus.MAX_NUM_ROWS}; "
+                  f"H={cfg.H} 下 V 上限≈{_vmax})")
+        else:
+            try:
+                triton_ok = _run_triton_three_way(embed, input_ids, cfg, args)
+            except Exception as e:
+                import traceback
+                print(f"  ZEUS-TRITON EXCEPTION: {e!r}")
+                traceback.print_exc()
+                triton_ok = False
+
     # ── status 汇总 ──────────────────────────────────────────
+    def _fold(base: Optional[bool]) -> Optional[bool]:
+        """把三路对拍结果叠加进 base 状态: base False 恒 False, 否则取 triton_ok."""
+        if triton_ok is None:
+            return base
+        if base is False:
+            return False
+        return triton_ok
+
     if args.mode == "ref":
-        return None if ref_skipped else True
+        return _fold(None if ref_skipped else True)
     if args.mode == "zeus":
-        return zeus_ok
+        return _fold(zeus_ok)
     # both
     if ref_skipped:
-        return None if zeus_ok is None else zeus_ok
+        return _fold(None if zeus_ok is None else zeus_ok)
     if zeus_ok is None:
-        return True
-    return zeus_ok
+        return _fold(True)
+    return _fold(zeus_ok)
 
 
 def main():
     parser = make_argparser("dev_embed", description="GLM5-Next embedding dev test")
+    parser.add_argument(
+        "--triton_forward",
+        action="store_true",
+        help="额外跑 forward_zeus_triton 并做 REF / Zeus-simC / Zeus-Triton 三路对拍 "
+             "(仅当 row num < 65536 才支持; 真实 V≈155K 会 SKIP, 用 --vocab 指定小 V)",
+    )
+    parser.add_argument(
+        "--vocab",
+        type=int,
+        default=None,
+        help="覆盖 config 里的 vocab (row num). 跑 Triton 三路需 V*(H//128)<65536 "
+             "(H=2048→V<4096, H=4096→V<2048); 非 128 倍数会自动 pad.",
+    )
+    parser.add_argument(
+        "--hidden",
+        type=int,
+        default=None,
+        help="覆盖 config 里的 hidden_size H (须为 128 的倍数). 影响 Triton 三路的 "
+             "V 上限 (< 65536/(H//128)).",
+    )
     args = parser.parse_args()
     print_header("GLM5-Next embedding", args)
     ok = _run_stage(args)
