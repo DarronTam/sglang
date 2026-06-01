@@ -1069,7 +1069,7 @@ def stage_latent_gather(args, ctx: DevContext) -> Optional[bool]:
             (K_c0, K_c1, K_T_c0, K_T_c1, m_c0, m_c1) = \
                 sgl_kernel_zeus.dsa_latent_k_gather(
                     slot_indices_b.to("zeus"),
-                    cache_b.unsqueeze(0).to("zeus"),
+                    cache_b.to("zeus"),
                 )
             # Mask: both cores' masks should equal REF exactly.
             ok &= compare_tensors(
@@ -1423,7 +1423,7 @@ def stage_decode_full_nocp(args, ctx: DevContext) -> Optional[bool]:
         slot_idx_b = top_pos[b].to(torch.int32).unsqueeze(0)
         (K_c0_b, _K_c1_b, K_T_c0_b, _K_T_c1_b, m_c0_b, _m_c1_b) = \
             sgl_kernel_zeus.dsa_latent_k_gather(
-                slot_idx_b.to("zeus"), full_latent[b:b+1].contiguous().to("zeus"),
+                slot_idx_b.to("zeus"), full_latent[b].contiguous().to("zeus"),
             )
         # Read core-0 banks (c1 is bit-identical content by the broadcast
         # invariant; we just need one canonical copy here for downstream

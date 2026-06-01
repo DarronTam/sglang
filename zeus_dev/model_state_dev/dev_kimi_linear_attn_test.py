@@ -399,8 +399,12 @@ def test_causal_conv1d_update(cfg, num_tokens=4, seed=42):
     state_zeus = state_ref.clone()
 
     # REF
+    # state_ref.to(REF_DEVICE) 在 REF_DEVICE!="cpu" 时会新建一份拷贝，REF 的原位
+    # state 更新写进的是这份拷贝；保留其引用去比较，否则比到的是未更新的原始
+    # CPU state_ref（假性 DIFF）。
+    state_ref_dev = state_ref.to(REF_DEVICE)
     y_ref = _ref_causal_conv1d_update(
-        x.to(REF_DEVICE), state_ref.to(REF_DEVICE),
+        x.to(REF_DEVICE), state_ref_dev,
         weight.to(REF_DEVICE), bias.to(REF_DEVICE),
         activation="silu",
     )
@@ -418,8 +422,8 @@ def test_causal_conv1d_update(cfg, num_tokens=4, seed=42):
     )
 
     ok_out   = compare_tensors("causal_conv1d_update/out",   y_ref,      y_zeus)
-    ok_state = compare_tensors("causal_conv1d_update/state", state_ref,  state_zeus_dev)
-    return ok_out and ok_state, (y_ref, state_ref)
+    ok_state = compare_tensors("causal_conv1d_update/state", state_ref_dev, state_zeus_dev)
+    return ok_out and ok_state, (y_ref, state_ref_dev)
 
 
 # ── Stage: causal_conv1d_update_qkv (decode, fused Q/K/V) ───────
@@ -460,16 +464,20 @@ def test_causal_conv1d_update_qkv(cfg, num_tokens=4, seed=42):
 
     # REF：三次独立 single-projection
     sq_ref, sk_ref, sv_ref = sq.clone(), sk.clone(), sv.clone()
+    # 保留 REF 真正原位更新的设备张量引用（见 causal_conv1d_update 处说明）。
+    sq_ref_dev = sq_ref.to(REF_DEVICE)
+    sk_ref_dev = sk_ref.to(REF_DEVICE)
+    sv_ref_dev = sv_ref.to(REF_DEVICE)
     yq_ref = _ref_causal_conv1d_update(
-        x_q.to(REF_DEVICE), sq_ref.to(REF_DEVICE),
+        x_q.to(REF_DEVICE), sq_ref_dev,
         w_q.to(REF_DEVICE), b_q.to(REF_DEVICE), activation="silu",
     )
     yk_ref = _ref_causal_conv1d_update(
-        x_k.to(REF_DEVICE), sk_ref.to(REF_DEVICE),
+        x_k.to(REF_DEVICE), sk_ref_dev,
         w_k.to(REF_DEVICE), b_k.to(REF_DEVICE), activation="silu",
     )
     yv_ref = _ref_causal_conv1d_update(
-        x_v.to(REF_DEVICE), sv_ref.to(REF_DEVICE),
+        x_v.to(REF_DEVICE), sv_ref_dev,
         w_v.to(REF_DEVICE), b_v.to(REF_DEVICE), activation="silu",
     )
     print(f"  REF y_q/k/v: shape={tuple(yq_ref.shape)} dtype={yq_ref.dtype}")
@@ -490,10 +498,10 @@ def test_causal_conv1d_update_qkv(cfg, num_tokens=4, seed=42):
     ok &= compare_tensors("causal_conv1d_update_qkv/out_q",   yq_ref, yq_z)
     ok &= compare_tensors("causal_conv1d_update_qkv/out_k",   yk_ref, yk_z)
     ok &= compare_tensors("causal_conv1d_update_qkv/out_v",   yv_ref, yv_z)
-    ok &= compare_tensors("causal_conv1d_update_qkv/state_q", sq_ref, sq_z)
-    ok &= compare_tensors("causal_conv1d_update_qkv/state_k", sk_ref, sk_z)
-    ok &= compare_tensors("causal_conv1d_update_qkv/state_v", sv_ref, sv_z)
-    return ok, (yq_ref, yk_ref, yv_ref, sq_ref, sk_ref, sv_ref)
+    ok &= compare_tensors("causal_conv1d_update_qkv/state_q", sq_ref_dev, sq_z)
+    ok &= compare_tensors("causal_conv1d_update_qkv/state_k", sk_ref_dev, sk_z)
+    ok &= compare_tensors("causal_conv1d_update_qkv/state_v", sv_ref_dev, sv_z)
+    return ok, (yq_ref, yk_ref, yv_ref, sq_ref_dev, sk_ref_dev, sv_ref_dev)
 
 
 # ── Stage: causal_conv1d_fn (extend) ────────────────────────────
@@ -530,9 +538,11 @@ def test_causal_conv1d_fn(cfg, seed=42):
     conv_states_zeus = conv_states_ref.clone()
 
     # REF
+    # 保留 REF 真正原位更新的设备张量引用（见 causal_conv1d_update 处说明）。
+    conv_states_ref_dev = conv_states_ref.to(REF_DEVICE)
     y_ref = _ref_causal_conv1d_fn(
         x.to(REF_DEVICE), weight.to(REF_DEVICE), bias.to(REF_DEVICE),
-        conv_states_ref.to(REF_DEVICE),
+        conv_states_ref_dev,
         has_initial_state.to(REF_DEVICE),
         query_start_loc.to(REF_DEVICE),
         activation="silu",
@@ -551,8 +561,8 @@ def test_causal_conv1d_fn(cfg, seed=42):
     )
 
     ok_out   = compare_tensors("causal_conv1d_fn/out",   y_ref, y_zeus)
-    ok_state = compare_tensors("causal_conv1d_fn/state", conv_states_ref, conv_states_zeus_dev)
-    return ok_out and ok_state, (y_ref, conv_states_ref)
+    ok_state = compare_tensors("causal_conv1d_fn/state", conv_states_ref_dev, conv_states_zeus_dev)
+    return ok_out and ok_state, (y_ref, conv_states_ref_dev)
 
 
 # ── Stage: l2norm ───────────────────────────────────────────────

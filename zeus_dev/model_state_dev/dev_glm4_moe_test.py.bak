@@ -210,14 +210,11 @@ def test_biased_grouped_topk(cfg, num_tokens=16, seed=42):
     # 时传 sorted=False），Zeus 返回降序；所以按集合比较。
     ok_ids = compare_ids(
         "biased_grouped_topk/ids", ids_ref, ids_zeus, allow_permutation=True)
-    # weights: 按 id 对齐后比。注意 Zeus 端 biased_grouped_topk 末尾把 weights
-    # 存成 bf16（moe.py: "single bf16 RNE store at the end"），REF 是 fp32，故须用
-    # bf16 级容差（~5e-3）——fp32 级 5e-5 会被 bf16 舍入（相对 ~2^-8）必然判 DIFF。
-    # 与 glm4_biased_grouped_topk stage 保持一致。
+    # weights: 按 id 对齐后比。
     ok_w = compare_topk_weights_by_id(
         "biased_grouped_topk/weights",
         w_ref, ids_ref, w_zeus, ids_zeus,
-        atol=5e-3, rtol=5e-3,
+        atol=5e-5, rtol=5e-5,
     )
     return (ok_ids and ok_w), (w_ref, ids_ref)
 

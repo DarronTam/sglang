@@ -498,7 +498,7 @@ def zeus_dsa_decode(ctx: dsa.DevContext, hidden_z: torch.Tensor) -> torch.Tensor
         slot_idx_b = top_pos[b].to(torch.int32).unsqueeze(0)
         (K_c0_b, _K_c1_b, K_T_c0_b, _K_T_c1_b, m_c0_b, _m_c1_b) = \
             sgl_kernel_zeus.dsa_latent_k_gather(
-                slot_idx_b.to("zeus"), full_latent[b:b+1].contiguous().to("zeus"),
+                slot_idx_b.to("zeus"), full_latent[b].contiguous().to("zeus"),
             )
         K_local_full[b]   = K_c0_b.cpu()[0]
         K_local_T_full[b] = K_T_c0_b.cpu()[0]
