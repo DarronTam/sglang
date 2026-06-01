@@ -89,13 +89,6 @@ except Exception:
     sgl_kernel_zeus_triton = None
 
 
-def _triton_view_axis(embed) -> int:
-    """Triton kernel 的 weight-view W 轴 = NUM_ROWS*(COL_PER_CORE//64), 必须 < 65536
-    (16-bit BR descriptor). 从已 pack 的 ``_embed_w_z`` shape 读取 (含 padding)."""
-    total_rows, col_per_core = embed._embed_w_z.shape
-    return (total_rows // 2) * (col_per_core // 64)
-
-
 def _run_triton_three_way(embed, input_ids, cfg, args) -> bool:
     """REF / Zeus-simC / Zeus-Triton 三路 bit-exact 对拍 (Lmem 2core dense).
 
@@ -104,8 +97,7 @@ def _run_triton_three_way(embed, input_ids, cfg, args) -> bool:
       - Zeus-simC    forward_zeus       C++ Lmem 2core dense
       - Zeus-Triton  forward_zeus_triton Triton-JIT Lmem 2core dense
 
-    仅在 ``cfg.V < MAX_NUM_ROWS`` (65536) 时调用 (caller 已判断); Triton 权重
-    在 ``__init__`` 已 pack 整表.
+    Triton 权重在 ``__init__`` 已 pack 整表 (整张 vocab 都支持, 含真实 V≈155K).
     """
     ids_z = input_ids.to("zeus")
     ref = embed.forward(input_ids)               # golden A (host)
@@ -196,7 +188,7 @@ class Glm5NextEmbed:
     # ── Zeus Triton-JIT forward ─────────────────────────────────
     def forward_zeus_triton(self, input_ids_z: torch.Tensor) -> torch.Tensor:
         """Zeus embedding lookup via the Triton-JIT kernel — SAME packed weight
-        as :meth:`forward_zeus`. Only valid for NUM_ROWS < 65536 (16-bit BR axis).
+        as :meth:`forward_zeus`.
 
         ``input_ids_z: [T] int64 (zeus)  ->  [T, H] bf16 (zeus)``
         """
@@ -290,13 +282,6 @@ def _run_stage(args) -> Optional[bool]:
         elif sgl_kernel_zeus_triton is None:
             print("  ZEUS-TRITON: SKIP (sgl_kernel_zeus_triton not installed: "
                   "`pip install -e sgl-kernel-zeus-triton`)")
-        elif _triton_view_axis(embed) >= sgl_kernel_zeus.MAX_NUM_ROWS:
-            # 16-bit BR 轴: weight-view = NUM_ROWS*(H//128) 必须 < 65536
-            _v = _triton_view_axis(embed)
-            _vmax = sgl_kernel_zeus.MAX_NUM_ROWS // (cfg.H // 128)
-            print(f"  ZEUS-TRITON: SKIP (NOT SUPPORTED: weight-view 轴 "
-                  f"NUM_ROWS*(H//128)={_v} >= {sgl_kernel_zeus.MAX_NUM_ROWS}; "
-                  f"H={cfg.H} 下 V 上限≈{_vmax})")
         else:
             try:
                 triton_ok = _run_triton_three_way(embed, input_ids, cfg, args)
@@ -333,21 +318,21 @@ def main():
         "--triton_forward",
         action="store_true",
         help="额外跑 forward_zeus_triton 并做 REF / Zeus-simC / Zeus-Triton 三路对拍 "
-             "(仅当 row num < 65536 才支持; 真实 V≈155K 会 SKIP, 用 --vocab 指定小 V)",
+             "(整张 vocab 都支持, 含真实 V≈155K; NUM_ROWS<524288 且 COL_PER_CORE<=8192)",
     )
     parser.add_argument(
         "--vocab",
         type=int,
         default=None,
-        help="覆盖 config 里的 vocab (row num). 跑 Triton 三路需 V*(H//128)<65536 "
-             "(H=2048→V<4096, H=4096→V<2048); 非 128 倍数会自动 pad.",
+        help="覆盖 config 里的 vocab (row num). Triton 三路需 V<524288 "
+             "(num_kb=V//128<4096); 非 128 倍数会自动 pad.",
     )
     parser.add_argument(
         "--hidden",
         type=int,
         default=None,
-        help="覆盖 config 里的 hidden_size H (须为 128 的倍数). 影响 Triton 三路的 "
-             "V 上限 (< 65536/(H//128)).",
+        help="覆盖 config 里的 hidden_size H (须为 128 的倍数). Triton 三路需 "
+             "COL_PER_CORE=H//2<=8192 (H<=16384).",
     )
     args = parser.parse_args()
     print_header("GLM5-Next embedding", args)
