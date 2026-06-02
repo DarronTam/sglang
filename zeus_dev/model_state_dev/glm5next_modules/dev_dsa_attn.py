@@ -61,6 +61,7 @@ from _common import (
     compare_tensors, zeus_chain_available,
     make_argparser, print_header, print_summary,
 )
+from sgl_kernel_zeus.dsa_index_k_dual_core import build_index_k_exec_tables
 
 # DSA 底层 API (位于上一级 model_state_dev/)
 import dev_glm5next_dsa_decode_test as dsa
@@ -371,12 +372,12 @@ class Glm5NextDsaAttn:
         paged_state: Dict[str, torch.Tensor],
         *,
         advance_seq_lens: bool = True,
-    ) -> torch.Tensor:
-        """DSA #1–#6: 首帧搬 device → 出 index logits ``[B, max_logical_s]``.
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """DSA #1–#6: 首帧搬 device → 返回 ``(logits_z, q_new_z)``.
 
-        single-core / dual_core 在 #5 STORE + #6 READ 分叉, 其余共用. #3 算出的
-        ``q_new_z`` 经 ``paged_state["_q_new_z"]`` 临时槽传给 :meth:`forward_zeus`
-        的 #7–#11 (避免改方法签名 / 多返回值).
+        ``logits_z`` 是 index logits ``[B, max_logical_s]``; single-core /
+        dual_core 在 #5 STORE + #6 READ 分叉, 其余共用. ``q_new_z`` 是 #3 的
+        absorb 输出, 直接返回给 :meth:`forward_zeus` 的 #7–#11 使用.
         """
         cfg = self.cfg
         B = hidden_z.shape[0]
@@ -435,8 +436,6 @@ class Glm5NextDsaAttn:
         q_new_z = sgl_kernel_zeus.dsa_q_main_absorb(
             q_lora_z, self._w_lmem["q_b"], self._w_lmem["w_kc"],
         )
-        # 经 paged_state 临时槽把 q_new_z 传给 forward_zeus 的 #7–#11.
-        paged_state["_q_new_z"] = q_new_z
 
         # #4  indexer Q + weights
         q_body_z, _q_scale_z, weights_z = sgl_kernel_zeus.dsa_indexer_q_weights(
@@ -446,7 +445,6 @@ class Glm5NextDsaAttn:
         )
 
         if paged_state.get("dual_core"):
-            from sgl_kernel_zeus.dsa_index_k_dual_core import build_index_k_exec_tables
             P = paged_state["num_physical_pages"]
             bc0 = paged_state["body_cache_c0"]
             bc1 = paged_state["body_cache_c1"]
@@ -515,13 +513,14 @@ class Glm5NextDsaAttn:
                 max_logical_s=max_logical_s,
             )
 
-        return logits_z
+        return logits_z, q_new_z
 
     def forward_zeus_logits(self, hidden_z, paged_state):
         """跑到 #6 返回 index logits [B, max_logical_s](对拍用)。"""
         if not self._zeus_packed:
             self._pack_zeus()
-        return self._forward_to_logits(hidden_z, paged_state)
+        logits_z, _ = self._forward_to_logits(hidden_z, paged_state)
+        return logits_z
 
     # ── Zeus forward (paged) ───────────────────────────────────
     def forward_zeus(
@@ -556,7 +555,7 @@ class Glm5NextDsaAttn:
             self._pack_zeus()
         cfg = self.cfg
 
-        logits_z = self._forward_to_logits(
+        logits_z, q_new_z = self._forward_to_logits(
             hidden_z, paged_state, advance_seq_lens=advance_seq_lens,
         )
 
@@ -566,9 +565,6 @@ class Glm5NextDsaAttn:
         page_size = paged_state["page_size"]
         max_logical_s = page_size * block_table_z.shape[1]
         positions_z = torch.arange(max_logical_s, dtype=torch.int32).to("zeus")
-
-        # q_new_z 由 #3 在 helper 内算出, 通过 paged_state 临时槽传出 (避免改方法签名).
-        q_new_z = paged_state.pop("_q_new_z")
 
         # #7  local top-K (cp=1 → IS global top-K). Output is **logical** position
         # in [0, max_logical_s); -inf positions naturally lose to valid ones.
