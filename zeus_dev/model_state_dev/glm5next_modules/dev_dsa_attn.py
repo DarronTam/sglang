@@ -364,6 +364,165 @@ class Glm5NextDsaAttn:
             "k_local_t_c1":     k_local_t_c1_lmem,
         }
 
+    # ── Zeus forward helpers ───────────────────────────────────
+    def _forward_to_logits(
+        self,
+        hidden_z: torch.Tensor,
+        paged_state: Dict[str, torch.Tensor],
+        *,
+        advance_seq_lens: bool = True,
+    ) -> torch.Tensor:
+        """DSA #1–#6: 首帧搬 device → 出 index logits ``[B, max_logical_s]``.
+
+        single-core / dual_core 在 #5 STORE + #6 READ 分叉, 其余共用. #3 算出的
+        ``q_new_z`` 经 ``paged_state["_q_new_z"]`` 临时槽传给 :meth:`forward_zeus`
+        的 #7–#11 (避免改方法签名 / 多返回值).
+        """
+        cfg = self.cfg
+        B = hidden_z.shape[0]
+
+        # Move paged_state to device on first call; subsequent calls reuse device tensors.
+        if "_z_loaded" not in paged_state:
+            if paged_state.get("dual_core"):
+                paged_state["latent_kv_pool"] = paged_state["latent_kv_pool"].to("zeus")
+                paged_state["body_cache_c0"] = torch.zeus.local_memory.from_tensor(
+                    paged_state["body_cache_c0"].to("zeus"), kind="weight", Tr=1, Tc=1,
+                )
+                paged_state["body_cache_c1"] = torch.zeus.local_memory.from_tensor(
+                    paged_state["body_cache_c1"].to("zeus"), kind="weight", Tr=1, Tc=1,
+                )
+                paged_state["scale_cache"] = paged_state["scale_cache"].to("zeus")
+                paged_state["block_table"] = paged_state["block_table"].to("zeus")
+                paged_state["seq_lens"] = paged_state["seq_lens"].to("zeus")
+                paged_state["_z_loaded"] = True
+            else:
+                paged_state["latent_kv_pool"] = paged_state["latent_kv_pool"].to("zeus")
+                # body_pool 是 fp8 LocalMem — 需要装到 LocalMem 给 indexer_k_prep_store
+                # 和 dsa_index_logits_paged 使用.
+                paged_state["index_body_pool"] = torch.zeus.local_memory.from_tensor(
+                    paged_state["index_body_pool"], kind="weight", Tr=1, Tc=1,
+                )
+                paged_state["index_scale_pool"] = paged_state["index_scale_pool"].to("zeus")
+                paged_state["block_table"] = paged_state["block_table"].to("zeus")
+                paged_state["seq_lens"] = paged_state["seq_lens"].to("zeus")
+                paged_state["_z_loaded"] = True
+
+        latent_pool_z = paged_state["latent_kv_pool"]
+        block_table_z = paged_state["block_table"]
+        seq_lens_z = paged_state["seq_lens"]
+        page_size = paged_state["page_size"]
+        max_logical_s = page_size * block_table_z.shape[1]
+
+        # #1  q_a_proj + RMSNorm → q_lora
+        q_lora_z = sgl_kernel_zeus.dsa_q_a_proj_norm(
+            hidden_z, self._w_lmem["q_a"], self._w_z["q_a_norm"],
+            eps=cfg.rms_norm_eps,
+        )
+
+        # #2a  Compute per-seq write slot: new_slot[b] = block_table[b, seq_lens[b]/PS] * PS + seq_lens[b]%PS
+        slot_mapping_z = sgl_kernel_zeus.dsa_compute_new_slot(
+            block_table_z, seq_lens_z, page_size=page_size,
+        )
+
+        # #2b  kv_a_proj + norm + STORE TO POOL (latent_pool_z[slot_mapping[b]] = new_k[b])
+        sgl_kernel_zeus.dsa_kv_a_proj_norm_store(
+            hidden_z, self._w_lmem["kv_a"], self._w_z["kv_a_norm"],
+            slot_mapping_z, latent_pool_z,
+            eps=cfg.rms_norm_eps,
+        )
+
+        # #3  q_b_proj + absorb bmm(w_kc) → q_new
+        q_new_z = sgl_kernel_zeus.dsa_q_main_absorb(
+            q_lora_z, self._w_lmem["q_b"], self._w_lmem["w_kc"],
+        )
+        # 经 paged_state 临时槽把 q_new_z 传给 forward_zeus 的 #7–#11.
+        paged_state["_q_new_z"] = q_new_z
+
+        # #4  indexer Q + weights
+        q_body_z, _q_scale_z, weights_z = sgl_kernel_zeus.dsa_indexer_q_weights(
+            q_lora_z, hidden_z, self._w_z["wq_b"], self._w_z["h_di_z"],
+            self._w_z["weights_proj"],
+            num_index_heads=cfg.I, index_head_dim=cfg.Di,
+        )
+
+        if paged_state.get("dual_core"):
+            from sgl_kernel_zeus.dsa_index_k_dual_core import build_index_k_exec_tables
+            P = paged_state["num_physical_pages"]
+            bc0 = paged_state["body_cache_c0"]
+            bc1 = paged_state["body_cache_c1"]
+            scale_cache_z = paged_state["scale_cache"]
+
+            # #5  STORE into the two persistent LocalMem banks
+            sgl_kernel_zeus.dsa_indexer_k_prep_store_dual_core(
+                hidden_z, self._w_lmem["wk_idx"],
+                self._w_z["k_norm_weight"], self._w_z["k_norm_bias"],
+                self._w_lmem["h_di"], slot_mapping_z,
+                bc0, bc1, scale_cache_z,
+                num_physical_pages=P, page_size=page_size,
+                eps=cfg.rms_norm_eps,
+            )
+
+            if advance_seq_lens:
+                seq_lens_z = seq_lens_z + 1
+                paged_state["seq_lens"] = seq_lens_z
+
+            # #5.5  host-side exec tables (outside device-resident chain)
+            tables = build_index_k_exec_tables(
+                block_table_z.cpu(), seq_lens_z.cpu(), P, page_size, bc0, bc1,
+            )
+            addr_tbl = tables["addr_table"]
+            work_list = tables["work_list"]
+
+            # #6  two per-core READs sharing a -1e30-preinit logits buffer
+            logits_z = torch.full(
+                (B, max_logical_s), -1e30, dtype=torch.float32, device="zeus",
+            )
+            for core_id in (0, 1):
+                sgl_kernel_zeus.dsa_index_logits_lmem_addr_table(
+                    q_body_z, weights_z,
+                    bc0 if core_id == 0 else bc1,
+                    scale_cache_z,
+                    addr_tbl[core_id].to("zeus"), work_list[core_id].to("zeus"),
+                    seq_lens_z, logits_z,
+                    page_size=page_size, core_id=core_id,
+                )
+        else:
+            body_pool_lmem = paged_state["index_body_pool"]
+            scale_pool_z = paged_state["index_scale_pool"]
+
+            # #5  indexer K prep + STORE TO POOL (body_pool[slot] + scale_pool[slot])
+            sgl_kernel_zeus.dsa_indexer_k_prep_store(
+                hidden_z, self._w_lmem["wk_idx"],
+                self._w_z["k_norm_weight"], self._w_z["k_norm_bias"],
+                self._w_lmem["h_di"], slot_mapping_z,
+                body_pool_lmem, scale_pool_z,
+                eps=cfg.rms_norm_eps,
+            )
+
+            # Advance seq_lens so subsequent reads see the new step.
+            # aten op, single device kernel launch — device-side history advance.
+            if advance_seq_lens:
+                seq_lens_z = seq_lens_z + 1
+                paged_state["seq_lens"] = seq_lens_z
+
+            # #6  paged index GEMM → logits [B, max_logical_s].
+            # max_logical_s = page_size * max_pages_per_seq (static upper bound).
+            # Positions >= seq_lens[b] get -inf inside the kernel.
+            logits_z = sgl_kernel_zeus.dsa_index_logits_paged(
+                q_body_z, weights_z, body_pool_lmem, scale_pool_z,
+                block_table_z, seq_lens_z,
+                page_size=page_size,
+                max_logical_s=max_logical_s,
+            )
+
+        return logits_z
+
+    def forward_zeus_logits(self, hidden_z, paged_state):
+        """跑到 #6 返回 index logits [B, max_logical_s](对拍用)。"""
+        if not self._zeus_packed:
+            self._pack_zeus()
+        return self._forward_to_logits(hidden_z, paged_state)
+
     # ── Zeus forward (paged) ───────────────────────────────────
     def forward_zeus(
         self,
@@ -396,84 +555,20 @@ class Glm5NextDsaAttn:
         if not self._zeus_packed:
             self._pack_zeus()
         cfg = self.cfg
-        B = hidden_z.shape[0]
 
-        # Move paged_state to device on first call; subsequent calls reuse device tensors.
-        if "_z_loaded" not in paged_state:
-            paged_state["latent_kv_pool"] = paged_state["latent_kv_pool"].to("zeus")
-            # body_pool 是 fp8 LocalMem — 需要装到 LocalMem 给 indexer_k_prep_store
-            # 和 dsa_index_logits_paged 使用.
-            paged_state["index_body_pool"] = torch.zeus.local_memory.from_tensor(
-                paged_state["index_body_pool"], kind="weight", Tr=1, Tc=1,
-            )
-            paged_state["index_scale_pool"] = paged_state["index_scale_pool"].to("zeus")
-            paged_state["block_table"] = paged_state["block_table"].to("zeus")
-            paged_state["seq_lens"] = paged_state["seq_lens"].to("zeus")
-            paged_state["_z_loaded"] = True
+        logits_z = self._forward_to_logits(
+            hidden_z, paged_state, advance_seq_lens=advance_seq_lens,
+        )
 
-        latent_pool_z = paged_state["latent_kv_pool"]
-        body_pool_lmem = paged_state["index_body_pool"]
-        scale_pool_z = paged_state["index_scale_pool"]
         block_table_z = paged_state["block_table"]
         seq_lens_z = paged_state["seq_lens"]
+        latent_pool_z = paged_state["latent_kv_pool"]
         page_size = paged_state["page_size"]
         max_logical_s = page_size * block_table_z.shape[1]
         positions_z = torch.arange(max_logical_s, dtype=torch.int32).to("zeus")
 
-        # #1  q_a_proj + RMSNorm → q_lora
-        q_lora_z = sgl_kernel_zeus.dsa_q_a_proj_norm(
-            hidden_z, self._w_lmem["q_a"], self._w_z["q_a_norm"],
-            eps=cfg.rms_norm_eps,
-        )
-
-        # #2a  Compute per-seq write slot: new_slot[b] = block_table[b, seq_lens[b]/PS] * PS + seq_lens[b]%PS
-        slot_mapping_z = sgl_kernel_zeus.dsa_compute_new_slot(
-            block_table_z, seq_lens_z, page_size=page_size,
-        )
-
-        # #2b  kv_a_proj + norm + STORE TO POOL (latent_pool_z[slot_mapping[b]] = new_k[b])
-        sgl_kernel_zeus.dsa_kv_a_proj_norm_store(
-            hidden_z, self._w_lmem["kv_a"], self._w_z["kv_a_norm"],
-            slot_mapping_z, latent_pool_z,
-            eps=cfg.rms_norm_eps,
-        )
-
-        # #3  q_b_proj + absorb bmm(w_kc) → q_new
-        q_new_z = sgl_kernel_zeus.dsa_q_main_absorb(
-            q_lora_z, self._w_lmem["q_b"], self._w_lmem["w_kc"],
-        )
-
-        # #4  indexer Q + weights
-        q_body_z, _q_scale_z, weights_z = sgl_kernel_zeus.dsa_indexer_q_weights(
-            q_lora_z, hidden_z, self._w_z["wq_b"], self._w_z["h_di_z"],
-            self._w_z["weights_proj"],
-            num_index_heads=cfg.I, index_head_dim=cfg.Di,
-        )
-
-        # #5  indexer K prep + STORE TO POOL (body_pool[slot] + scale_pool[slot])
-        sgl_kernel_zeus.dsa_indexer_k_prep_store(
-            hidden_z, self._w_lmem["wk_idx"],
-            self._w_z["k_norm_weight"], self._w_z["k_norm_bias"],
-            self._w_lmem["h_di"], slot_mapping_z,
-            body_pool_lmem, scale_pool_z,
-            eps=cfg.rms_norm_eps,
-        )
-
-        # Advance seq_lens so subsequent reads see the new step.
-        # aten op, single device kernel launch — device-side history advance.
-        if advance_seq_lens:
-            seq_lens_z = seq_lens_z + 1
-            paged_state["seq_lens"] = seq_lens_z
-
-        # #6  paged index GEMM → logits [B, max_logical_s].
-        # max_logical_s = page_size * max_pages_per_seq (static upper bound).
-        # Positions >= seq_lens[b] get -inf inside the kernel.
-        logits_z = sgl_kernel_zeus.dsa_index_logits_paged(
-            q_body_z, weights_z, body_pool_lmem, scale_pool_z,
-            block_table_z, seq_lens_z,
-            page_size=page_size,
-            max_logical_s=max_logical_s,
-        )
+        # q_new_z 由 #3 在 helper 内算出, 通过 paged_state 临时槽传出 (避免改方法签名).
+        q_new_z = paged_state.pop("_q_new_z")
 
         # #7  local top-K (cp=1 → IS global top-K). Output is **logical** position
         # in [0, max_logical_s); -inf positions naturally lose to valid ones.
