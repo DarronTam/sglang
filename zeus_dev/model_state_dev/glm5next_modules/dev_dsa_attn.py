@@ -49,6 +49,7 @@ State:
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -159,6 +160,8 @@ class Glm5NextDsaAttn:
         history: dsa.GlobalHistory,
         *,
         page_size: Optional[int] = None,
+        num_physical_pages: Optional[int] = None,
+        dual_core: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """从 ``dsa.GlobalHistory`` 构造 paged-attention state.
 
@@ -186,6 +189,108 @@ class Glm5NextDsaAttn:
         assert Rkv == cfg.Rkv
         Di = index_body.shape[-1]
         assert Di == cfg.Di
+
+        if dual_core:
+            from sgl_kernel_zeus.dsa_index_k_dual_core import (
+                owner_of_physical_page, local_page_of,
+            )
+            assert page_size is not None and num_physical_pages is not None, (
+                "dual_core path requires explicit page_size and num_physical_pages"
+            )
+            P = int(num_physical_pages)
+            assert P % 2 == 0, "num_physical_pages must be even"
+            pages_per_seq = -(-S_hist // page_size)            # ceil
+            num_local_pages = P // 2
+            total_slots = P * page_size
+            split = num_local_pages
+            # Per-core capacity guard. Allocation alternates cores per logical
+            # page (lp%2==0 → core0 region [0, split); lp%2==1 → core1 region
+            # [split, P)). When pages_per_seq is odd, core0 demands
+            # B*ceil(pages_per_seq/2) and core1 B*floor(pages_per_seq/2); a total
+            # guard P >= B*pages_per_seq can pass while core0 overflows past
+            # `split` into core1's region → same physical page handed to two
+            # sequences. Check each core's region independently.
+            need_c0 = B * math.ceil(pages_per_seq / 2)
+            need_c1 = B * (pages_per_seq // 2)
+            assert need_c0 <= num_local_pages and need_c1 <= num_local_pages, (
+                f"dual_core pool too small: per-core need (c0={need_c0}, c1={need_c1}) "
+                f"exceeds num_local_pages={num_local_pages} (P={P}, B={B}, "
+                f"pages_per_seq={pages_per_seq}); increase num_physical_pages"
+            )
+
+            # Small-page block_table: consecutive logical pages of a sequence
+            # alternate cores (forces page-wise cross-core split).
+            # core0 owns physical pages [0, P/2); core1 owns [P/2, P).
+            block_table = torch.full((B, pages_per_seq), -1, dtype=torch.int32)
+            next_c0, next_c1 = 0, split
+            for b in range(B):
+                for lp in range(pages_per_seq):
+                    if lp % 2 == 0:
+                        pp = next_c0; next_c0 += 1
+                    else:
+                        pp = next_c1; next_c1 += 1
+                    block_table[b, lp] = pp
+            assert next_c0 <= split and next_c1 <= P, (
+                "dual_core allocation overflowed its core region"
+            )
+
+            body_c0 = torch.zeros(
+                (num_local_pages, page_size, Di), dtype=torch.float8_e4m3fn,
+            )
+            body_c1 = torch.zeros(
+                (num_local_pages, page_size, Di), dtype=torch.float8_e4m3fn,
+            )
+            scale_pool = torch.zeros((total_slots,), dtype=torch.float32)
+            latent_pool = torch.zeros((total_slots, Rkv), dtype=torch.bfloat16)
+            for b in range(B):
+                for s in range(S_hist):
+                    lp_logical = s // page_size
+                    sip = s % page_size
+                    pp = int(block_table[b, lp_logical])
+                    slot = pp * page_size + sip
+                    scale_pool[slot] = index_scale[b, s]
+                    latent_pool[slot] = latent_kv[b, s]
+                    bank = body_c0 if owner_of_physical_page(pp, P) == 0 else body_c1
+                    bank[local_page_of(pp, P), sip] = (
+                        index_body[b, s].to(torch.float8_e4m3fn)
+                    )
+
+            seq_lens = torch.full((B,), S_hist, dtype=torch.int32)
+
+            # 4 zero-init LocalMem gather buffers (same as degenerate path; #9
+            # needs them — see the rationale comment in the degenerate path).
+            Ktop = cfg.Ktop
+            zero_K   = torch.zeros(B, Ktop, Rkv, dtype=torch.bfloat16)
+            zero_K_T = torch.zeros(B, Rkv, Ktop, dtype=torch.bfloat16)
+            k_local_c0_lmem   = torch.zeus.local_memory.from_tensor(
+                zero_K,   kind="native", Tr=1, Tc=1,
+            )
+            k_local_c1_lmem   = torch.zeus.local_memory.from_tensor(
+                zero_K,   kind="native", Tr=1, Tc=1,
+            )
+            k_local_t_c0_lmem = torch.zeus.local_memory.from_tensor(
+                zero_K_T, kind="native", Tr=1, Tc=1,
+            )
+            k_local_t_c1_lmem = torch.zeus.local_memory.from_tensor(
+                zero_K_T, kind="native", Tr=1, Tc=1,
+            )
+
+            return {
+                "latent_kv_pool":   latent_pool,
+                "index_scale_pool": scale_pool,
+                "scale_cache":      scale_pool,
+                "block_table":      block_table,
+                "seq_lens":         seq_lens,
+                "page_size":        int(page_size),
+                "num_physical_pages": P,
+                "body_cache_c0":    body_c0,
+                "body_cache_c1":    body_c1,
+                "dual_core":        True,
+                "k_local_c0":       k_local_c0_lmem,
+                "k_local_c1":       k_local_c1_lmem,
+                "k_local_t_c0":     k_local_t_c0_lmem,
+                "k_local_t_c1":     k_local_t_c1_lmem,
+            }
 
         if page_size is None:
             page_size = S_hist + 1
