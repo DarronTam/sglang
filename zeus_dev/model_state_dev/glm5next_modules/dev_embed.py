@@ -174,8 +174,9 @@ class Glm5NextEmbed:
     def _pack_zeus(self) -> None:
         """把整张 embed table 打成 **Lmem / 2core / dense** (列切两核, 每核各一半
         col, GEMM dense weight 7D tiled). 同一份 packed 权重被 C++ sim-C op 和
-        Triton-JIT op 共用 (sgl_kernel_zeus.pack_weight)."""
-        self._embed_w_z = sgl_kernel_zeus.pack_weight(self.embed_w)
+        Triton-JIT op 共用; pack 是 embedding 算子的方法 (sgl_kernel_zeus.embedding.pack),
+        不在 trunk."""
+        self._embed_w_z = sgl_kernel_zeus.embedding.pack(self.embed_w)
 
     # ── Zeus forward ────────────────────────────────────────────
     def forward_zeus(self, input_ids_z: torch.Tensor) -> torch.Tensor:
