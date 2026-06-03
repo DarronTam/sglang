@@ -446,23 +446,22 @@ class Glm5NextDsaAttn:
         )
         # #6  单个 dual-core kernel: 两核合一次 launch, 内部按 physical-page ownership
         # 写 disjoint 列, 并自行 init -1e30 (无需外部 torch.full); seq_lens INCLUSIVE
-        # → kernel 内位置 >= seq_lens[b] 留 -1e30. logits 是纯输出, 传未初始化 buffer.
-        logits = torch.empty(
-            (B, max_logical_s), dtype=torch.float32, device="zeus",
-        )
-        sgl_kernel_zeus.dsa_index_logits_lmem_addr_table_dual_core(
+        # → kernel 内位置 >= seq_lens[b] 留 -1e30. logits 是纯输出, 由 wrapper 按
+        # max_logical_s 内部分配返回 —— 链中途不再 torch.empty.
+        logits = sgl_kernel_zeus.dsa_index_logits_lmem_addr_table_dual_core(
             q_body, weights, bc0, bc1, scale_cache,
             addr_c0, addr_c1, work_c0, work_c1,
-            seq_lens, logits, page_size=page_size,
+            seq_lens, page_size=page_size, max_logical_s=max_logical_s,
         )
         if stop_at_logits:
             return logits
 
         # #7  local top-K (cp=1 → IS global top-K). 输出 logical position
-        # in [0, max_logical_s); -inf 位置自然输给 valid 的.
-        positions = torch.arange(max_logical_s, dtype=torch.int32).to("zeus")
+        # in [0, max_logical_s); -inf 位置自然输给 valid 的. positions 省略 →
+        # wrapper 内部按 identity (列号 == logical position) 生成, 链中途不再
+        # torch.arange.
         _top_lg, top_pos = sgl_kernel_zeus.dsa_local_topk_radix(
-            logits, positions, Ktop=cfg.Ktop,
+            logits, Ktop=cfg.Ktop,
         )
         # #8  logical position → pool 内 physical slot
         phys_slot = sgl_kernel_zeus.dsa_translate_topk_positions(
