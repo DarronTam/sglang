@@ -70,6 +70,7 @@ class Glm5NextDsaBlock:
         paged_state = block.init_paged_state(
             history, page_size=512, num_physical_pages=4,
         )
+        block.prepare_decode_step(paged_state)   # host: slot_mapping + advance seq_lens
         z_mid, z_out = block.forward_zeus(residual_flat.to("zeus"), paged_state)
 
     Residual 全程 ``[B, N*H]`` bf16; 内部 sublayer 接 ``[B, H]``. mHC 把 N 条
@@ -116,6 +117,11 @@ class Glm5NextDsaBlock:
         return self.attn.init_paged_state(
             history, page_size=page_size, num_physical_pages=num_physical_pages,
         )
+
+    def prepare_decode_step(self, paged_state: dict) -> None:
+        """Host per-step prepare (算 slot_mapping + advance seq_lens), 委托给 attn。
+        每个 decode step 在 :meth:`forward_zeus` 前调用一次 (对齐上游 prepare_for_decode)。"""
+        self.attn.prepare_decode_step(paged_state)
 
     # ── REF forward ─────────────────────────────────────────────
     def forward(self,
@@ -187,9 +193,10 @@ _ZEUS_OPS_REQUIRED = (
     # mHC chain
     "mhc_pre_norm_split", "mhc_sinkhorn", "mhc_pre_apply_mix", "mhc_post",
     # DSA attn sublayer (dual-core paged)
-    "dsa_q_a_proj_norm", "dsa_compute_new_slot", "dsa_kv_a_proj_norm_store",
+    "dsa_q_a_proj_norm", "dsa_kv_a_proj_norm_store",
     "dsa_q_main_absorb", "dsa_indexer_q_weights",
-    "dsa_indexer_k_prep_store_dual_core", "dsa_index_logits_lmem_addr_table",
+    "dsa_indexer_k_prep_store_dual_core",
+    "dsa_index_logits_lmem_addr_table_dual_core",
     "dsa_local_topk_radix", "dsa_translate_topk_positions",
     "dsa_latent_k_gather_paged", "dsa_sparse_mqa_partial",
     "dsa_post_o_proj_no_cp",
@@ -267,6 +274,8 @@ def _run_stage(args) -> Optional[bool]:
                     history, page_size=args.seqlen + 1,
                     num_physical_pages=2 * B,
                 )
+                # host prepare_for_decode 等价步: 算 slot_mapping + advance seq_lens
+                block.prepare_decode_step(paged_state)
                 z_mid, z_out = block.forward_zeus(
                     residual_flat.to("zeus"), paged_state,
                 )

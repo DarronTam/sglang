@@ -188,7 +188,8 @@ class Glm5NextDsaAttn:
           scale_cache        [total_slots]         fp32     共享 scale 池 (zeus)
           block_table        [B, pages_per_seq]    int32    logical→physical (zeus)
           block_table_host   同上                  int32    host 副本 (供 host exec tables 复用)
-          seq_lens           [B]                   int32    current history length (zeus)
+          seq_lens           [B]                   int32    history length (zeus); prepare_decode_step 推进为 inclusive
+          seq_lens_host      [B]                   int32    host 副本 (slot 计算 + exec tables 复用)
           page_size / num_physical_pages           int
           k_local_c0/c1/t_c0/t_c1                            #9 gather 复用的 zero-init LocalMem
         """
@@ -288,6 +289,7 @@ class Glm5NextDsaAttn:
             "block_table":        block_table_host.to("zeus"),
             "block_table_host":   block_table_host,
             "seq_lens":           seq_lens.to("zeus"),
+            "seq_lens_host":      seq_lens.clone(),     # host 副本, prepare_decode_step 推进
             "page_size":          int(page_size),
             "num_physical_pages": P,
             # K_local gather LocalMem pool (zero-init, 跨 step 复用)
@@ -302,13 +304,48 @@ class Glm5NextDsaAttn:
             self._pack_zeus()
         return paged_state
 
+    # ── Host per-step prepare (对齐上游 prepare_for_decode) ──────
+    def prepare_decode_step(self, paged_state: Dict[str, torch.Tensor]) -> None:
+        """Host 侧 per-step KV bookkeeping —— 对齐上游 SGLang ``prepare_for_decode``.
+
+        在 forward 之前, host 一次性完成 (device 链只消费):
+          1. 用当前 (pre-increment) seq_lens 从 block_table 算出本步新 token 的物理
+             槽位 ``slot_mapping`` (= out_cache_loc, = block_table[b,L/PS]*PS+L%PS,
+             L = seq_lens[b]); 越界/未分配页给 -1.
+          2. 把 ``seq_lens`` 推进到含新 token 的 INCLUSIVE 长度。
+          3. 同步 slot_mapping / seq_lens 给 device。
+
+        forward_zeus 不再 compute_new_slot / advance —— 整条 device 链没有任何 ±1。
+        **每个 decode step 必须先调本方法再调** :meth:`forward_zeus`。
+        """
+        page_size = paged_state["page_size"]
+        bt_h = paged_state["block_table_host"]            # [B, max_pages] int32 host
+        sl_h = paged_state["seq_lens_host"]               # [B] int32 host, pre-increment
+        B = sl_h.shape[0]
+        L = sl_h.to(torch.int64)                          # 本步新 token 的逻辑位置
+        lp = L // page_size
+        sip = L % page_size
+        max_pages = bt_h.shape[1]
+        # 越界 = caller 没给 decode 预留页 (见 dsa-paged-state-no-decode-headroom).
+        assert int(lp.max()) < max_pages, (
+            f"decode position {int(L.max())} 超出已分配页 (max_pages={max_pages}, "
+            f"page_size={page_size}); init_paged_state 需更大 page_size 预留 decode 余量"
+        )
+        pp = bt_h.to(torch.int64).gather(1, lp.view(B, 1)).view(B)   # block_table_host[b, L/PS]
+        slot = torch.where(
+            pp >= 0, pp * page_size + sip, torch.full_like(pp, -1),
+        ).to(torch.int32)
+        sl_h_new = (sl_h + 1).to(torch.int32)             # advance 到 inclusive
+        paged_state["seq_lens_host"] = sl_h_new
+        paged_state["seq_lens"] = sl_h_new.to("zeus")
+        paged_state["slot_mapping"] = slot.to("zeus")
+
     # ── Zeus forward (dual-core paged) ──────────────────────────
     def forward_zeus(
         self,
         hidden_z: torch.Tensor,
         paged_state: Dict[str, torch.Tensor],
         *,
-        advance_seq_lens: bool = True,
         stop_at_logits: bool = False,
     ) -> torch.Tensor:
         """Zeus DSA decode (dual-core paged chain, 全 device-resident).
@@ -329,11 +366,15 @@ class Glm5NextDsaAttn:
           - latent K gather 用 ``dsa_latent_k_gather_paged`` (paged pool 直接 gather)
           - 全链路 device-resident, 没有 D2H concat / per-batch loop / host coordination
 
+        seq_lens / slot_mapping 由 host 侧 :meth:`prepare_decode_step` 在每步 forward
+        前算好并写进 ``paged_state`` (对齐上游 SGLang: scheduler 在 forward 前
+        allocate out_cache_loc 并 advance seq_lens). forward 只消费, 自己不再
+        compute_new_slot / advance —— 整条 device 链没有任何 ±1.
+
         Args:
           hidden_z:         [B, H] bf16 (zeus)
-          paged_state:      由 :meth:`init_paged_state` 返回的 device-resident dict.
-          advance_seq_lens: True (默认) → 写完 pool 后 in-place 推进 ``seq_lens[b] += 1``,
-                            使下游 read 看到新 step. multi-step decode 必需.
+          paged_state:      :meth:`init_paged_state` 返回 + 每步 :meth:`prepare_decode_step`
+                            刷新过的 device-resident dict.
           stop_at_logits:   True → 跑到 #6 即返回 index logits ``[B, max_logical_s]``
                             (对拍/调试用).
         """
@@ -341,10 +382,13 @@ class Glm5NextDsaAttn:
         B = hidden_z.shape[0]
 
         # ── 取出 device-resident paged state (集中在 device chain 之前) ──
+        # seq_lens / slot_mapping 已由 host prepare_decode_step 刷新: seq_lens 是
+        # INCLUSIVE (含本步新 token), slot_mapping 是新 token 的物理槽位 (out_cache_loc).
         latent_pool   = paged_state["latent_kv_pool"]
         block_table   = paged_state["block_table"]            # zeus
         block_table_h = paged_state["block_table_host"]       # host, 静态
-        seq_lens      = paged_state["seq_lens"]               # zeus, pre-advance
+        seq_lens      = paged_state["seq_lens"]               # zeus, INCLUSIVE
+        slot_mapping  = paged_state["slot_mapping"]           # zeus, host 算好
         bc0           = paged_state["body_cache_c0"]
         bc1           = paged_state["body_cache_c1"]
         scale_cache   = paged_state["scale_cache"]
@@ -357,13 +401,13 @@ class Glm5NextDsaAttn:
         max_logical_s = page_size * block_table.shape[1]
 
         # ── host per-core exec tables (在 device chain 之前算好) ──
-        # 只依赖 block_table + 本步 (advance 后) seq_lens + 静态 bank 地址几何,
-        # 不依赖任何 device 中间结果; addr_table entry = group_ptr(local_page) -
-        # base_ptr (按 bank 实际地址反查, 非等距), bank 在 init 一次性分配后几何恒定,
-        # 每步唯一变化的输入是 seq_lens (决定每核 owned page 数).
-        seq_lens_after = seq_lens.cpu() + (1 if advance_seq_lens else 0)
+        # 只依赖 block_table + 本步 INCLUSIVE seq_lens + 静态 bank 地址几何, 不依赖
+        # 任何 device 中间结果; addr_table entry = group_ptr(local_page) - base_ptr
+        # (按 bank 实际地址反查, 非等距), bank 在 init 一次性分配后几何恒定, 每步唯一
+        # 变化的输入是 seq_lens (决定每核 owned page 数). 无 ±1: seq_lens_host 已是
+        # host prepare_decode_step 推进后的 inclusive 值.
         tables = build_index_k_exec_tables(
-            block_table_h, seq_lens_after, P, page_size, bc0, bc1,
+            block_table_h, paged_state["seq_lens_host"], P, page_size, bc0, bc1,
         )
         addr_c0 = tables["addr_table"][0].to("zeus")
         addr_c1 = tables["addr_table"][1].to("zeus")
@@ -375,11 +419,9 @@ class Glm5NextDsaAttn:
         q_lora = sgl_kernel_zeus.dsa_q_a_proj_norm(
             hidden_z, self._w_lmem["q_a"], self._w_z["q_a_norm"], eps=cfg.rms_norm_eps,
         )
-        # #2a  写入 slot: new_slot[b] = block_table[b, L/PS]*PS + L%PS, L=seq_lens[b]
-        slot_mapping = sgl_kernel_zeus.dsa_compute_new_slot(
-            block_table, seq_lens, page_size=page_size,
-        )
-        # #2b  kv_a_proj + norm + STORE TO POOL (latent_pool[slot_mapping[b]] = new_k[b])
+        # #2  kv_a_proj + norm + STORE TO POOL (latent_pool[slot_mapping[b]] = new_k[b]).
+        # slot_mapping 由 host prepare_decode_step 算好 (= block_table[b,L/PS]*PS+L%PS,
+        # L = 本步新 token 位置 = inclusive seq_lens - 1); 链里不再 compute_new_slot.
         sgl_kernel_zeus.dsa_kv_a_proj_norm_store(
             hidden_z, self._w_lmem["kv_a"], self._w_z["kv_a_norm"],
             slot_mapping, latent_pool, eps=cfg.rms_norm_eps,
@@ -402,25 +444,17 @@ class Glm5NextDsaAttn:
             bc0, bc1, scale_cache,
             num_physical_pages=P, page_size=page_size, eps=cfg.rms_norm_eps,
         )
-        # history advance —— STORE(pre-advance) 与 READ(post-advance) 之间的分界.
-        # aten op, 单 device kernel launch.
-        if advance_seq_lens:
-            seq_lens = seq_lens + 1
-            paged_state["seq_lens"] = seq_lens
-        # #6  两核各自 paged index GEMM, 共写一块 -1e30 预置的 logits buffer.
-        # max_logical_s = page_size * pages_per_seq (静态上界); 位置 >= seq_lens[b]
-        # 在 kernel 内被置 -inf.
-        logits = torch.full(
-            (B, max_logical_s), -1e30, dtype=torch.float32, device="zeus",
+        # #6  单个 dual-core kernel: 两核合一次 launch, 内部按 physical-page ownership
+        # 写 disjoint 列, 并自行 init -1e30 (无需外部 torch.full); seq_lens INCLUSIVE
+        # → kernel 内位置 >= seq_lens[b] 留 -1e30. logits 是纯输出, 传未初始化 buffer.
+        logits = torch.empty(
+            (B, max_logical_s), dtype=torch.float32, device="zeus",
         )
-        for core_id in (0, 1):
-            sgl_kernel_zeus.dsa_index_logits_lmem_addr_table(
-                q_body, weights,
-                bc0 if core_id == 0 else bc1, scale_cache,
-                addr_c0 if core_id == 0 else addr_c1,
-                work_c0 if core_id == 0 else work_c1,
-                seq_lens, logits, page_size=page_size, core_id=core_id,
-            )
+        sgl_kernel_zeus.dsa_index_logits_lmem_addr_table_dual_core(
+            q_body, weights, bc0, bc1, scale_cache,
+            addr_c0, addr_c1, work_c0, work_c1,
+            seq_lens, logits, page_size=page_size,
+        )
         if stop_at_logits:
             return logits
 
@@ -459,9 +493,10 @@ class Glm5NextDsaAttn:
 
 # ── Stage runner ────────────────────────────────────────────────
 _ZEUS_OPS_REQUIRED = (
-    "dsa_q_a_proj_norm", "dsa_compute_new_slot", "dsa_kv_a_proj_norm_store",
+    "dsa_q_a_proj_norm", "dsa_kv_a_proj_norm_store",
     "dsa_q_main_absorb", "dsa_indexer_q_weights",
-    "dsa_indexer_k_prep_store_dual_core", "dsa_index_logits_lmem_addr_table",
+    "dsa_indexer_k_prep_store_dual_core",
+    "dsa_index_logits_lmem_addr_table_dual_core",
     "dsa_local_topk_radix", "dsa_translate_topk_positions",
     "dsa_latent_k_gather_paged", "dsa_sparse_mqa_partial",
     "dsa_post_o_proj_no_cp",
@@ -513,6 +548,8 @@ def _run_stage(args) -> bool | None:
                     history, page_size=page_size,
                     num_physical_pages=num_physical_pages,
                 )
+                # host prepare_for_decode 等价步: 算 slot_mapping + advance seq_lens
+                attn.prepare_decode_step(paged_state)
                 z_out = attn.forward_zeus(hidden.to("zeus"), paged_state)
                 z_out_cpu = z_out.cpu()
                 finite = torch.isfinite(z_out_cpu).all().item()

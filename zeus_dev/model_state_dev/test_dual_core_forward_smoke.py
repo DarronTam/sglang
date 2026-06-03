@@ -26,8 +26,10 @@ def test_dual_core_forward_runs():
     for step in range(2):                       # multi-step: seq_lens grows
         torch.manual_seed(100 + step)
         hidden = torch.randn(B, cfg.H, dtype=torch.bfloat16).to("zeus")
+        # host prepare_for_decode 等价步 (每步一次): 算 slot_mapping + advance seq_lens
+        attn.prepare_decode_step(st)
         out = attn.forward_zeus(hidden, st)
         assert out.shape == (B, cfg.H)
-        # logits-only path also runs
+        # logits-only path also runs (复用本步已 prepare 的 state)
         lg = attn.forward_zeus_logits(hidden, st)
         assert lg.shape[0] == B
