@@ -57,7 +57,7 @@ State:
 from __future__ import annotations
 
 import math
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -68,12 +68,121 @@ from _common import (
     compare_tensors, zeus_chain_available,
     make_argparser, print_header, print_summary,
 )
-from sgl_kernel_zeus.dsa_index_k_dual_core import (
-    build_index_k_exec_tables, owner_of_physical_page, local_page_of,
-)
 
 # DSA 底层 API (位于上一级 model_state_dev/)
 import dev_glm5next_dsa_decode_test as dsa
+
+
+# ── Dual-core page ownership + exec-table builder ────────────────
+# 原 sgl_kernel_zeus.dsa_index_k_dual_core, 迁到本 serving 侧 (exec table
+# 构造是 caller 的职责, kernel 包只提供算子). 这样 dev_dsa_attn 不再依赖
+# kernel 包的内部 Python 模块, 没装/没编 dual-core kernel 时仍可纯 REF 跑.
+#
+# CP=1, 按 physical-page ownership 分核: physical page 连续范围对半切, 前一半
+# core0、后一半 core1. pool 固定 ⇒ 静态映射, 无 manager.
+_CORE_NUM = 2
+_PAGES_PER_BLOCK = 512  # 每 16KB native block 容纳的 page 数 (addr_table 内轴)
+_REPEAT = 8             # addr_table 第三维: 同一 offset 的 8 份相同复制
+
+
+def _check_even(P: int) -> None:
+    if P % 2 != 0:
+        raise ValueError(f"P (physical page total) must be even, got {P}")
+
+
+def _check_pp(pp: int, P: int) -> None:
+    if pp < 0 or pp >= P:
+        raise ValueError(f"physical page out of range: pp={pp} not in [0, {P})")
+
+
+def owner_of_physical_page(pp: int, P: int) -> int:
+    _check_even(P)
+    _check_pp(pp, P)
+    return 0 if pp < P // 2 else 1
+
+
+def local_page_of(pp: int, P: int) -> int:
+    _check_even(P)
+    _check_pp(pp, P)
+    split = P // 2
+    return pp if pp < split else pp - split
+
+
+def pages_of_core(core: int, P: int) -> List[int]:
+    _check_even(P)
+    if core not in (0, 1):
+        raise ValueError(f"core must be 0 or 1, got {core}")
+    split = P // 2
+    return list(range(0, split)) if core == 0 else list(range(split, P))
+
+
+def build_index_k_exec_tables(
+    semantic_block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    P: int,
+    page_size: int,
+    body_lmem_c0,
+    body_lmem_c1,
+) -> dict:
+    """每个 step 从最新 block_table 全量重建 per-core 地址表 + work list。
+
+    返回 dict：addr_table=[t0,t1] int32 [B, max_blocks_core, REPEAT, PAGES_PER_BLOCK]，
+    work_list=[w0,w1] int32 [B, max_pages_core, 3]=(b, logical_page, physical_page)，
+    外加 max_blocks_core, max_pages_core。
+    entry = group_ptr(local_page) - base_ptr（相对本核 bank 基址的 int32 字节 offset），
+    core 侧 addr = base_ptr + offset。几何空位填 0；有效性以 work_list 为准（READ
+    只读 work_list 指向的格），故 offset 0（local_page 0）合法、不与空位混淆。
+    """
+    _check_even(P)
+    if semantic_block_table.dim() != 2:
+        raise ValueError("semantic_block_table must be [B, max_pages_per_seq]")
+    B, max_pages_per_seq = semantic_block_table.shape
+    bt = semantic_block_table.cpu().tolist()
+    sl = seq_lens.cpu().tolist()
+    # 兼容 to_local_mem(LocalMemTensor) 与 from_tensor(ZeusLocalMemTensor)
+    lmems = [getattr(body_lmem_c0, "local_mem", body_lmem_c0),
+             getattr(body_lmem_c1, "local_mem", body_lmem_c1)]
+
+    owned = [[[] for _ in range(B)] for _ in range(_CORE_NUM)]  # owned[core][b]=list[(lp,pp)]
+    for b in range(B):
+        n_valid_pages = (int(sl[b]) + page_size - 1) // page_size
+        for lp in range(min(n_valid_pages, max_pages_per_seq)):
+            pp = int(bt[b][lp])
+            if pp < 0:
+                continue
+            c = owner_of_physical_page(pp, P)
+            owned[c][b].append((lp, pp))
+
+    # 按 ownership 统计每个 (core, b) 实际拥有的 page 数
+    max_pages_core = max(
+        (len(owned[c][b]) for c in range(_CORE_NUM) for b in range(B)), default=0,
+    )
+    max_pages_core = max(max_pages_core, 1)
+    max_blocks_core = (max_pages_core + _PAGES_PER_BLOCK - 1) // _PAGES_PER_BLOCK
+
+    addr_tables, work_lists = [], []
+    for c in range(_CORE_NUM):
+        base_ptr_c = int(lmems[c].base_ptr)  # 本核 bank 基址
+        t = torch.zeros((B, max_blocks_core, _REPEAT, _PAGES_PER_BLOCK), dtype=torch.int32)
+        w = torch.full((B, max_pages_core, 3), -1, dtype=torch.int32)
+        for b in range(B):
+            for j, (lp, pp) in enumerate(owned[c][b]):
+                # entry = bank-relative 字节 offset；core 侧 base_ptr + offset 定位
+                offset = int(lmems[c].group_ptr(local_page_of(pp, P))) - base_ptr_c
+                blk, within = j // _PAGES_PER_BLOCK, j % _PAGES_PER_BLOCK
+                t[b, blk, :, within] = offset
+                w[b, j, 0] = b
+                w[b, j, 1] = lp
+                w[b, j, 2] = pp
+        addr_tables.append(t)
+        work_lists.append(w)
+
+    return {
+        "addr_table": addr_tables,
+        "work_list": work_lists,
+        "max_blocks_core": max_blocks_core,
+        "max_pages_core": max_pages_core,
+    }
 
 
 # ── Module ──────────────────────────────────────────────────────
@@ -177,7 +286,7 @@ class Glm5NextDsaAttn:
         """从 ``dsa.GlobalHistory`` 构造 **device-resident** dual-core paged state.
 
         physical page 连续范围对半切核 (前 P/2 → core0, 后 P/2 → core1, 见
-        ``dsa_index_k_dual_core``); 同一 seq 的相邻 logical page 奇偶交替落核,
+        本模块顶部 ``owner_of_physical_page``); 同一 seq 的相邻 logical page 奇偶交替落核,
         强制 page-wise 跨核 split. history 直接摊进两个 per-core bank + 共享
         latent/scale pool, 返回时全部已搬上 zeus device + LocalMem pack ——
         ``forward_zeus`` 进来不再做任何 load.
@@ -325,12 +434,8 @@ class Glm5NextDsaAttn:
         L = sl_h.to(torch.int64)                          # 本步新 token 的逻辑位置
         lp = L // page_size
         sip = L % page_size
-        max_pages = bt_h.shape[1]
-        # 越界 = caller 没给 decode 预留页 (见 dsa-paged-state-no-decode-headroom).
-        assert int(lp.max()) < max_pages, (
-            f"decode position {int(L.max())} 超出已分配页 (max_pages={max_pages}, "
-            f"page_size={page_size}); init_paged_state 需更大 page_size 预留 decode 余量"
-        )
+        # 越界 (lp >= max_pages, caller 没给 decode 预留页) 由下面 gather 直接抛
+        # index error, 不静默; 见 dsa-paged-state-no-decode-headroom.
         pp = bt_h.to(torch.int64).gather(1, lp.view(B, 1)).view(B)   # block_table_host[b, L/PS]
         slot = torch.where(
             pp >= 0, pp * page_size + sip, torch.full_like(pp, -1),
