@@ -32,6 +32,13 @@ Chain (与 dev_glm5next_block_decode_test.zeus_moe_decode 一致):
   python glm5next_modules/dev_moe.py                    # 16b / both
   python glm5next_modules/dev_moe.py --config next      # next / both (REF SKIP)
   python glm5next_modules/dev_moe.py --mode zeus
+  python glm5next_modules/dev_moe.py --triton_forward   # REF / Zeus-simC / Zeus-Triton 三路对拍
+
+三路对拍 (``--triton_forward``):
+  - forward             REF host bf16 MoE chain                         (golden A)
+  - forward_zeus        Zeus C++ sim-C MoE chain (sgl_kernel_zeus)       (golden B)
+  - forward_zeus_triton Zeus Triton-JIT MoE chain (sgl_kernel_zeus_triton)
+  三者使用同一份权重；next 配置 REF 内存过大时三路对拍自动 SKIP.
 """
 
 from __future__ import annotations
@@ -53,6 +60,16 @@ from _common import (
 
 # REF MoE core 复用 (上一级 dev_glm4_moe_test)
 import dev_glm4_moe_test as moe_dev
+
+
+# ── sgl-kernel-zeus-triton (sibling Triton-JIT package) ─────────
+# Editable-installed alongside sgl_kernel_zeus (`pip install -e
+# sgl-kernel-zeus-triton`), so it imports directly — no sys.path bootstrap.
+# Guarded so the basic REF/Zeus test still runs when it isn't installed.
+try:
+    import sgl_kernel_zeus_triton
+except Exception:  # pragma: no cover
+    sgl_kernel_zeus_triton = None
 
 
 # ── Config ──────────────────────────────────────────────────────
@@ -147,6 +164,12 @@ class Glm5NextMoE:
         self._corr_bias_z = None
         self._w13_z = None
         self._w2_z = None
+        self._triton_weights_packed = False
+        self._gate_w_triton_z = None
+        self._sh_gu_triton_z = None
+        self._sh_dp_triton_z = None
+        self._w13_triton_z = None
+        self._w2_triton_z = None
         # Per-T scratch buffer cache (lazy alloc per batch-size, reused across
         # forwards with the same T). 5 个中间 buffer 都仅由 T 决定 (top_k / sI /
         # mI / H 都来自 config), 因此可以池化避免每次 forward 重新 alloc.
@@ -232,6 +255,30 @@ class Glm5NextMoE:
         )
         self._zeus_packed = True
 
+    def _pack_zeus_triton_weights(self) -> None:
+        """Plain Zeus contiguous weights consumed by Triton-JIT wrappers.
+
+        Lmem initialization for these tensors is owned by the
+        ``sgl_kernel_zeus_triton`` Python wrappers and cached there.
+        """
+        if ZEUS_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                f"Zeus runtime unavailable: {ZEUS_IMPORT_ERROR}"
+            )
+        if self._gate_w_triton_z is None:
+            self._gate_w_triton_z = self.gate_w.to("zeus").contiguous()
+        if self._sh_gu_triton_z is None:
+            self._sh_gu_triton_z = self.sh_gu.to("zeus").contiguous()
+        if self._sh_dp_triton_z is None:
+            self._sh_dp_triton_z = self.sh_dp.to("zeus").contiguous()
+        if self._w13_triton_z is None:
+            self._w13_triton_z = self.w13.to("zeus").contiguous()
+        if self._w2_triton_z is None:
+            self._w2_triton_z = self.w2.to("zeus").contiguous()
+        if self._corr_bias_z is None:
+            self._corr_bias_z = self.corr_bias.to("zeus")
+        self._triton_weights_packed = True
+
     def _get_scratch(self, T: int) -> Dict[str, torch.Tensor]:
         """Per-T scratch buffer pool. Allocates once per batch-size T, reuses on
         subsequent forwards. 生产路径下 layer 持有的 buffer 也是按 max-T 预分配,
@@ -242,7 +289,12 @@ class Glm5NextMoE:
             top_k = cfg.top_k
             num_valid_tokens = T * top_k
             s = {
+                "router_logits": torch.empty(T, cfg.E, dtype=torch.float32, device="zeus"),
+                "sh_gu":    torch.empty(T, 2 * cfg.sI,
+                                        dtype=torch.bfloat16, device="zeus"),
                 "sh_silu": torch.empty(T, cfg.sI, dtype=torch.bfloat16, device="zeus"),
+                "shared_out": torch.empty(T, cfg.H,
+                                          dtype=torch.bfloat16, device="zeus"),
                 "C1":      torch.empty(num_valid_tokens, 2 * cfg.mI,
                                        dtype=torch.bfloat16, device="zeus"),
                 "C1_silu": torch.empty(num_valid_tokens, cfg.mI,
@@ -327,6 +379,102 @@ class Glm5NextMoE:
         )
         return final_z
 
+    # ── Zeus Triton-JIT forward ─────────────────────────────────
+    def forward_zeus_triton(self, hidden_z: torch.Tensor) -> torch.Tensor:
+        """Zeus MoE chain via the Triton-JIT kernels — SAME weights as
+        :meth:`forward_zeus`.
+
+        ``hidden_z: [T, H] bf16 (zeus)  ->  [T, H] bf16 (zeus)``
+        """
+        if sgl_kernel_zeus_triton is None:
+            raise RuntimeError("sgl_kernel_zeus_triton is not installed")
+        if not self._triton_weights_packed:
+            self._pack_zeus_triton_weights()
+
+        cfg = self.cfg
+        T = hidden_z.shape[0]
+        H = hidden_z.shape[-1]
+        E, top_k = cfg.E, cfg.top_k
+        block_size = sgl_kernel_zeus.MOE_GROUPED_GEMM_BLOCK_M
+        num_valid_tokens = T * top_k
+        scratch = self._get_scratch(T)
+
+        router_logits_z = scratch["router_logits"]
+        sgl_kernel_zeus_triton.linear_bf16_outfp32(
+            hidden_z,
+            self._gate_w_triton_z,
+            out=router_logits_z,
+        )
+
+        sh_gu_z = scratch["sh_gu"]
+        sgl_kernel_zeus_triton.linear_bf16(
+            hidden_z,
+            self._sh_gu_triton_z,
+            out=sh_gu_z,
+        )
+        sh_silu_z = scratch["sh_silu"]
+        sgl_kernel_zeus_triton.silu_and_mul(sh_gu_z, out=sh_silu_z)
+        shared_out_z = scratch["shared_out"]
+        sgl_kernel_zeus_triton.linear_bf16(
+            sh_silu_z,
+            self._sh_dp_triton_z,
+            out=shared_out_z,
+        )
+
+        w_z, ids_z = sgl_kernel_zeus_triton.biased_grouped_topk(
+            router_logits_z,
+            self._corr_bias_z,
+            num_expert_group=cfg.num_expert_group,
+            topk_group=cfg.topk_group,
+            topk=top_k,
+            num_fused_shared_experts=0,
+            routed_scaling_factor=cfg.routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=True,
+        )
+        sorted_ids_z, expert_ids_z, num_post_z = sgl_kernel_zeus_triton.moe_align_block_size_alloc(
+            ids_z,
+            block_size,
+            E,
+        )
+
+        C1_z = scratch["C1"]
+        sgl_kernel_zeus_triton.moe_grouped_gemm(
+            hidden_z,
+            self._w13_triton_z,
+            sorted_ids_z,
+            expert_ids_z,
+            num_post_z,
+            num_valid_tokens=num_valid_tokens,
+            top_k=top_k,
+            out=C1_z,
+        )
+
+        C1_silu_z = scratch["C1_silu"]
+        sgl_kernel_zeus_triton.silu_and_mul(C1_z, out=C1_silu_z)
+
+        C2_z = scratch["C2"]
+        sgl_kernel_zeus_triton.moe_grouped_gemm(
+            C1_silu_z,
+            self._w2_triton_z,
+            sorted_ids_z,
+            expert_ids_z,
+            num_post_z,
+            topk_weights=w_z.flatten(),
+            num_valid_tokens=num_valid_tokens,
+            top_k=1,
+            mul_routed_weight=True,
+            out=C2_z,
+        )
+
+        final_z = scratch["final"]
+        sgl_kernel_zeus_triton.moe_sum_reduce(
+            C2_z.view(T, top_k, H),
+            output=final_z,
+            shared_output=shared_out_z,
+            routed_scaling_factor=cfg.routed_scaling_factor,
+        )
+        return final_z
+
 
 # ── Stage runner ────────────────────────────────────────────────
 _ZEUS_OPS_REQUIRED = (
@@ -334,6 +482,38 @@ _ZEUS_OPS_REQUIRED = (
     "biased_grouped_topk", "moe_align_block_size_alloc",
     "moe_grouped_gemm", "silu_and_mul", "moe_sum_reduce",
 )
+
+
+def _run_triton_three_way(moe, hidden, cfg, args) -> bool:
+    """REF / Zeus-simC / Zeus-Triton 三路对拍 (full MoE chain).
+
+    三路:
+      - REF          forward             host bf16 MoE chain
+      - Zeus-simC    forward_zeus        C++ sim-C kernels
+      - Zeus-Triton  forward_zeus_triton Triton-JIT kernels
+    """
+    hidden_z = hidden.to("zeus")
+    ref = moe.forward(hidden)                    # golden A (host)
+    simc = moe.forward_zeus(hidden_z).cpu()      # golden B (C++ sim-C)
+    tri = moe.forward_zeus_triton(hidden_z).cpu()  # under test (Triton)
+
+    print(f"  ZEUS-TRITON out shape={tuple(tri.shape)} dtype={tri.dtype}")
+    print(f"  ZEUS-TRITON out[0,:4] = "
+          f"{[round(v,4) for v in tri[0,:4].float().tolist()]}")
+    finite_t = torch.isfinite(tri).all().item()
+    shape_ok_t = (tri.shape == (args.num_tokens, cfg.H)
+                  and tri.dtype == torch.bfloat16)
+    print(f"  ZEUS-TRITON finite={finite_t} shape_ok={shape_ok_t}")
+
+    c_tri_ref = compare_tensors(
+        f"moe.{args.config}.triton-vs-REF", ref, tri, atol=5e-2, rtol=5e-2)
+    c_tri_simc = compare_tensors(
+        f"moe.{args.config}.triton-vs-simC", simc, tri, atol=5e-2, rtol=5e-2)
+    # golden 自洽: REF vs simC 也应一致
+    c_ref_simc = compare_tensors(
+        f"moe.{args.config}.REF-vs-simC", ref, simc, atol=5e-2, rtol=5e-2)
+
+    return bool(finite_t and shape_ok_t and c_tri_ref and c_tri_simc and c_ref_simc)
 
 
 def _run_stage(args) -> Optional[bool]:
@@ -401,21 +581,56 @@ def _run_stage(args) -> Optional[bool]:
                 traceback.print_exc()
                 zeus_ok = False
 
+    # ── Zeus Triton-JIT (三路对拍) ────────────────────────────
+    # 仅当 --triton_forward 时跑第三路, 与 REF (golden A) / Zeus-simC (golden B)
+    # 做三路比较.
+    triton_ok: Optional[bool] = None
+    if getattr(args, "triton_forward", False):
+        if not zeus_chain_available(*_ZEUS_OPS_REQUIRED):
+            print(f"  ZEUS-TRITON: SKIP (chain unavailable: {ZEUS_IMPORT_ERROR})")
+        elif sgl_kernel_zeus_triton is None:
+            print("  ZEUS-TRITON: SKIP (sgl_kernel_zeus_triton not installed: "
+                  "`pip install -e sgl-kernel-zeus-triton`)")
+        elif ref_mem > REF_MEMORY_BUDGET_GB:
+            print(f"  ZEUS-TRITON: SKIP three-way ({ref_mem:.1f} GB > budget "
+                  f"{REF_MEMORY_BUDGET_GB:.1f} GB; REF unavailable)")
+        else:
+            try:
+                triton_ok = _run_triton_three_way(moe, hidden, cfg, args)
+            except Exception as e:
+                import traceback
+                print(f"  ZEUS-TRITON EXCEPTION: {e!r}")
+                traceback.print_exc()
+                triton_ok = False
+
     # ── status 汇总 ──────────────────────────────────────────
+    def _fold(base: Optional[bool]) -> Optional[bool]:
+        """把三路对拍结果叠加进 base 状态: base False 恒 False, 否则取 triton_ok."""
+        if triton_ok is None:
+            return base
+        if base is False:
+            return False
+        return triton_ok
+
     if args.mode == "ref":
-        return None if ref_skipped else True
+        return _fold(None if ref_skipped else True)
     if args.mode == "zeus":
-        return zeus_ok
+        return _fold(zeus_ok)
     # both
     if ref_skipped:
-        return None if zeus_ok is None else zeus_ok
+        return _fold(None if zeus_ok is None else zeus_ok)
     if zeus_ok is None:
-        return True
-    return zeus_ok
+        return _fold(True)
+    return _fold(zeus_ok)
 
 
 def main():
     parser = make_argparser("dev_moe", description="GLM5-Next MoE sublayer dev test")
+    parser.add_argument(
+        "--triton_forward",
+        action="store_true",
+        help="额外跑 forward_zeus_triton 并做 REF / Zeus-simC / Zeus-Triton 三路对拍",
+    )
     args = parser.parse_args()
     print_header("GLM5-Next MoE sublayer", args)
     ok = _run_stage(args)
