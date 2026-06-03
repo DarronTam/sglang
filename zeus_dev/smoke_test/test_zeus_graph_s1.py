@@ -44,6 +44,7 @@ Usage:
   python zeus_dev/test_zeus_graph_s1.py
 """
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -89,9 +90,14 @@ def run_test(name, code):
             os._exit(1)
     """)
 
+    # Per-test wall-clock budget. The V3 functional-simulator path forks a
+    # Python subprocess per kernel launch and is slow for wide-N GEMMs (a single
+    # gate_up GEMM can take ~2min), so a multi-layer decode capture can run for
+    # several minutes. Override with ZEUS_GRAPH_TEST_TIMEOUT when needed.
+    _timeout = float(os.environ.get("ZEUS_GRAPH_TEST_TIMEOUT", "900"))
     result = subprocess.run(
         [sys.executable, "-c", full_code],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True, timeout=_timeout,
     )
     output = result.stdout + result.stderr
     passed = result.returncode == 0 and "PASSED" in result.stdout
@@ -256,13 +262,18 @@ def _():
         from sgl_kernel_zeus import embedding
 
         s = torch_zeus.zeus.Stream()
-        VOCAB, HIDDEN = 1024, 896
-        weight = torch.randn(VOCAB, HIDDEN, dtype=DTYPE, device=DEVICE)
+        VOCAB, HIDDEN = 1024, 896  # HIDDEN not a multiple of 128 -> padded path
+        # Pack OUTSIDE capture (equiv. layer.__init__): pack does .to('zeus') +
+        # to_local_mem, which must not be in the captured region. The packed
+        # weight is a stable resident tensor; the captured op only does
+        # torch.empty(out) + kernel write.
+        weight = torch.randn(VOCAB, HIDDEN, dtype=DTYPE)
+        packed = embedding.pack(weight)
         ids = torch.randint(0, VOCAB, (4,), dtype=torch.int32).to(DEVICE)
 
         g = torch_zeus.zeus.ZEUSGraph()
         with torch_zeus.zeus.graph(g, stream=s):
-            out = embedding(ids, weight)
+            out = embedding(ids, packed)
         print("capture ok")
 
         g.replay()
@@ -379,7 +390,7 @@ def _():
     return textwrap.dedent("""\
         # Phase 3: Verify torch.argmax works natively on Zeus device
         # (Previously required CPU roundtrip: argmax(logits.cpu()).to(device))
-        VOCAB = 1024
+        VOCAB = 256   # reduced lm_head/embedding vocab: flow-only test, keep V3 sim fast
         bs = 4
         logits = torch.randn(bs, VOCAB, dtype=DTYPE, device=DEVICE)
 
@@ -405,7 +416,7 @@ def _():
         )
 
         s = torch_zeus.zeus.Stream()
-        H, D = 896, 4864
+        H, D = 896, 512   # reduced FFN intermediate: V3 sim is slow on wide-N gate_up GEMM; flow-only test
         NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, PAGE_SIZE = 14, 2, 64, 128
         q_size = NUM_HEADS * HEAD_DIM
         kv_size = NUM_KV_HEADS * HEAD_DIM
@@ -501,8 +512,8 @@ def _():
         )
 
         s = torch_zeus.zeus.Stream()
-        H, D = 896, 4864
-        VOCAB = 1024
+        H, D = 896, 512   # reduced FFN intermediate: V3 sim is slow on wide-N gate_up GEMM; flow-only test
+        VOCAB = 256   # reduced lm_head/embedding vocab: flow-only test, keep V3 sim fast
         NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, PAGE_SIZE = 14, 2, 64, 128
         N_LAYERS = 4
         q_size = NUM_HEADS * HEAD_DIM
@@ -547,7 +558,7 @@ def _():
         positions = torch.tensor([sl - 1 for sl in seq_lens], dtype=torch.int32).to(DEVICE)
         out_cache_loc = torch.tensor([seq_lens[0] - 1, total_kv - 1], dtype=torch.int32).to(DEVICE)
 
-        embed_w = torch.randn(VOCAB, H, dtype=DTYPE, device=DEVICE)
+        embed_w = embedding.pack(torch.randn(VOCAB, H, dtype=DTYPE))  # pack outside capture
         input_ids = torch.randint(0, VOCAB, (bs,), dtype=torch.int32).to(DEVICE)
 
         hidden = torch.empty(bs, H, dtype=DTYPE, device=DEVICE)
@@ -646,8 +657,8 @@ def _():
         )
 
         s = torch_zeus.zeus.Stream()
-        H, D = 896, 4864
-        VOCAB = 1024
+        H, D = 896, 512   # reduced FFN intermediate: V3 sim is slow on wide-N gate_up GEMM; flow-only test
+        VOCAB = 256   # reduced lm_head/embedding vocab: flow-only test, keep V3 sim fast
         NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, PAGE_SIZE = 14, 2, 64, 128
         N_LAYERS = 2
         q_size = NUM_HEADS * HEAD_DIM
@@ -690,7 +701,7 @@ def _():
         positions = torch.tensor([sl - 1 for sl in seq_lens], dtype=torch.int32).to(DEVICE)
         out_cache_loc = torch.tensor([seq_lens[0] - 1, total_kv - 1], dtype=torch.int32).to(DEVICE)
 
-        embed_w = torch.randn(VOCAB, H, dtype=DTYPE, device=DEVICE)
+        embed_w = embedding.pack(torch.randn(VOCAB, H, dtype=DTYPE))  # pack outside capture
         input_ids = torch.randint(0, VOCAB, (bs,), dtype=torch.int32).to(DEVICE)
 
         hidden = torch.empty(bs, H, dtype=DTYPE, device=DEVICE)
@@ -1009,7 +1020,7 @@ def _():
         kv_indices = torch.arange(total_kv, dtype=torch.int32).to(DEVICE)
         positions = torch.tensor([sl - 1 for sl in seq_lens], dtype=torch.int32).to(DEVICE)
         out_cache_loc = torch.tensor([seq_lens[0] - 1, total_kv - 1], dtype=torch.int32).to(DEVICE)
-        embed_w = torch.randn(VOCAB, H, dtype=DTYPE, device=DEVICE)
+        embed_w = embedding.pack(torch.randn(VOCAB, H, dtype=DTYPE))  # pack outside capture
         input_ids = torch.randint(0, VOCAB, (bs,), dtype=torch.int32).to(DEVICE)
 
         hidden = torch.empty(bs, H, dtype=DTYPE, device=DEVICE)
