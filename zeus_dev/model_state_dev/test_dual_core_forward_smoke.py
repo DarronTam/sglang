@@ -17,9 +17,12 @@ from glm5next_modules.dev_dsa_attn import Glm5NextDsaAttn
 def test_dual_core_forward_runs():
     attn = Glm5NextDsaAttn(which="16b", seed=42)
     cfg = attn.cfg
-    B, seqlen, page_size, P = 2, 1024, 512, 4
+    # 几何须给 decode 留位: history 摊进 pages_per_seq=ceil(S/PS) 页, 后续
+    # decode 写在 pos S, S+1, ... 必须仍落在已分配页内. S=600/PS=512 →
+    # pages_per_seq=2 (真实跨双核), 写在 pos 600+ → page 1, 界内.
+    B, seqlen, page_size, P = 2, 600, 512, 4
     st = attn.init_paged_state(dsa.init_history(cfg, B, seqlen, seed=1),
-                               page_size=page_size, num_physical_pages=P, dual_core=True)
+                               page_size=page_size, num_physical_pages=P)
     for step in range(2):                       # multi-step: seq_lens grows
         torch.manual_seed(100 + step)
         hidden = torch.randn(B, cfg.H, dtype=torch.bfloat16).to("zeus")

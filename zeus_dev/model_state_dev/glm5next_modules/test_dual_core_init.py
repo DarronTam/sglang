@@ -13,7 +13,7 @@ def test_dual_core_init_geometry():
     B, seqlen, page_size, P = 2, 1024, 512, 4
     history = dsa.init_history(cfg, B, seqlen, seed=1)
     st = attn.init_paged_state(history, page_size=page_size,
-                               num_physical_pages=P, dual_core=True)
+                               num_physical_pages=P)
     assert P % 2 == 0
     assert st["page_size"] == page_size
     assert st["num_physical_pages"] == P
@@ -22,9 +22,9 @@ def test_dual_core_init_geometry():
     assert st["scale_cache"].shape == (P * page_size,)
     pages_per_seq = -(-seqlen // page_size)        # ceil
     assert pages_per_seq >= 2, "config must exercise multi-page-per-seq"
-    assert st["block_table"].shape[1] >= pages_per_seq
+    assert st["block_table_host"].shape[1] >= pages_per_seq
     # 同源自检:每个有效 (b, lp_logical) 的 pp 唯一且在 [0,P)
-    bt = st["block_table"]
+    bt = st["block_table_host"]
     seen = set()
     for b in range(B):
         for lp in range(pages_per_seq):
@@ -45,7 +45,7 @@ def test_dual_core_init_rejects_underprovisioned_odd_pages():
     history = dsa.init_history(cfg, B, seqlen, seed=1)
     with pytest.raises(AssertionError):
         attn.init_paged_state(history, page_size=page_size,
-                              num_physical_pages=P, dual_core=True)
+                              num_physical_pages=P)
 
 
 def test_dual_core_init_odd_pages_no_collision():
@@ -55,8 +55,8 @@ def test_dual_core_init_odd_pages_no_collision():
     B, seqlen, page_size, P = 2, 1100, 512, 8   # pages_per_seq=3; core0 需 4<=P/2=4
     history = dsa.init_history(cfg, B, seqlen, seed=1)
     st = attn.init_paged_state(history, page_size=page_size,
-                               num_physical_pages=P, dual_core=True)
-    bt = st["block_table"]
+                               num_physical_pages=P)
+    bt = st["block_table_host"]
     pages_per_seq = -(-seqlen // page_size)
     seen = set()
     for b in range(B):
