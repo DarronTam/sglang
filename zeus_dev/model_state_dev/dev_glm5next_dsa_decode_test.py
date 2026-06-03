@@ -1066,10 +1066,13 @@ def stage_latent_gather(args, ctx: DevContext) -> Optional[bool]:
             # Invalid rows of K_local and invalid columns of K_local_T are
             # garbage on both cores; mask drives the comparison. Broadcast
             # invariant: c0 and c1 hold bit-identical valid content.
+            # Kernel 契约: latent_kv_cache 现为 [B, num_slots, Rkv]（batch 维最外，
+            # BLOCK_B=1 loop）。这里 per-batch 处理，B=1，故把 [S_local, Rkv] 升成
+            # [1, S_local, Rkv]；slot_indices_b 已是 [1, Ktop]。
             (K_c0, K_c1, K_T_c0, K_T_c1, m_c0, m_c1) = \
                 sgl_kernel_zeus.dsa_latent_k_gather(
                     slot_indices_b.to("zeus"),
-                    cache_b.unsqueeze(0).to("zeus"),
+                    cache_b.unsqueeze(0).contiguous().to("zeus"),
                 )
             # Mask: both cores' masks should equal REF exactly.
             ok &= compare_tensors(
@@ -1421,9 +1424,12 @@ def stage_decode_full_nocp(args, ctx: DevContext) -> Optional[bool]:
     mask_full      = torch.zeros(args.batch, cfg.Ktop,           dtype=torch.bfloat16)
     for b in range(args.batch):
         slot_idx_b = top_pos[b].to(torch.int32).unsqueeze(0)
+        # latent_kv_cache 契约 [B, num_slots, Rkv]，per-batch B=1：[S_full, Rkv]
+        # 升成 [1, S_full, Rkv]。
         (K_c0_b, _K_c1_b, K_T_c0_b, _K_T_c1_b, m_c0_b, _m_c1_b) = \
             sgl_kernel_zeus.dsa_latent_k_gather(
-                slot_idx_b.to("zeus"), full_latent[b:b+1].contiguous().to("zeus"),
+                slot_idx_b.to("zeus"),
+                full_latent[b].unsqueeze(0).contiguous().to("zeus"),
             )
         # Read core-0 banks (c1 is bit-identical content by the broadcast
         # invariant; we just need one canonical copy here for downstream

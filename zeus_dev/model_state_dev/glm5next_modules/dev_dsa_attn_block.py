@@ -15,8 +15,8 @@ GLM5-Next DSA-transformer block (decode) 整层装配 + REF↔Zeus 对拍.
   glm5_next.py 同一个 layer 内 attn-mHC / mlp-mHC 两套独立 mix 参数对齐)
 - DSA attn sublayer 走 paged-attention chain: REF 用 ``dsa.GlobalHistory`` host
   tensors; Zeus 用 :meth:`Glm5NextDsaAttn.init_paged_state` 构造的 paged_state
-  (latent/body/scale 共享池 + block_table + seq_lens), 首次 forward_zeus 一次性
-  搬上 device 之后跨 step 复用, 全链路 device-resident.
+  (latent/body/scale 共享池 + block_table + seq_lens), init 时即一次性搬上
+  device, 之后跨 step 复用, 全链路 device-resident.
 - MLP 与 ``dev_linear_attn_block.py`` 一致, 用 ``Glm5NextMoE``.
 
 用法:
@@ -66,8 +66,11 @@ class Glm5NextDsaBlock:
         history, block_span = block.init_state(B=batch, seqlen=ctx_len, seed=...)
         # REF
         mid, out = block.forward(residual_flat, history, new_pos=ctx_len)
-        # Zeus
-        paged_state = block.init_paged_state(history)
+        # Zeus (dual-core paged)
+        paged_state = block.init_paged_state(
+            history, page_size=512, num_physical_pages=4,
+        )
+        block.prepare_decode_step(paged_state)   # host: slot_mapping + advance seq_lens
         z_mid, z_out = block.forward_zeus(residual_flat.to("zeus"), paged_state)
 
     Residual 全程 ``[B, N*H]`` bf16; 内部 sublayer 接 ``[B, H]``. mHC 把 N 条
@@ -102,15 +105,23 @@ class Glm5NextDsaBlock:
                    ) -> Tuple[dsa.GlobalHistory, int]:
         """构造初始 KV history (REF 用) + block_span 常量.
 
-        Zeus 路径需要再调 :meth:`init_paged_state(history)` 把 history 摊到
-        paged pool. 两套 state 共用同一份 host history, 保证 REF / Zeus 起点一致.
+        Zeus 路径需要再调 :meth:`init_paged_state(history, page_size=...,
+        num_physical_pages=...)` 把 history 摊到 paged pool. 两套 state 共用
+        同一份 host history, 保证 REF / Zeus 起点一致.
         """
         return self.attn.init_state(B, seqlen, seed=seed, block_span=block_span)
 
     def init_paged_state(self, history: dsa.GlobalHistory, *,
-                         page_size: Optional[int] = None) -> dict:
-        """从 history 构造 paged_state (Zeus 用)."""
-        return self.attn.init_paged_state(history, page_size=page_size)
+                         page_size: int, num_physical_pages: int) -> dict:
+        """从 history 构造 dual-core paged_state (Zeus 用)."""
+        return self.attn.init_paged_state(
+            history, page_size=page_size, num_physical_pages=num_physical_pages,
+        )
+
+    def prepare_decode_step(self, paged_state: dict) -> None:
+        """Host per-step prepare (算 slot_mapping + advance seq_lens), 委托给 attn。
+        每个 decode step 在 :meth:`forward_zeus` 前调用一次 (对齐上游 prepare_for_decode)。"""
+        self.attn.prepare_decode_step(paged_state)
 
     # ── REF forward ─────────────────────────────────────────────
     def forward(self,
@@ -181,10 +192,11 @@ class Glm5NextDsaBlock:
 _ZEUS_OPS_REQUIRED = (
     # mHC chain
     "mhc_pre_norm_split", "mhc_sinkhorn", "mhc_pre_apply_mix", "mhc_post",
-    # DSA attn sublayer (paged)
-    "dsa_q_a_proj_norm", "dsa_kv_a_proj_norm_store", "dsa_q_main_absorb",
-    "dsa_indexer_q_weights", "dsa_indexer_k_prep_store",
-    "dsa_compute_new_slot", "dsa_index_logits_paged",
+    # DSA attn sublayer (dual-core paged)
+    "dsa_q_a_proj_norm", "dsa_kv_a_proj_norm_store",
+    "dsa_q_main_absorb", "dsa_indexer_q_weights",
+    "dsa_indexer_k_prep_store_dual_core",
+    "dsa_index_logits_lmem_addr_table_dual_core",
     "dsa_local_topk_radix", "dsa_translate_topk_positions",
     "dsa_latent_k_gather_paged", "dsa_sparse_mqa_partial",
     "dsa_post_o_proj_no_cp",
@@ -255,8 +267,15 @@ def _run_stage(args) -> Optional[bool]:
             print(f"  ZEUS: SKIP (chain unavailable: {ZEUS_IMPORT_ERROR})")
         else:
             try:
-                # paged_state 从同一份 host history 构造 —— REF / Zeus 起点一致
-                paged_state = block.init_paged_state(history)
+                # paged_state 从同一份 host history 构造 —— REF / Zeus 起点一致.
+                # 退化几何: page_size=S_hist+1 → 每 seq 单 logical page,
+                # num_physical_pages=2*B 满足 dual-core 逐核容量.
+                paged_state = block.init_paged_state(
+                    history, page_size=args.seqlen + 1,
+                    num_physical_pages=2 * B,
+                )
+                # host prepare_for_decode 等价步: 算 slot_mapping + advance seq_lens
+                block.prepare_decode_step(paged_state)
                 z_mid, z_out = block.forward_zeus(
                     residual_flat.to("zeus"), paged_state,
                 )
