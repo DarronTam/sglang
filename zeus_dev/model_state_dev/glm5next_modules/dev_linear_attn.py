@@ -149,6 +149,13 @@ class Glm5NextLinearAttn:
 
     def __init__(self, cfg: Glm5NextLinearAttnConfig, seed: int = 0):
         self.cfg = cfg
+        # gate/o reshape (REF forward L241, forward_zeus gproj_z.reshape) 假设
+        # head_v_dim == head_k_dim: gproj/g_b 实际按 Dk 切, 却 reshape 成 [.., Hh, Dv].
+        # 异构 head dim 会静默 mis-shape, 此处一次性硬校验.
+        assert cfg.head_v_dim == cfg.head_k_dim, (
+            f"gate/o reshape 假设 head_v_dim == head_k_dim, got "
+            f"Dv={cfg.head_v_dim} Dk={cfg.head_k_dim}; 异构 head dim 需重写 gate reshape"
+        )
         g = torch.Generator().manual_seed(seed)
 
         def rn(*shape, scale: float = 0.02, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
@@ -306,6 +313,11 @@ class Glm5NextLinearAttn:
         B = hidden_z.shape[0]
         H, Hh, Dk, Dv, P = cfg.H, cfg.num_heads, cfg.head_k_dim, cfg.head_v_dim, cfg.proj_size
 
+        # ── host/setup 准备 (集中在 device chain 之前, 对齐 DSA 链路标准) ──
+        # cu_seqlens = [0,1,..,B] 只依赖 B, pooled per-B; hoist 到链外, 让下面
+        # #1→#13 是一串纯 kernel 调用, 中途无 device alloc.
+        cu_seqlens_z = self._get_cu_seqlens_z(B)
+
         # 1-7. 6 颗 linear_bf16 + 1 颗 linear_bf16_outfp32_sigmoid (b_proj
         #      走 fp32+sigmoid 融合直出，消除原本 `linear_bf16(b_proj) +
         #      .float().sigmoid()` 中的 cast + sigmoid host fallback)
@@ -340,7 +352,6 @@ class Glm5NextLinearAttn:
         q_4d = q_z.view(B, Hh, Dk)
         k_4d = k_z.view(B, Hh, Dk)
         v_4d = v_z.view(B, Hh, Dv)
-        cu_seqlens_z = self._get_cu_seqlens_z(B)   # pooled per-B
         o_z, _ = sgl_kernel_zeus.fused_recurrent_kda_Sdecay(
             q=q_4d, k=k_4d, v=v_4d,
             g=g_gate_z, beta=beta_fp32,
