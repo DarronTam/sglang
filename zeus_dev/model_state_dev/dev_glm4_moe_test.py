@@ -548,11 +548,11 @@ def test_moe_grouped_gemm(cfg, num_tokens=8, seed=42):
     with torch.no_grad():
         sgl_kernel_zeus.moe_grouped_gemm(
             hidden_states.to("zeus"),
-            w13.to("zeus"),
-            C1_z,
+            sgl_kernel_zeus.moe_grouped_gemm.pack(w13),
             sorted_ids_z, expert_ids_z, num_post_z,
             num_valid_tokens=num_valid_tokens,
             top_k=top_k,
+            out=C1_z,
         )
     C1_ref = _ref_moe_grouped_gemm(
         hidden_states, w13,
@@ -575,13 +575,13 @@ def test_moe_grouped_gemm(cfg, num_tokens=8, seed=42):
     with torch.no_grad():
         sgl_kernel_zeus.moe_grouped_gemm(
             A2.to("zeus"),
-            w2.to("zeus"),
-            C2_z,
+            sgl_kernel_zeus.moe_grouped_gemm.pack(w2),
             sorted_ids_z, expert_ids_z, num_post_z,
             num_valid_tokens=num_valid_tokens,
             top_k=1,
             topk_weights=topk_weights_flat_bf16.to("zeus"),
             mul_routed_weight=True,
+            out=C2_z,
         )
     C2_ref = _ref_moe_grouped_gemm(
         A2, w2,
@@ -885,8 +885,8 @@ def test_moe_block_full(cfg, num_tokens=16, seed=42):
 
     # ── Zeus 6-kernel MoE 核心 ──
     corr_bias_z = corr_bias_fp32.to("zeus")
-    w13_z = w13_bf16.to("zeus")
-    w2_z = w2_bf16.to("zeus")
+    w13_z = sgl_kernel_zeus.moe_grouped_gemm.pack(w13_bf16)
+    w2_z = sgl_kernel_zeus.moe_grouped_gemm.pack(w2_bf16)
     # router_logits_z / shared_out_z 已在 Zeus 上（上面 front-end 算出）
 
     with torch.no_grad():
@@ -914,10 +914,11 @@ def test_moe_block_full(cfg, num_tokens=16, seed=42):
         # 3) gemm1: [T, H] → [T*top_k, 2*mI]
         C1_z = torch.empty(T * top_k, 2 * mI, dtype=torch.bfloat16, device="zeus")
         sgl_kernel_zeus.moe_grouped_gemm(
-            x_z, w13_z, C1_z,
+            x_z, w13_z,
             sorted_ids_z, expert_ids_z, num_post_z,
             num_valid_tokens=num_valid_tokens,
             top_k=top_k,
+            out=C1_z,
         )
 
         # 4) silu_and_mul: [T*top_k, 2*mI] → [T*top_k, mI]
@@ -929,12 +930,13 @@ def test_moe_block_full(cfg, num_tokens=16, seed=42):
         w_z_flat_bf16 = w_z.to(torch.bfloat16).flatten().contiguous()
         C2_z = torch.empty(T * top_k, H, dtype=torch.bfloat16, device="zeus")
         sgl_kernel_zeus.moe_grouped_gemm(
-            C1_silu_z, w2_z, C2_z,
+            C1_silu_z, w2_z,
             sorted_ids_z, expert_ids_z, num_post_z,
             num_valid_tokens=num_valid_tokens,
             top_k=1,
             topk_weights=w_z_flat_bf16,
             mul_routed_weight=True,
+            out=C2_z,
         )
 
         # 6) moe_sum_reduce (+shared residual; scale=1.0 因为 scale 已融进 weights)

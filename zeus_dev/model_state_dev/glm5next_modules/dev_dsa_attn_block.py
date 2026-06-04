@@ -44,7 +44,7 @@ from dev_mhc import Glm5NextMhc
 
 # 同目录 sublayer modules
 from dev_dsa_attn import Glm5NextDsaAttn
-from dev_moe import Glm5NextMoE, load_cfg as load_moe_cfg, estimate_ref_memory_gb
+from dev_moe import Glm5NextMoE, load_cfg as load_moe_cfg
 
 # DSA 底层 API (用于 history 类型注解)
 import dev_glm5next_dsa_decode_test as dsa
@@ -222,9 +222,6 @@ def _run_stage(args) -> Optional[bool]:
           f"attn[Nh={attn_cfg.Nh} Rq={attn_cfg.Rq} Rkv={attn_cfg.Rkv} "
           f"I={attn_cfg.I} Di={attn_cfg.Di} Ktop={attn_cfg.Ktop}]  "
           f"moe[E={block.moe_cfg.E} mI={block.moe_cfg.mI} top_k={block.moe_cfg.top_k}]")
-    ref_mem = estimate_ref_memory_gb(block.moe_cfg)
-    print(f"  REF MoE memory estimate: {ref_mem:.2f} GB "
-          f"(budget {REF_MEMORY_BUDGET_GB:.1f} GB)")
 
     # bf16 residual, scale 0.05 与各 sublayer dev script 一致
     residual_flat = (
@@ -237,28 +234,23 @@ def _run_stage(args) -> Optional[bool]:
     ref_out: Optional[torch.Tensor] = None
     ref_skipped = False
     if args.mode in ("ref", "both"):
-        if ref_mem > REF_MEMORY_BUDGET_GB:
-            print(f"  REF: SKIP (MoE weight {ref_mem:.1f} GB > "
-                  f"budget {REF_MEMORY_BUDGET_GB:.1f} GB)")
-            ref_skipped = True
-        else:
-            ref_mid, ref_out = block.forward(
-                residual_flat, history, new_pos=args.seqlen,
-                block_span=block_span, quantize_mhc=True,
-            )
-            shape_ok = (ref_mid.shape == (B, N * H)
-                        and ref_out.shape == (B, N * H)
-                        and ref_out.dtype == torch.bfloat16)
-            # mHC 关键不变量：N 条 residual stream 经 attn 后应被 mix —— 即 mid
-            # 的 N 切片不再相等 (否则 mHC 没工作).
-            mid3 = ref_mid.view(B, N, H)
-            diverged = not torch.equal(mid3[:, 0, :], mid3[:, 1, :])
-            print(f"  REF mid={tuple(ref_mid.shape)} out={tuple(ref_out.shape)}  "
-                  f"streams_diverged={diverged}")
-            print(f"  REF out[0,:4] = "
-                  f"{[round(v,4) for v in ref_out[0,:4].float().tolist()]}")
-            if not (shape_ok and diverged):
-                return False
+        ref_mid, ref_out = block.forward(
+            residual_flat, history, new_pos=args.seqlen,
+            block_span=block_span, quantize_mhc=True,
+        )
+        shape_ok = (ref_mid.shape == (B, N * H)
+                    and ref_out.shape == (B, N * H)
+                    and ref_out.dtype == torch.bfloat16)
+        # mHC 关键不变量：N 条 residual stream 经 attn 后应被 mix —— 即 mid
+        # 的 N 切片不再相等 (否则 mHC 没工作).
+        mid3 = ref_mid.view(B, N, H)
+        diverged = not torch.equal(mid3[:, 0, :], mid3[:, 1, :])
+        print(f"  REF mid={tuple(ref_mid.shape)} out={tuple(ref_out.shape)}  "
+                f"streams_diverged={diverged}")
+        print(f"  REF out[0,:4] = "
+                f"{[round(v,4) for v in ref_out[0,:4].float().tolist()]}")
+        if not (shape_ok and diverged):
+            return False
 
     # ── Zeus ──────────────────────────────────────────────────
     zeus_ok: Optional[bool] = None

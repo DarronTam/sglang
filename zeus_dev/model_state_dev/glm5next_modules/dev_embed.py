@@ -49,7 +49,6 @@ from _common import (
     ZEUS_IMPORT_ERROR, sgl_kernel_zeus,
     config_path, compare_tensors, zeus_chain_available,
     make_argparser, print_header, print_summary,
-    REF_MEMORY_BUDGET_GB,
 )
 
 
@@ -121,15 +120,6 @@ def _run_triton_three_way(embed, input_ids, cfg, args) -> bool:
         f"embed.{args.config}.REF-vs-simC", ref, simc, atol=0.0, rtol=0.0)
 
     return bool(finite_t and shape_ok_t and c_tri_ref and c_tri_simc and c_ref_simc)
-
-
-def estimate_ref_memory_gb(cfg: Glm5NextEmbedConfig) -> float:
-    """REF 权重显存估算 (GB).
-
-    单张 embed table ``[V, H] bf16`` = V*H*2 字节; 再保留一份 host copy 用于
-    Zeus pack 验证, 总占用 ~2x.
-    """
-    return cfg.V * cfg.H * 2 * 2 / (1024 ** 3)
 
 
 # ── Module ──────────────────────────────────────────────────────
@@ -210,37 +200,30 @@ def _run_stage(args) -> Optional[bool]:
         cfg = replace(cfg, V=args.vocab)  # override row num (e.g. 跑 triton 三路用小 V)
     if args.hidden is not None:
         cfg = replace(cfg, H=args.hidden)  # override hidden_size H
-    ref_mem = estimate_ref_memory_gb(cfg)
     print(f"  cfg: V={cfg.V} H={cfg.H}")
-    print(f"  REF memory estimate: {ref_mem:.2f} GB "
-          f"(budget {REF_MEMORY_BUDGET_GB:.1f} GB)")
 
     torch.manual_seed(args.seed)
     embed = Glm5NextEmbed(cfg, seed=args.seed)
     # decode-only path: T 即 batch (一步 decode 一个 token / batch token)
+    # int32 from the source: the Zeus embedding ops require int32 indices and do
+    # NO in-wrapper cast (a cast would fault under graph capture).
     input_ids = torch.randint(
         0, cfg.V, (args.num_tokens,),
         generator=torch.Generator().manual_seed(args.seed + 1),
-        dtype=torch.int64,
+        dtype=torch.int32,
     )
 
     # ── REF ───────────────────────────────────────────────────
     ref_out: Optional[torch.Tensor] = None
-    ref_skipped = False
     if args.mode in ("ref", "both"):
-        if ref_mem > REF_MEMORY_BUDGET_GB:
-            print(f"  REF: SKIP ({ref_mem:.1f} GB > budget "
-                  f"{REF_MEMORY_BUDGET_GB:.1f} GB)")
-            ref_skipped = True
-        else:
-            ref_out = embed.forward(input_ids)
-            ok = (ref_out.shape == (args.num_tokens, cfg.H)
-                  and ref_out.dtype == torch.bfloat16)
-            print(f"  REF out shape={tuple(ref_out.shape)} dtype={ref_out.dtype}")
-            print(f"  REF out[0,:4] = "
-                  f"{[round(v,4) for v in ref_out[0,:4].float().tolist()]}")
-            if not ok:
-                return False
+        ref_out = embed.forward(input_ids)
+        ok = (ref_out.shape == (args.num_tokens, cfg.H)
+              and ref_out.dtype == torch.bfloat16)
+        print(f"  REF out shape={tuple(ref_out.shape)} dtype={ref_out.dtype}")
+        print(f"  REF out[0,:4] = "
+              f"{[round(v,4) for v in ref_out[0,:4].float().tolist()]}")
+        if not ok:
+            return False
 
     # ── Zeus ──────────────────────────────────────────────────
     zeus_ok: Optional[bool] = None
@@ -302,12 +285,10 @@ def _run_stage(args) -> Optional[bool]:
         return triton_ok
 
     if args.mode == "ref":
-        return _fold(None if ref_skipped else True)
+        return _fold(True)
     if args.mode == "zeus":
         return _fold(zeus_ok)
     # both
-    if ref_skipped:
-        return _fold(None if zeus_ok is None else zeus_ok)
     if zeus_ok is None:
         return _fold(True)
     return _fold(zeus_ok)

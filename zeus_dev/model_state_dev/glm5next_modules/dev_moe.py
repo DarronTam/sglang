@@ -30,7 +30,7 @@ Chain (与 dev_glm5next_block_decode_test.zeus_moe_decode 一致):
 
 用法:
   python glm5next_modules/dev_moe.py                    # 16b / both
-  python glm5next_modules/dev_moe.py --config next      # next / both (REF SKIP)
+  python glm5next_modules/dev_moe.py --config next --mode zeus  # next 用 zeus (REF 显存过大会 OOM)
   python glm5next_modules/dev_moe.py --mode zeus
   python glm5next_modules/dev_moe.py --triton_forward   # REF / Zeus-simC / Zeus-Triton 三路对拍
 
@@ -38,7 +38,7 @@ Chain (与 dev_glm5next_block_decode_test.zeus_moe_decode 一致):
   - forward             REF host bf16 MoE chain                         (golden A)
   - forward_zeus        Zeus C++ sim-C MoE chain (sgl_kernel_zeus)       (golden B)
   - forward_zeus_triton Zeus Triton-JIT MoE chain (sgl_kernel_zeus_triton)
-  三者使用同一份权重；next 配置 REF 内存过大时三路对拍自动 SKIP.
+  三者使用同一份权重。注: next 配置 REF (host fp32 权重) 显存过大, 请用 --mode zeus.
 """
 
 from __future__ import annotations
@@ -55,7 +55,6 @@ from _common import (
     ZEUS_IMPORT_ERROR, sgl_kernel_zeus,
     config_path, compare_tensors, zeus_chain_available,
     make_argparser, print_header, print_summary,
-    REF_MEMORY_BUDGET_GB,
 )
 
 # REF MoE core 复用 (上一级 dev_glm4_moe_test)
@@ -115,16 +114,6 @@ def load_cfg(which: str) -> Glm5NextMoEConfig:
     return Glm5NextMoEConfig.from_json(config_path(which), name=which)
 
 
-def estimate_ref_memory_gb(cfg: Glm5NextMoEConfig) -> float:
-    """REF 路径峰值显存估算 (GB).
-
-    ``_ref_moe_core`` 内部把 w13 / w2 cast 到 fp32 (×2), 再加 bf16 原副本 (×1)，
-    总占用 ≈ (w13 + w2) * 6 字节/entry.
-    """
-    elements = cfg.E * (2 * cfg.mI + cfg.mI) * cfg.H  # w13 + w2 entries
-    return elements * 3 * 2 / (1024 ** 3)
-
-
 # ── Module ──────────────────────────────────────────────────────
 class Glm5NextMoE:
     """GLM5-Next MoE sublayer（router + routed experts + shared experts 整段）.
@@ -164,29 +153,14 @@ class Glm5NextMoE:
         self._corr_bias_z = None
         self._w13_z = None
         self._w2_z = None
-        self._triton_weights_packed = False
-        self._gate_w_triton_z = None
-        self._sh_gu_triton_z = None
-        self._sh_dp_triton_z = None
-        self._w13_triton_z = None
-        self._w2_triton_z = None
+        # NOTE: the Triton path needs NO separate weights — both backends share
+        # the sim-C LocalMem packs (linear via _*_lmem, grouped-GEMM via
+        # _w13_z/_w2_z). The Triton moe_grouped_gemm now accepts a pre-packed
+        # weight (same 2-core N-split layout as its own .pack), so we pack once.
         # Per-T scratch buffer cache (lazy alloc per batch-size, reused across
         # forwards with the same T). 5 个中间 buffer 都仅由 T 决定 (top_k / sI /
         # mI / H 都来自 config), 因此可以池化避免每次 forward 重新 alloc.
         self._scratch_cache: Dict[int, Dict[str, torch.Tensor]] = {}
-
-    # 兼容旧 callers (dev_glm5next_block_decode_test dict-style 用法)
-    def as_weight_dict(self) -> Dict:
-        return {
-            "gate_w": self.gate_w,
-            "corr_bias": self.corr_bias,
-            "w13": self.w13,
-            "w2": self.w2,
-            "sh_gu": self.sh_gu,
-            "sh_dp": self.sh_dp,
-            "_meta": {"E": self.cfg.E, "mI": self.cfg.mI,
-                      "top_k": self.cfg.top_k, "sI": self.cfg.sI},
-        }
 
     # ── REF forward ─────────────────────────────────────────────
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -230,54 +204,28 @@ class Glm5NextMoE:
 
     # ── Zeus pack (lazy) ────────────────────────────────────────
     def _pack_zeus(self) -> None:
-        if ZEUS_IMPORT_ERROR is not None:
-            raise RuntimeError(
-                f"Zeus runtime unavailable: {ZEUS_IMPORT_ERROR}"
-            )
-        self._gate_w_lmem = torch.zeus.local_memory.from_tensor(
-            self.gate_w.to("zeus"), kind="weight", Tr=1, Tc=1,
-        )
-        self._sh_gu_lmem = torch.zeus.local_memory.from_tensor(
-            self.sh_gu.to("zeus"), kind="weight", Tr=1, Tc=1,
-        )
-        self._sh_dp_lmem = torch.zeus.local_memory.from_tensor(
-            self.sh_dp.to("zeus"), kind="weight", Tr=1, Tc=1,
-        )
-        self._corr_bias_z = self.corr_bias.to("zeus")
-        # w13 / w2 走 LocalMem multi-matrix (num_matrices=E)：每个 expert 是
-        # 一个独立 2D tiled slice；moe_grouped_gemm sim 端按
-        # `expert*slice_bytes + lm_weight_offset_bytes(n, k, ...)` 寻址.
-        self._w13_z = torch.zeus.local_memory.from_tensor(
-            self.w13.to("zeus"), kind="weight", Tr=1, Tc=1,
-        )
-        self._w2_z = torch.zeus.local_memory.from_tensor(
-            self.w2.to("zeus"), kind="weight", Tr=1, Tc=1,
-        )
-        self._zeus_packed = True
+        """LocalMem-pack the sim-C weights through each op's own ``.pack``.
 
-    def _pack_zeus_triton_weights(self) -> None:
-        """Plain Zeus contiguous weights consumed by Triton-JIT wrappers.
-
-        Lmem initialization for these tensors is owned by the
-        ``sgl_kernel_zeus_triton`` Python wrappers and cached there.
+        每个权重交给 **消费它的算子** 去 pack (与 ``sgl_kernel_zeus.embedding.pack``
+        同范式: pack 是算子的方法, 不是 trunk 级的 ``from_tensor`` 散调用):
+          - gate_w  → router gate Linear (出 fp32) → ``linear_bf16_outfp32.pack``
+          - sh_gu / sh_dp → shared experts Linear → ``linear_bf16.pack``
+          - w13 / w2 → routed-expert grouped GEMM → ``moe_grouped_gemm.pack``
+            (LocalMem multi-matrix, num_matrices=E; 每个 expert 一个独立 2D tiled
+            slice, sim 端按 ``expert*slice_bytes + lm_weight_offset_bytes(...)`` 寻址)
+        ``corr_bias`` 不是权重矩阵, 直接搬上 device.
         """
         if ZEUS_IMPORT_ERROR is not None:
             raise RuntimeError(
                 f"Zeus runtime unavailable: {ZEUS_IMPORT_ERROR}"
             )
-        if self._gate_w_triton_z is None:
-            self._gate_w_triton_z = self.gate_w.to("zeus").contiguous()
-        if self._sh_gu_triton_z is None:
-            self._sh_gu_triton_z = self.sh_gu.to("zeus").contiguous()
-        if self._sh_dp_triton_z is None:
-            self._sh_dp_triton_z = self.sh_dp.to("zeus").contiguous()
-        if self._w13_triton_z is None:
-            self._w13_triton_z = self.w13.to("zeus").contiguous()
-        if self._w2_triton_z is None:
-            self._w2_triton_z = self.w2.to("zeus").contiguous()
-        if self._corr_bias_z is None:
-            self._corr_bias_z = self.corr_bias.to("zeus")
-        self._triton_weights_packed = True
+        self._gate_w_lmem = sgl_kernel_zeus.linear_bf16_outfp32.pack(self.gate_w)
+        self._sh_gu_lmem = sgl_kernel_zeus.linear_bf16.pack(self.sh_gu)
+        self._sh_dp_lmem = sgl_kernel_zeus.linear_bf16.pack(self.sh_dp)
+        self._corr_bias_z = self.corr_bias.to("zeus")
+        self._w13_z = sgl_kernel_zeus.moe_grouped_gemm.pack(self.w13)
+        self._w2_z = sgl_kernel_zeus.moe_grouped_gemm.pack(self.w2)
+        self._zeus_packed = True
 
     def _get_scratch(self, T: int) -> Dict[str, torch.Tensor]:
         """Per-T scratch buffer pool. Allocates once per batch-size T, reuses on
@@ -351,9 +299,10 @@ class Glm5NextMoE:
         # gemm1
         C1_z = scratch["C1"]
         sgl_kernel_zeus.moe_grouped_gemm(
-            hidden_z, self._w13_z, C1_z,
+            hidden_z, self._w13_z,
             sorted_ids_z, expert_ids_z, num_post_z,
             num_valid_tokens=num_valid_tokens, top_k=top_k,
+            out=C1_z,
         )
         # silu_and_mul
         C1_silu_z = scratch["C1_silu"]
@@ -364,10 +313,11 @@ class Glm5NextMoE:
         w_z_flat_bf16 = w_z.flatten()
         C2_z = scratch["C2"]
         sgl_kernel_zeus.moe_grouped_gemm(
-            C1_silu_z, self._w2_z, C2_z,
+            C1_silu_z, self._w2_z,
             sorted_ids_z, expert_ids_z, num_post_z,
             num_valid_tokens=num_valid_tokens, top_k=1,
             topk_weights=w_z_flat_bf16, mul_routed_weight=True,
+            out=C2_z,
         )
         # sum_reduce + shared residual fuse
         final_z = scratch["final"]
@@ -388,8 +338,11 @@ class Glm5NextMoE:
         """
         if sgl_kernel_zeus_triton is None:
             raise RuntimeError("sgl_kernel_zeus_triton is not installed")
-        if not self._triton_weights_packed:
-            self._pack_zeus_triton_weights()
+        # All weights are the SAME sim-C LocalMem packs: the Triton linear_bf16
+        # and moe_grouped_gemm wrappers both accept an already-LocalMem weight
+        # as-is (pack once via _pack_zeus, feed both backends).
+        if not self._zeus_packed:
+            self._pack_zeus()
 
         cfg = self.cfg
         T = hidden_z.shape[0]
@@ -400,24 +353,30 @@ class Glm5NextMoE:
         scratch = self._get_scratch(T)
 
         router_logits_z = scratch["router_logits"]
+        sh_gu_z = scratch["sh_gu"]
+        sh_silu_z = scratch["sh_silu"]
+        C1_z = scratch["C1"]
+        C1_silu_z = scratch["C1_silu"]
+        C2_z = scratch["C2"]
+        final_z = scratch["final"]
+        
         sgl_kernel_zeus_triton.linear_bf16_outfp32(
             hidden_z,
-            self._gate_w_triton_z,
+            self._gate_w_lmem,
             out=router_logits_z,
         )
 
-        sh_gu_z = scratch["sh_gu"]
         sgl_kernel_zeus_triton.linear_bf16(
             hidden_z,
-            self._sh_gu_triton_z,
+            self._sh_gu_lmem,
             out=sh_gu_z,
         )
-        sh_silu_z = scratch["sh_silu"]
+        
         sgl_kernel_zeus_triton.silu_and_mul(sh_gu_z, out=sh_silu_z)
         shared_out_z = scratch["shared_out"]
         sgl_kernel_zeus_triton.linear_bf16(
             sh_silu_z,
-            self._sh_dp_triton_z,
+            self._sh_dp_lmem,
             out=shared_out_z,
         )
 
@@ -431,16 +390,16 @@ class Glm5NextMoE:
             routed_scaling_factor=cfg.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=True,
         )
+        
         sorted_ids_z, expert_ids_z, num_post_z = sgl_kernel_zeus_triton.moe_align_block_size_alloc(
             ids_z,
             block_size,
             E,
         )
 
-        C1_z = scratch["C1"]
         sgl_kernel_zeus_triton.moe_grouped_gemm(
             hidden_z,
-            self._w13_triton_z,
+            self._w13_z,
             sorted_ids_z,
             expert_ids_z,
             num_post_z,
@@ -449,13 +408,11 @@ class Glm5NextMoE:
             out=C1_z,
         )
 
-        C1_silu_z = scratch["C1_silu"]
         sgl_kernel_zeus_triton.silu_and_mul(C1_z, out=C1_silu_z)
-
-        C2_z = scratch["C2"]
+        
         sgl_kernel_zeus_triton.moe_grouped_gemm(
             C1_silu_z,
-            self._w2_triton_z,
+            self._w2_z,
             sorted_ids_z,
             expert_ids_z,
             num_post_z,
@@ -465,8 +422,7 @@ class Glm5NextMoE:
             mul_routed_weight=True,
             out=C2_z,
         )
-
-        final_z = scratch["final"]
+        
         sgl_kernel_zeus_triton.moe_sum_reduce(
             C2_z.view(T, top_k, H),
             output=final_z,
@@ -522,12 +478,9 @@ def _run_stage(args) -> Optional[bool]:
     print(f"Stage: {args.config} (real shape)")
     print("=" * 60)
     cfg = load_cfg(args.config)
-    ref_mem = estimate_ref_memory_gb(cfg)
     print(f"  cfg: H={cfg.H} E={cfg.E} mI={cfg.mI} sI={cfg.sI} top_k={cfg.top_k}  "
           f"groups={cfg.num_expert_group}/{cfg.topk_group}  "
           f"scale={cfg.routed_scaling_factor}")
-    print(f"  REF memory estimate: {ref_mem:.2f} GB "
-          f"(budget {REF_MEMORY_BUDGET_GB:.1f} GB)")
 
     torch.manual_seed(args.seed)
     moe = Glm5NextMoE(cfg, seed=args.seed)
@@ -537,20 +490,14 @@ def _run_stage(args) -> Optional[bool]:
 
     # ── REF ───────────────────────────────────────────────────
     ref_out: Optional[torch.Tensor] = None
-    ref_skipped = False
     if args.mode in ("ref", "both"):
-        if ref_mem > REF_MEMORY_BUDGET_GB:
-            print(f"  REF: SKIP ({ref_mem:.1f} GB > budget {REF_MEMORY_BUDGET_GB:.1f} GB; "
-                  f"kernel 层对拍见 dev_glm4_moe_test.py)")
-            ref_skipped = True
-        else:
-            ref_out = moe.forward(hidden)
-            ok = ref_out.shape == (args.num_tokens, cfg.H) and ref_out.dtype == torch.bfloat16
-            print(f"  REF out shape={tuple(ref_out.shape)} dtype={ref_out.dtype}")
-            print(f"  REF out[0,:4] = "
-                  f"{[round(v,4) for v in ref_out[0,:4].float().tolist()]}")
-            if not ok:
-                return False
+        ref_out = moe.forward(hidden)
+        ok = ref_out.shape == (args.num_tokens, cfg.H) and ref_out.dtype == torch.bfloat16
+        print(f"  REF out shape={tuple(ref_out.shape)} dtype={ref_out.dtype}")
+        print(f"  REF out[0,:4] = "
+              f"{[round(v,4) for v in ref_out[0,:4].float().tolist()]}")
+        if not ok:
+            return False
 
     # ── Zeus ──────────────────────────────────────────────────
     zeus_ok: Optional[bool] = None
@@ -591,9 +538,6 @@ def _run_stage(args) -> Optional[bool]:
         elif sgl_kernel_zeus_triton is None:
             print("  ZEUS-TRITON: SKIP (sgl_kernel_zeus_triton not installed: "
                   "`pip install -e sgl-kernel-zeus-triton`)")
-        elif ref_mem > REF_MEMORY_BUDGET_GB:
-            print(f"  ZEUS-TRITON: SKIP three-way ({ref_mem:.1f} GB > budget "
-                  f"{REF_MEMORY_BUDGET_GB:.1f} GB; REF unavailable)")
         else:
             try:
                 triton_ok = _run_triton_three_way(moe, hidden, cfg, args)
@@ -613,12 +557,10 @@ def _run_stage(args) -> Optional[bool]:
         return triton_ok
 
     if args.mode == "ref":
-        return _fold(None if ref_skipped else True)
+        return _fold(True)
     if args.mode == "zeus":
         return _fold(zeus_ok)
     # both
-    if ref_skipped:
-        return _fold(None if zeus_ok is None else zeus_ok)
     if zeus_ok is None:
         return _fold(True)
     return _fold(zeus_ok)

@@ -661,8 +661,9 @@ def zeus_moe_decode(hidden_z: torch.Tensor, moe_w: Dict) -> torch.Tensor:
     shared_out_z = sgl_kernel_zeus.linear_bf16(sh_silu_z, sh_dp_lmem)  # [T, H]
 
     corr_bias_z = moe_w["corr_bias"].to("zeus")
-    w13_z = moe_w["w13"].to("zeus")
-    w2_z = moe_w["w2"].to("zeus")
+    # moe_grouped_gemm requires a LocalMem-packed weight (pack is caller-side).
+    w13_z = sgl_kernel_zeus.moe_grouped_gemm.pack(moe_w["w13"].to("zeus"))
+    w2_z = sgl_kernel_zeus.moe_grouped_gemm.pack(moe_w["w2"].to("zeus"))
 
     # 1) biased_grouped_topk（scale fused 进 weights，scaling=1.0 → 无放大）
     w_z, ids_z = sgl_kernel_zeus.biased_grouped_topk(
@@ -681,9 +682,10 @@ def zeus_moe_decode(hidden_z: torch.Tensor, moe_w: Dict) -> torch.Tensor:
     # 3) gemm1: [T, H] → [T*top_k, 2*mI]
     C1_z = torch.empty(T * top_k, 2 * mI, dtype=torch.bfloat16, device="zeus")
     sgl_kernel_zeus.moe_grouped_gemm(
-        hidden_z, w13_z, C1_z,
+        hidden_z, w13_z,
         sorted_ids_z, expert_ids_z, num_post_z,
         num_valid_tokens=num_valid_tokens, top_k=top_k,
+        out=C1_z,
     )
     # 4) silu_and_mul: [T*top_k, 2*mI] → [T*top_k, mI]
     C1_silu_z = torch.empty(T * top_k, mI, dtype=torch.bfloat16, device="zeus")
@@ -693,10 +695,11 @@ def zeus_moe_decode(hidden_z: torch.Tensor, moe_w: Dict) -> torch.Tensor:
     w_z_flat_bf16 = w_z.to(torch.bfloat16).flatten().contiguous()
     C2_z = torch.empty(T * top_k, H, dtype=torch.bfloat16, device="zeus")
     sgl_kernel_zeus.moe_grouped_gemm(
-        C1_silu_z, w2_z, C2_z,
+        C1_silu_z, w2_z,
         sorted_ids_z, expert_ids_z, num_post_z,
         num_valid_tokens=num_valid_tokens, top_k=1,
         topk_weights=w_z_flat_bf16, mul_routed_weight=True,
+        out=C2_z,
     )
     # 6) moe_sum_reduce (+shared residual)
     final_z = torch.empty(T, H, dtype=torch.bfloat16, device="zeus")
