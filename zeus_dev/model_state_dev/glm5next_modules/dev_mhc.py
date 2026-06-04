@@ -145,8 +145,11 @@ class Glm5NextMhc:
         layer_input = sgl_kernel_zeus.mhc_pre_apply_mix(
             residual_flat_z, pre, n=n,
         )
-        h_res = comb.reshape(s, n * n)
-        h_post = post.reshape(s, n)
+        # comb[s,n,n]→[s,n*n] 合并末尾连续维; post[s,n,1]→[s,n] 去末尾 size-1 维.
+        # 二者在 contiguous kernel 输出上恒为零拷贝, 用 .view (而非 .reshape) 让这条
+        # 不变量 load-bearing —— 将来 kernel 输出若变非 contiguous 直接报错, 不静默拷贝.
+        h_res = comb.view(s, n * n)
+        h_post = post.view(s, n)
         return layer_input, residual_flat_z, h_res, h_post
 
     def forward_post_zeus(self, x_z: torch.Tensor, residual_z: torch.Tensor,
