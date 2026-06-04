@@ -364,9 +364,12 @@ class Glm5NextLinearAttn:
         )  # [B, Hh, Dv] bf16
 
         # 12. rms_norm_gated (sigmoid 门控；o_norm=ones 是 implicit weight=1)
-        gate_for_rms = gproj_z.reshape(B, Hh, Dv)  # Dv == Dk per head (本配置)
+        # gproj_z[B,P]→[B,Hh,Dv] 拆末尾维 (P=Hh*Dv); normed_z[B,Hh,Dv]→[B,P] 合末尾维.
+        # 均在 contiguous kernel 输出上零拷贝, 用 .view 让零拷贝不变量 load-bearing
+        # (非 contiguous 时 .view 报错而非静默拷贝).
+        gate_for_rms = gproj_z.view(B, Hh, Dv)  # Dv == Dk per head (本配置)
         normed_z = sgl_kernel_zeus.rms_norm_gated(o_z, gate_for_rms, eps=cfg.rms_norm_eps)
-        normed_flat = normed_z.reshape(B, P)
+        normed_flat = normed_z.view(B, P)
 
         # 13. o_proj
         return sgl_kernel_zeus.linear_bf16(normed_flat, w["o_proj"])         # [B, H]

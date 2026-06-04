@@ -309,8 +309,10 @@ class Glm5NextMoE:
         sgl_kernel_zeus.silu_and_mul(C1_z, C1_silu_z)
 
         # gemm2 (mul_routed_weight=True) — biased_grouped_topk 已直出 bf16,
-        # 此处仅 flatten (metadata-only view, 零 device 操作).
-        w_z_flat_bf16 = w_z.flatten()
+        # w_z[T,top_k] contig → [T*top_k] 零拷贝. 用 view(-1) 而非 flatten():
+        # flatten 走 reshape 语义 (非 contiguous 时静默拷贝), view 则报错, 让零拷贝
+        # 不变量 load-bearing.
+        w_z_flat_bf16 = w_z.view(-1)
         C2_z = scratch["C2"]
         sgl_kernel_zeus.moe_grouped_gemm(
             C1_silu_z, self._w2_z,
@@ -416,7 +418,7 @@ class Glm5NextMoE:
             sorted_ids_z,
             expert_ids_z,
             num_post_z,
-            topk_weights=w_z.flatten(),
+            topk_weights=w_z.view(-1),  # contig [T,top_k]→[T*top_k] 零拷贝 (见 forward_zeus)
             num_valid_tokens=num_valid_tokens,
             top_k=1,
             mul_routed_weight=True,
