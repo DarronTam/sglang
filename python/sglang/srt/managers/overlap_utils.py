@@ -21,12 +21,6 @@ _is_hip = is_hip()
 
 
 def _resolve_future_token_ids_native(input_ids, future_token_ids_map):
-    if _is_zeus:
-        ids = input_ids.cpu()
-        buf = future_token_ids_map.cpu()
-        resolved = torch.where(ids < 0, buf[torch.clamp(-ids, min=0)], ids)
-        input_ids[:] = resolved.to(input_ids.device)
-        return
     input_ids[:] = torch.where(
         input_ids < 0,
         future_token_ids_map[torch.clamp(-input_ids, min=0)],
@@ -40,6 +34,15 @@ if _is_cuda or _is_hip:
     )
 
     _resolve_future_token_ids = resolve_future_token_ids_cuda
+elif _is_zeus:
+    # Zeus now ships a device-side fused kernel (lt + neg + clamp + gather +
+    # where), so the overlap path no longer needs the all-CPU workaround.
+    # Both input_ids and token_ids_buf are already int32 as the kernel requires.
+    from sgl_kernel_zeus import (
+        resolve_future_token_ids as _resolve_future_token_ids_zeus,
+    )
+
+    _resolve_future_token_ids = _resolve_future_token_ids_zeus
 else:
     _resolve_future_token_ids = _resolve_future_token_ids_native
 

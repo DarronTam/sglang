@@ -163,10 +163,16 @@ class ZeusMLABackend(AttentionBackend):
         spec_info: Optional["SpecInput"] = None,
         seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
-        self._fill_decode_graph_metadata(bs, req_pool_indices, seq_lens)
+        self._fill_decode_graph_metadata(
+            bs, req_pool_indices, seq_lens, seq_lens_cpu
+        )
 
     def _fill_decode_graph_metadata(
-        self, bs: int, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor,
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
         assert self._g_cache_seqlens is not None, "init_cuda_graph_state not called"
         cache_seqlens = seq_lens[:bs].to(torch.int32)
@@ -182,11 +188,19 @@ class ZeusMLABackend(AttentionBackend):
         page_table_1 = self._g_page_table[:bs, :max_seqlen_k]
         real_page_table = self._transform_table_1_to_real(page_table_1)
 
+        # max_seq_len_k on host: prefer the scheduler's existing CPU copy to
+        # avoid a per-replay device .max() (D->H sync). Falls back to a one-off
+        # .cpu() during capture, where seq_lens_cpu is not provided.
+        if seq_lens_cpu is not None:
+            max_seq_len_k = int(seq_lens_cpu[:bs].max().item())
+        else:
+            max_seq_len_k = int(seq_lens[:bs].cpu().max().item())
+
         self.forward_metadata = NSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=self._g_cache_seqlens[:bs],
             max_seq_len_q=1,
-            max_seq_len_k=int(seq_lens[:bs].max().item()),
+            max_seq_len_k=max_seq_len_k,
             cu_seqlens_q=self._g_cu_seqlens_q[: bs + 1],
             cu_seqlens_k=self._g_cu_seqlens_k[: bs + 1],
             page_table_1=page_table_1,
