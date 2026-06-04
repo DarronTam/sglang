@@ -1,6 +1,14 @@
 """init_paged_state 的 dual-core small-page 分支几何自检。
 Run: $PY -m pytest glm5next_modules/test_dual_core_init.py -v
 """
+import os
+import sys
+
+# 本文件在 glm5next_modules/ 内, pytest "prepend" 模式只把本目录放进 sys.path,
+# 而 dev_glm5next_dsa_decode_test 在上一级 model_state_dev/. 手动补一下父目录,
+# 让 `$PY -m pytest glm5next_modules/test_dual_core_init.py` 直接可跑.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import pytest
 import torch
 import dev_glm5next_dsa_decode_test as dsa
