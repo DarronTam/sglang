@@ -1,7 +1,7 @@
 """
 GLM5-Next DSA-transformer block (decode) 整层装配 + REF↔Zeus 对拍.
 
-与 ``dev_linear_attn_block.py`` 同构, 但 attn sublayer 换成 DSA (paged-attention):
+与 ``dev_linear_attn_moe_block.py`` 同构, 但 attn sublayer 换成 DSA (paged-attention):
 
   residual[B, N*H]
     │ attn_hc.pre   → layer_input[B, H]
@@ -17,7 +17,7 @@ GLM5-Next DSA-transformer block (decode) 整层装配 + REF↔Zeus 对拍.
   tensors; Zeus 用 :meth:`Glm5NextDsaAttn.init_paged_state` 构造的 paged_state
   (latent/body/scale 共享池 + block_table + seq_lens), init 时即一次性搬上
   device, 之后跨 step 复用, 全链路 device-resident.
-- MLP 与 ``dev_linear_attn_block.py`` 一致, 用 ``Glm5NextMoE``.
+- MLP 与 ``dev_linear_attn_moe_block.py`` 一致, 用 ``Glm5NextMoE``.
 
 用法:
   python glm5next_modules/dev_dsa_attn_block.py
@@ -86,7 +86,7 @@ class Glm5NextDsaBlock:
         self.moe_cfg = moe_cfg
         self.moe = Glm5NextMoE(moe_cfg, seed=seed + 5)
 
-        # 两个独立 mHC wrapper, 与 dev_linear_attn_block 同方案
+        # 两个独立 mHC wrapper, 与 dev_linear_attn_moe_block 同方案
         self.attn_mhc = Glm5NextMhc(which, seed=seed)
         self.mlp_mhc  = Glm5NextMhc(which, seed=seed + 100)
 
@@ -167,7 +167,7 @@ class Glm5NextDsaBlock:
           内部一次性 pack (_pack_zeus lazy cache, 不再每 forward repack).
         - DSA attn sublayer 走 paged chain; ``paged_state`` 跨 forward 复用,
           首次进入时一次性 .to("zeus") + LocalMem pack, 之后纯 device-resident.
-        - MoE sublayer 与 dev_linear_attn_block 同步, 全 device-resident.
+        - MoE sublayer 与 dev_linear_attn_moe_block 同步, 全 device-resident.
         - 整段 pipeline 无 host↔device cast, 见各 sublayer dev script 的 audit.
         """
         # ── attn block (device-resident)

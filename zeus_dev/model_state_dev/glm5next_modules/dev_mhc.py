@@ -6,7 +6,7 @@ GLM5-Next mHC (HyperConnection) wrapper 独立模块 + REF↔Zeus 对拍.
 本身是否引入奇怪的 host↔device cast / 非 contig view / fallback / 反复
 LocalMem repack 等隐藏操作.
 
-mHC chain (与 dev_glm5next_block_decode_test / dev_linear_attn_block 一致):
+mHC chain (与 dev_glm5next_block_decode_test / dev_linear_attn_moe_block 一致):
   residual[T, N*H]
     │ pre  (K1 mhc_pre_norm_split + K2 mhc_sinkhorn + K3 mhc_pre_apply_mix)
     │    → layer_input[T, H] bf16, h_res[T, N*N] fp32, h_post[T, N] fp32
