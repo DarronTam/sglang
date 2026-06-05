@@ -105,9 +105,7 @@ class Glm5NextMhc:
         # tiled pack. K1 (mhc_pre_norm_split) 期望 weight=fn_effective(bf16) LocalMem.
         fn_eff_fp32 = p.fn if p.norm_weight is None else p.fn * p.norm_weight
         fn_eff_bf16 = fn_eff_fp32.to(torch.bfloat16)
-        self._fn_lmem = torch.zeus.local_memory.from_tensor(
-            fn_eff_bf16.to("zeus"), kind="weight", Tr=1, Tc=1,
-        )
+        self._fn_lmem = sgl_kernel_zeus.mhc_pre_norm_split.pack(fn_eff_bf16)
         self._base_z = p.base.to("zeus")
         # NOTE: p.scale (shape [3] fp32) — K1 kernel 直接接 CPU fp32 tensor, 无需
         # 搬到 device (见 dev_glm5next_mhc_test.zeus_mhc_pre 的实现).

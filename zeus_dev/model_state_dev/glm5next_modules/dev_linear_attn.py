@@ -260,19 +260,14 @@ class Glm5NextLinearAttn:
         if ZEUS_IMPORT_ERROR is not None:
             raise RuntimeError(f"Zeus runtime unavailable: {ZEUS_IMPORT_ERROR}")
 
-        def _lmem_pack(t: torch.Tensor):
-            return torch.zeus.local_memory.from_tensor(
-                t.to("zeus"), kind="weight", Tr=1, Tc=1,
-            )
-
         self._w_lmem = {
-            "qkv_proj": _lmem_pack(self.qkv_proj),
-            "b_proj":   _lmem_pack(self.b_proj),
-            "f_a":      _lmem_pack(self.f_a),
-            "f_b":      _lmem_pack(self.f_b),
-            "g_a":      _lmem_pack(self.g_a),
-            "g_b":      _lmem_pack(self.g_b),
-            "o_proj":   _lmem_pack(self.o_proj),
+            "qkv_proj": sgl_kernel_zeus.linear_bf16.pack(self.qkv_proj),
+            "b_proj":   sgl_kernel_zeus.linear_bf16_outfp32_sigmoid.pack(self.b_proj),
+            "f_a":      sgl_kernel_zeus.linear_bf16.pack(self.f_a),
+            "f_b":      sgl_kernel_zeus.linear_bf16.pack(self.f_b),
+            "g_a":      sgl_kernel_zeus.linear_bf16.pack(self.g_a),
+            "g_b":      sgl_kernel_zeus.linear_bf16.pack(self.g_b),
+            "o_proj":   sgl_kernel_zeus.linear_bf16.pack(self.o_proj),
             # plain Zeus tensors (非 weight 矩阵)
             "conv_w_z":  self.conv_w.to(torch.bfloat16).to("zeus"),
             "conv_b_z":  self.conv_b.to(torch.bfloat16).to("zeus"),
