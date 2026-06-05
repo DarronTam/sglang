@@ -20,8 +20,8 @@ GLM5-Next DSA-transformer block (decode) 整层装配 + REF↔Zeus 对拍.
 - MLP 与 ``dev_linear_attn_moe_block.py`` 一致, 用 ``Glm5NextMoE``.
 
 用法:
-  python glm5next_modules/dev_dsa_attn_block.py
-  python glm5next_modules/dev_dsa_attn_block.py --config next --mode zeus --seqlen 64
+  python glm5next_modules/dev_dsa_attn_moe_block.py
+  python glm5next_modules/dev_dsa_attn_moe_block.py --config next --mode zeus --seqlen 64
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ import dev_glm5next_dsa_decode_test as dsa
 
 
 # ── Block module ────────────────────────────────────────────────
-class Glm5NextDsaBlock:
+class Glm5NextDsaAttnMoeBlock:
     """GLM5-Next DSA-transformer decoder block (decode single-step).
 
     Composition (mHC wrapper 包两次, attn 一次 / mlp 一次):
@@ -62,7 +62,7 @@ class Glm5NextDsaBlock:
 
     使用模式::
 
-        block = Glm5NextDsaBlock(which="16b", seed=42)
+        block = Glm5NextDsaAttnMoeBlock(which="16b", seed=42)
         history, block_span = block.init_state(B=batch, seqlen=ctx_len, seed=...)
         # REF
         mid, out = block.forward(residual_flat, history, new_pos=ctx_len)
@@ -209,11 +209,11 @@ _ZEUS_OPS_REQUIRED = (
 
 def _run_stage(args) -> Optional[bool]:
     print("\n" + "=" * 60)
-    print(f"Stage: DSA-transformer block ({args.config})  seqlen={args.seqlen}")
+    print(f"Stage: DSA-attn + MoE block ({args.config})  seqlen={args.seqlen}")
     print("=" * 60)
 
     torch.manual_seed(args.seed)
-    block = Glm5NextDsaBlock(args.config, seed=args.seed)
+    block = Glm5NextDsaAttnMoeBlock(args.config, seed=args.seed)
     cfg = block.mhc_cfg
     B = args.num_tokens
     H, N = cfg.H, cfg.N
@@ -321,7 +321,7 @@ def _run_stage(args) -> Optional[bool]:
 
 def main():
     parser = make_argparser(
-        "dev_dsa_attn_block",
+        "dev_dsa_attn_moe_block",
         description="GLM5-Next DSA-transformer decoder block dev test "
                     "(mHC + DSA-attn + MoE)",
     )
@@ -330,7 +330,7 @@ def main():
     args = parser.parse_args()
     print_header("GLM5-Next DSA-transformer block (mHC + DSA + MoE)", args)
     ok = _run_stage(args)
-    print_summary(f"glm5next_dsa_block ({args.config})", ok)
+    print_summary(f"glm5next_dsa_attn_moe_block ({args.config})", ok)
 
 
 if __name__ == "__main__":
