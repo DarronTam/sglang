@@ -456,12 +456,141 @@ def _run_stage(args) -> Optional[bool]:
     return True if zeus_ok is None else zeus_ok
 
 
+def _combine_status(a: Optional[bool], b: Optional[bool]) -> Optional[bool]:
+    """合并两段 stage 的 PASS/FAIL/SKIP: None=SKIP 不左右另一段, 有 False 即 False。"""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a and b
+
+
+# ── Indexed conv-state probe helpers (生产方向 pooled cache) ─────
+def _make_cache_indices(batch: int, pool_size: int, seed: int) -> torch.Tensor:
+    if pool_size < batch:
+        raise ValueError(f"pool_size ({pool_size}) must be >= batch ({batch})")
+    g = torch.Generator().manual_seed(seed)
+    return torch.randperm(pool_size, generator=g, dtype=torch.int64)[:batch].to(torch.int32)
+
+
+def _make_step_inputs(batch: int, channels: int, kernel_width: int, pool_size: int,
+                      *, has_bias: bool, seed: int):
+    g = torch.Generator().manual_seed(seed)
+    x = (torch.randn(batch, channels, generator=g, dtype=torch.float32) * 0.05).to(torch.bfloat16)
+    weight = (torch.randn(channels, kernel_width, generator=g, dtype=torch.float32) * 0.03).to(torch.bfloat16)
+    bias = None
+    if has_bias:
+        bias = (torch.randn(channels, generator=g, dtype=torch.float32) * 0.01).to(torch.bfloat16)
+    pool = (torch.randn(pool_size, channels, kernel_width - 1, generator=g, dtype=torch.float32) * 0.05).to(torch.bfloat16)
+    return x, weight, bias, pool
+
+
+def _compare_exact_or_report(name: str, ref: torch.Tensor, got: torch.Tensor) -> bool:
+    if torch.equal(ref, got):
+        print(f"  [OK] {name}: bit-exact")
+        return True
+    return compare_tensors(name, ref, got, atol=0.0, rtol=0.0)
+
+
+def run_indexed_conv_parity(args) -> Optional[bool]:
+    """生产方向探针: pooled cache ``[N_pool, 3P, K-1]`` 的 indexed conv-state 对拍。
+
+    主 stage 用 ``causal_conv1d_update_split`` (非 indexed, 连续 conv_state);
+    这条校验迁往生产 paged/pooled cache 的 indexed 变体, 验两件事:
+
+      causal_conv1d_update_indexed(...).split([P,P,P]) == causal_conv1d_update_split_indexed(...)
+
+    且 cache pool 经 ``cache_indices`` 索引更新、不碰 untouched slot。Zeus-only,
+    需要两个 indexed op; 不可用则 SKIP。
+    """
+    required = ("causal_conv1d_update_indexed", "causal_conv1d_update_split_indexed")
+    print("\n" + "=" * 60)
+    print(f"Stage: indexed conv-state parity ({args.config})")
+    print("=" * 60)
+    if not zeus_chain_available(*required):
+        print(f"  INDEXED: SKIP (ops unavailable: {ZEUS_IMPORT_ERROR})")
+        return None
+
+    cfg = load_cfg(args.config)
+    batch = args.num_tokens
+    pool_size = args.pool_size or max(16, batch * 4)
+    p = cfg.proj_size
+    channels = 3 * p
+    kernel_width = cfg.conv_size
+    has_bias = not args.no_bias
+
+    print(f"  B={batch}  N_pool={pool_size}  P={p}  C=3P={channels}  "
+          f"K={kernel_width}  steps={args.steps}  bias={has_bias}")
+
+    x0, weight, bias, pool0 = _make_step_inputs(
+        batch, channels, kernel_width, pool_size, has_bias=has_bias, seed=args.seed,
+    )
+    cache_indices = _make_cache_indices(batch, pool_size, seed=args.seed + 97)
+    untouched = sorted(set(range(pool_size)) - set(cache_indices.tolist()))
+    print(f"  cache_indices={cache_indices.tolist()}")
+
+    pool_indexed = pool0.clone().to("zeus")
+    pool_split_indexed = pool0.clone().to("zeus")
+    weight_z = weight.to("zeus")
+    bias_z = bias.to("zeus") if bias is not None else None
+    cache_indices_z = cache_indices.to("zeus")
+
+    ok = True
+    for step in range(args.steps):
+        if step == 0:
+            x = x0
+        else:
+            g = torch.Generator().manual_seed(args.seed + 1000 + step)
+            x = (torch.randn(batch, channels, generator=g, dtype=torch.float32) * 0.05).to(torch.bfloat16)
+        x_z = x.to("zeus")
+
+        qkv = sgl_kernel_zeus.causal_conv1d_update_indexed(
+            x_z, pool_indexed, cache_indices_z, weight_z, bias_z, activation="silu",
+        )
+        q_ref, k_ref, v_ref = qkv.split([p, p, p], dim=-1)
+        q, k, v = sgl_kernel_zeus.causal_conv1d_update_split_indexed(
+            x_z, pool_split_indexed, cache_indices_z, weight_z, bias_z, activation="silu",
+        )
+
+        print(f"\n  step={step}")
+        ok &= _compare_exact_or_report("q", q_ref.cpu(), q.cpu())
+        ok &= _compare_exact_or_report("k", k_ref.cpu(), k.cpu())
+        ok &= _compare_exact_or_report("v", v_ref.cpu(), v.cpu())
+        ok &= _compare_exact_or_report("pool", pool_indexed.cpu(), pool_split_indexed.cpu())
+        print(f"  output_contiguous: q={q.is_contiguous()} "
+              f"k={k.is_contiguous()} v={v.is_contiguous()}")
+        ok &= q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+
+    pool_final = pool_split_indexed.cpu()
+    for slot in untouched:
+        if not torch.equal(pool_final[slot], pool0[slot]):
+            print(f"  [FAIL] untouched pool slot modified: {slot}")
+            ok = False
+            break
+    if untouched:
+        print(f"\n  untouched slots checked: {len(untouched)}")
+
+    return ok
+
+
 def main():
+    def _extra(parser):
+        parser.add_argument("--steps", type=int, default=3,
+                            help="indexed conv-state 探针的 decode 步数")
+        parser.add_argument("--pool-size", type=int, default=None,
+                            help="indexed conv-state pool 槽位数 (默认 max(16, 4*B))")
+        parser.add_argument("--no-bias", action="store_true",
+                            help="indexed conv-state 探针不加 conv bias")
+
     parser = make_argparser("dev_linear_attn",
-                            description="GLM5-Next Linear-attention (KDA) sublayer dev test")
+                            description="GLM5-Next Linear-attention (KDA) sublayer dev test",
+                            extra_setup=_extra)
     args = parser.parse_args()
     print_header("GLM5-Next Linear-attention (KDA) sublayer", args)
     ok = _run_stage(args)
+    # 生产方向 indexed conv-state 探针 (Zeus-only, 自带 op gate)
+    if args.mode in ("zeus", "both"):
+        ok = _combine_status(ok, run_indexed_conv_parity(args))
     print_summary(f"glm5next_linear_attn ({args.config})", ok)
 
 

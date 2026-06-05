@@ -687,6 +687,99 @@ def _run_stage(args) -> bool | None:
     return True if zeus_ok is None else zeus_ok
 
 
+def _combine_status(a: bool | None, b: bool | None) -> bool | None:
+    """合并两段子检查的 PASS/FAIL/SKIP: None=SKIP 不左右另一段, 有 False 即 False。"""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a and b
+
+
+def run_geometry_selfcheck(args) -> bool | None:
+    """``init_paged_state`` 的 dual-core small-page 分页几何自检。
+
+    主 stage 的 Zeus 路径用退化几何 (page_size=seqlen+1 → 每 seq 单 logical
+    page, 全落 core0), 不触发多页 dual-core 切分; 这里专门用 page_size<seqlen
+    的小页几何, 覆盖主 stage 没碰的分配路径:
+      ① 偶数 pages_per_seq: 物理页唯一分配 + per-core bank / 共享 pool 形状;
+      ② 奇数 pages_per_seq 且 per-core 容量不足: 必须报错, 而非静默页冲突;
+      ③ 奇数 pages_per_seq 且容量充足: 分配无物理页冲突。
+    ``init_paged_state`` 会把 state 搬上 zeus device, 故需 Zeus runtime;
+    不可用则 SKIP。
+    """
+    print("\n" + "=" * 60)
+    print(f"Self-check: dual-core paged geometry ({args.config})")
+    print("=" * 60)
+    if ZEUS_IMPORT_ERROR is not None:
+        print(f"  GEOMETRY: SKIP (Zeus runtime unavailable: {ZEUS_IMPORT_ERROR})")
+        return None
+
+    attn = Glm5NextDsaAttn(args.config, seed=args.seed)
+    cfg = attn.cfg
+    ok = True
+
+    def _pages_unique(bt, B: int, pages_per_seq: int, P: int) -> bool:
+        seen: set[int] = set()
+        for b in range(B):
+            for lp in range(pages_per_seq):
+                pp = int(bt[b, lp])
+                if not (0 <= pp < P) or pp in seen:
+                    return False
+                seen.add(pp)
+        return True
+
+    # ① 偶数 pages_per_seq: 唯一分配 + 形状
+    B, seqlen, page_size, P = 2, 1024, 512, 4
+    history = attn.init_state(B, seqlen, seed=args.seed + 1)[0]
+    st = attn.init_paged_state(history, page_size=page_size, num_physical_pages=P)
+    pages_per_seq = -(-seqlen // page_size)            # ceil
+    geo_checks = {
+        "P even": P % 2 == 0,
+        "page_size": st["page_size"] == page_size,
+        "num_physical_pages": st["num_physical_pages"] == P,
+        "body_cache_c0 shape": st["body_cache_c0"].shape == (P // 2, page_size, cfg.Di),
+        "body_cache_c1 shape": st["body_cache_c1"].shape == (P // 2, page_size, cfg.Di),
+        "scale_cache shape": st["scale_cache"].shape == (P * page_size,),
+        "pages_per_seq>=2": pages_per_seq >= 2,
+        "block_table cols": st["block_table_host"].shape[1] >= pages_per_seq,
+        "physical pages unique": _pages_unique(st["block_table_host"], B, pages_per_seq, P),
+        "gather buffers present": all(
+            k in st for k in ("k_local_c0", "k_local_c1", "k_local_t_c0", "k_local_t_c1")
+        ),
+    }
+    passed = sum(1 for v in geo_checks.values() if v)
+    for name, cond in geo_checks.items():
+        if not cond:
+            print(f"  [FAIL] even-page geometry: {name}")
+            ok = False
+    print(f"  [{'OK' if passed == len(geo_checks) else 'FAIL'}] "
+          f"even pages_per_seq={pages_per_seq}: {passed}/{len(geo_checks)} checks")
+
+    # ② 奇数 pages_per_seq 且 per-core 容量不足 → 必须报错 (core0 需 4 > P/2=3)
+    B, seqlen, page_size, P = 2, 1100, 512, 6
+    history = attn.init_state(B, seqlen, seed=args.seed + 1)[0]
+    try:
+        attn.init_paged_state(history, page_size=page_size, num_physical_pages=P)
+        print("  [FAIL] underprovisioned odd pages did NOT raise")
+        ok = False
+    except AssertionError:
+        print("  [OK] underprovisioned odd pages rejected (AssertionError)")
+
+    # ③ 奇数 pages_per_seq 容量充足 → 无物理页冲突 (core0 需 4 <= P/2=4)
+    B, seqlen, page_size, P = 2, 1100, 512, 8
+    history = attn.init_state(B, seqlen, seed=args.seed + 1)[0]
+    st = attn.init_paged_state(history, page_size=page_size, num_physical_pages=P)
+    pages_per_seq = -(-seqlen // page_size)
+    if _pages_unique(st["block_table_host"], B, pages_per_seq, P):
+        print(f"  [OK] odd pages_per_seq={pages_per_seq} no collision")
+    else:
+        print(f"  [FAIL] odd pages_per_seq={pages_per_seq} collision")
+        ok = False
+
+    return ok
+
+
 def main():
     parser = make_argparser(
         "dev_dsa_attn",
@@ -697,6 +790,9 @@ def main():
     args = parser.parse_args()
     print_header("GLM5-Next DSA decode sublayer", args)
     ok = _run_stage(args)
+    # dual-core 分页几何自检 (需 Zeus runtime, 与主 stage 的退化几何互补)
+    if args.mode in ("zeus", "both"):
+        ok = _combine_status(ok, run_geometry_selfcheck(args))
     print_summary(f"glm5next_dsa_attn ({args.config})", ok)
 
 
