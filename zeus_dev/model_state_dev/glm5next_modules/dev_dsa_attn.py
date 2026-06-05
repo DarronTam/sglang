@@ -240,37 +240,40 @@ class Glm5NextDsaAttn:
         if ZEUS_IMPORT_ERROR is not None:
             raise RuntimeError(f"Zeus runtime unavailable: {ZEUS_IMPORT_ERROR}")
 
+        skz = sgl_kernel_zeus
         cfg = self.cfg
         w = self.weights
-
-        def _lmem(t: torch.Tensor) -> torch.Tensor:
-            return torch.zeus.local_memory.from_tensor(
-                t.to("zeus"), kind="weight", Tr=1, Tc=1,
-            )
 
         # fused_qkv_a [Rq+Rkv, H] 在 host 切成 q_a [Rq, H] / kv_a [Rkv, H] 两块
         q_a_w  = w["fused_qkv_a"][:cfg.Rq].contiguous()
         kv_a_w = w["fused_qkv_a"][cfg.Rq:].contiguous()
 
-        # LocalMem-packed weights (#1/#2/#3/#5 算子的 GEMM weight)
+        # 每个 op 的权重交给该 op 自己的 .pack 准备 —— 布局是 kernel 的契约
+        # (见 sgl_kernel_zeus.glm5next_dsa 里各 op 的 .pack;同 embedding.pack 范式)。
+        # 注意 hadamard_Di 被 #4 (plain) 与 #5 (LocalMem) 分别按各自需要打包。
+        q_b_z,  w_kc_z          = skz.dsa_q_main_absorb.pack(w["q_b_proj"], w["w_kc"])              # #3
+        wk_z,   h_di_lmem       = skz.dsa_indexer_k_prep_store_dual_core.pack(                       # #5
+            w["wk_idx"], w["hadamard_Di"])
+
+        # LocalMem-packed weights (#1/#2/#3/#5)
         self._w_lmem = {
-            "q_a":    _lmem(q_a_w),                   # #1 dsa_q_a_proj_norm
-            "kv_a":   _lmem(kv_a_w),                  # #2 dsa_kv_a_proj_norm_store
-            "q_b":    _lmem(w["q_b_proj"]),           # #3 dsa_q_main_absorb (q upproject)
-            "w_kc":   _lmem(w["w_kc"]),               # #3 dsa_q_main_absorb (absorb)
-            "wk_idx": _lmem(w["wk_idx"]),             # #5 dsa_indexer_k_prep_store_dual_core
-            "h_di":   _lmem(w["hadamard_Di"]),        # #5 dsa_indexer_k_prep_store_dual_core (Hadamard)
+            "q_a":    skz.dsa_q_a_proj_norm.pack(q_a_w),          # #1 dsa_q_a_proj_norm
+            "kv_a":   skz.dsa_kv_a_proj_norm_store.pack(kv_a_w),  # #2 dsa_kv_a_proj_norm_store
+            "q_b":    q_b_z,                                      # #3 dsa_q_main_absorb (q upproject)
+            "w_kc":   w_kc_z,                                     # #3 dsa_q_main_absorb (absorb)
+            "wk_idx": wk_z,                                       # #5 dsa_indexer_k_prep_store_dual_core
+            "h_di":   h_di_lmem,                                  # #5 (Hadamard, LocalMem)
         }
-        # Plain Zeus tensors (kernel 不要求 LocalMem 的: norm / bias / non-LocalMem GEMM)
+        # 非 LocalMem 的 op 权重(plain Zeus) + norm/bias(不进 .pack)
         self._w_z = {
             "q_a_norm":      w["q_a_norm"].to("zeus"),
             "kv_a_norm":     w["kv_a_norm"].to("zeus"),
-            "wq_b":          w["wq_b"].to("zeus"),               # #4 dsa_indexer_q_weights
-            "h_di_z":        w["hadamard_Di"].to("zeus"),        # #4 (plain Zeus)
-            "weights_proj": w["weights_proj"].to("zeus"),        # #4
-            "k_norm_weight": w["k_norm_weight"].to("zeus"),      # #5
-            "k_norm_bias":   w["k_norm_bias"].to("zeus"),        # #5
-            "w_vc":          w["w_vc"].to("zeus"),               # #11 dsa_post_o_proj_no_cp
+            "wq_b":          w["wq_b"].to("zeus"),               # #4 (plain)
+            "h_di_z":        w["hadamard_Di"].to("zeus"),        # #4 (plain Hadamard)
+            "weights_proj":  w["weights_proj"].to("zeus"),       # #4
+            "k_norm_weight": w["k_norm_weight"].to("zeus"),      # #5 norm
+            "k_norm_bias":   w["k_norm_bias"].to("zeus"),        # #5 bias
+            "w_vc":          w["w_vc"].to("zeus"),               # #11 (plain)
             "o_proj":        w["o_proj"].to("zeus"),             # #11
         }
         self._zeus_packed = True

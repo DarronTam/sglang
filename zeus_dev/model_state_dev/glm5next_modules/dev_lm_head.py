@@ -169,9 +169,7 @@ class Glm5NextLmHead:
         if ZEUS_IMPORT_ERROR is not None:
             raise RuntimeError(f"Zeus runtime unavailable: {ZEUS_IMPORT_ERROR}")
         self._norm_w_z = self.norm_w.to("zeus")
-        self._lm_head_lmem = torch.zeus.local_memory.from_tensor(
-            self.lm_head_w.to("zeus"), kind="weight", Tr=1, Tc=1,
-        )
+        self._lm_head_lmem = sgl_kernel_zeus.linear_bf16_outfp32.pack(self.lm_head_w)
         self._zeus_packed = True
 
     # ── Zeus forward ────────────────────────────────────────────
