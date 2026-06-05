@@ -168,8 +168,9 @@ _ZEUS_OPS_REQUIRED = (
     "linear_bf16", "linear_bf16_outfp32_sigmoid",
     "causal_conv1d_update_split", "fused_kda_gate",
     "fused_recurrent_kda_Sdecay", "rms_norm_gated",
-    # dense FFN sublayer
-    "silu_and_mul",
+    # dense FFN sublayer (linear_bf16 已在 linear-attn 段; 这里一并列出明确依赖,
+    # 与 dev_dsa_attn_dense_block 一致, 防将来换 attn 后漏掉)
+    "linear_bf16", "silu_and_mul",
 )
 
 
