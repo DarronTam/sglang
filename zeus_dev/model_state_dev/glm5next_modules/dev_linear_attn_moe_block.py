@@ -19,8 +19,8 @@ mHC wrapper 串成一个完整 decoder layer:
   真实架构一致 (全部 decoder layer 都走 MoE).
 
 用法:
-  python glm5next_modules/dev_linear_attn_block.py
-  python glm5next_modules/dev_linear_attn_block.py --config next --mode zeus
+  python glm5next_modules/dev_linear_attn_moe_block.py
+  python glm5next_modules/dev_linear_attn_moe_block.py --config next --mode zeus
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ from dev_moe import Glm5NextMoE, load_cfg as load_moe_cfg
 
 
 # ── Block module ────────────────────────────────────────────────
-class Glm5NextLinearBlock:
+class Glm5NextLinearAttnMoeBlock:
     """GLM5-Next linear-transformer decoder block (decode single-step).
 
     Composition (mHC wrapper 包两次, attn 一次 / mlp 一次):
@@ -58,7 +58,7 @@ class Glm5NextLinearBlock:
 
     使用模式::
 
-        block = Glm5NextLinearBlock(which="16b", seed=42)
+        block = Glm5NextLinearAttnMoeBlock(which="16b", seed=42)
         conv, rec = block.init_state(B=batch, seed=...)
         # REF
         mid, out = block.forward(residual_flat, conv, rec)
@@ -177,11 +177,11 @@ _ZEUS_OPS_REQUIRED = (
 
 def _run_stage(args) -> Optional[bool]:
     print("\n" + "=" * 60)
-    print(f"Stage: linear-transformer block ({args.config})")
+    print(f"Stage: linear-attn + MoE block ({args.config})")
     print("=" * 60)
 
     torch.manual_seed(args.seed)
-    block = Glm5NextLinearBlock(args.config, seed=args.seed)
+    block = Glm5NextLinearAttnMoeBlock(args.config, seed=args.seed)
     cfg = block.mhc_cfg
     B = args.num_tokens
     H, N = cfg.H, cfg.N
@@ -286,14 +286,14 @@ def _run_stage(args) -> Optional[bool]:
 
 def main():
     parser = make_argparser(
-        "dev_linear_attn_block",
+        "dev_linear_attn_moe_block",
         description="GLM5-Next linear-transformer decoder block dev test "
                     "(mHC + Linear-attn + MoE)",
     )
     args = parser.parse_args()
     print_header("GLM5-Next linear-transformer block (mHC + KDA + MoE)", args)
     ok = _run_stage(args)
-    print_summary(f"glm5next_linear_block ({args.config})", ok)
+    print_summary(f"glm5next_linear_attn_moe_block ({args.config})", ok)
 
 
 if __name__ == "__main__":

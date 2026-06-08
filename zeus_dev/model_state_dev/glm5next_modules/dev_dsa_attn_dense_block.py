@@ -1,14 +1,15 @@
 """
 GLM5-Next DSA-transformer block (decode) 整层装配 + REF↔Zeus 对拍.
 
-与 ``dev_linear_attn_block.py`` 同构, 但 attn sublayer 换成 DSA (paged-attention):
+与 ``dev_linear_attn_moe_block.py`` 同构, 但 attn sublayer 换成 DSA (paged-attention),
+MLP 用 Dense FFN (而非 MoE):
 
   residual[B, N*H]
     │ attn_hc.pre   → layer_input[B, H]
   Glm5NextDsaAttn(layer_input, history / paged_state)
     │ attn_hc.post  → residual_mid[B, N*H]
     │ mlp_hc.pre    → layer_input[B, H]
-  Glm5NextMoE(layer_input)
+  Glm5NextDenseFFN(layer_input)
     │ mlp_hc.post   → residual_out[B, N*H]
 
 - attn_hc / mlp_hc 用 ``mhc.init_mhc_params`` 各自 seed 独立 (与 prerelease
@@ -17,11 +18,11 @@ GLM5-Next DSA-transformer block (decode) 整层装配 + REF↔Zeus 对拍.
   tensors; Zeus 用 :meth:`Glm5NextDsaAttn.init_paged_state` 构造的 paged_state
   (latent/body/scale 共享池 + block_table + seq_lens), init 时即一次性搬上
   device, 之后跨 step 复用, 全链路 device-resident.
-- MLP 与 ``dev_linear_attn_block.py`` 一致, 用 ``Glm5NextMoE``.
+- MLP 用 ``Glm5NextDenseFFN`` (前 first_k_dense_replace 层, 无 MoE routing).
 
 用法:
-  python glm5next_modules/dev_dsa_attn_block.py
-  python glm5next_modules/dev_dsa_attn_block.py --config next --mode zeus --seqlen 64
+  python glm5next_modules/dev_dsa_attn_dense_block.py
+  python glm5next_modules/dev_dsa_attn_dense_block.py --config next --mode zeus --seqlen 64
 """
 
 from __future__ import annotations
@@ -44,25 +45,25 @@ from dev_mhc import Glm5NextMhc
 
 # 同目录 sublayer modules
 from dev_dsa_attn import Glm5NextDsaAttn
-from dev_moe import Glm5NextMoE, load_cfg as load_moe_cfg
+from dev_dense_ffn import Glm5NextDenseFFN, load_cfg as load_ffn_cfg
 
 # DSA 底层 API (用于 history 类型注解)
 import dev_glm5next_dsa_decode_test as dsa
 
 
 # ── Block module ────────────────────────────────────────────────
-class Glm5NextDsaBlock:
-    """GLM5-Next DSA-transformer decoder block (decode single-step).
+class Glm5NextDsaAttnDenseBlock:
+    """GLM5-Next DSA-transformer decoder block (decode single-step), Dense FFN variant.
 
     Composition (mHC wrapper 包两次, attn 一次 / mlp 一次):
       - attn_mhc:       ``Glm5NextMhc``        (HyperConnection wrapper for attn)
       - attn sublayer:  ``Glm5NextDsaAttn``    (paged-attention, state-bearing)
       - mlp_mhc:        ``Glm5NextMhc``        (HyperConnection wrapper for mlp)
-      - mlp  sublayer:  ``Glm5NextMoE``
+      - mlp  sublayer:  ``Glm5NextDenseFFN``   (dense SwiGLU, 无 MoE routing)
 
     使用模式::
 
-        block = Glm5NextDsaBlock(which="16b", seed=42)
+        block = Glm5NextDsaAttnDenseBlock(which="16b", seed=42)
         history, block_span = block.init_state(B=batch, seqlen=ctx_len, seed=...)
         # REF
         mid, out = block.forward(residual_flat, history, new_pos=ctx_len)
@@ -81,19 +82,19 @@ class Glm5NextDsaBlock:
         # DSA attn sublayer (用 which 字符串构造, 内部走 dsa.select_config)
         self.attn = Glm5NextDsaAttn(which, seed=seed)
 
-        # MoE sublayer
-        moe_cfg = load_moe_cfg(which)
-        self.moe_cfg = moe_cfg
-        self.moe = Glm5NextMoE(moe_cfg, seed=seed + 5)
+        # Dense FFN sublayer
+        ffn_cfg = load_ffn_cfg(which)
+        self.ffn_cfg = ffn_cfg
+        self.ffn = Glm5NextDenseFFN(ffn_cfg, seed=seed + 5)
 
-        # 两个独立 mHC wrapper, 与 dev_linear_attn_block 同方案
+        # 两个独立 mHC wrapper, 与 dev_linear_attn_moe_block 同方案
         self.attn_mhc = Glm5NextMhc(which, seed=seed)
         self.mlp_mhc  = Glm5NextMhc(which, seed=seed + 100)
 
-        # H 必须一致 (attn / moe / mhc 都看同一条 residual stream)
+        # H 必须一致 (attn / ffn / mhc 都看同一条 residual stream)
         attn_H = self.attn.cfg.H
-        assert attn_H == moe_cfg.H == self.attn_mhc.cfg.H, (
-            f"H mismatch: attn={attn_H} moe={moe_cfg.H} "
+        assert attn_H == ffn_cfg.H == self.attn_mhc.cfg.H, (
+            f"H mismatch: attn={attn_H} ffn={ffn_cfg.H} "
             f"mhc={self.attn_mhc.cfg.H}"
         )
         self.mhc_cfg = self.attn_mhc.cfg
@@ -148,11 +149,11 @@ class Glm5NextDsaBlock:
                                      block_span=block_span)
         residual_mid = self.attn_mhc.forward_post(attn_out, res_a, hpost_a, hres_a)
 
-        # ── mlp block: mHC pre → MoE → mHC post
+        # ── mlp block: mHC pre → Dense FFN → mHC post
         li_m, res_m, hres_m, hpost_m = self.mlp_mhc.forward_pre(
             residual_mid, quantize=quantize_mhc,
         )
-        mlp_out = self.moe.forward(li_m)
+        mlp_out = self.ffn.forward(li_m)
         residual_out = self.mlp_mhc.forward_post(mlp_out, res_m, hpost_m, hres_m)
         return residual_mid, residual_out
 
@@ -167,7 +168,7 @@ class Glm5NextDsaBlock:
           内部一次性 pack (_pack_zeus lazy cache, 不再每 forward repack).
         - DSA attn sublayer 走 paged chain; ``paged_state`` 跨 forward 复用,
           首次进入时一次性 .to("zeus") + LocalMem pack, 之后纯 device-resident.
-        - MoE sublayer 与 dev_linear_attn_block 同步, 全 device-resident.
+        - Dense FFN sublayer 全 device-resident, 无 MoE routing.
         - 整段 pipeline 无 host↔device cast, 见各 sublayer dev script 的 audit.
         """
         # ── attn block (device-resident)
@@ -181,7 +182,7 @@ class Glm5NextDsaBlock:
 
         # ── mlp block (device-resident, z_mid 直接喂下一轮 mHC pre, 不下 host)
         z_li_m, z_res_m, z_hres_m, z_hpost_m = self.mlp_mhc.forward_pre_zeus(z_mid)
-        mlp_out_z = self.moe.forward_zeus(z_li_m)
+        mlp_out_z = self.ffn.forward_zeus(z_li_m)
         z_out = self.mlp_mhc.forward_post_zeus(
             mlp_out_z, z_res_m, z_hpost_m, z_hres_m,
         )
@@ -200,20 +201,18 @@ _ZEUS_OPS_REQUIRED = (
     "dsa_local_topk_radix", "dsa_translate_topk_positions",
     "dsa_latent_k_gather_paged", "dsa_sparse_mqa_partial",
     "dsa_post_o_proj_no_cp",
-    # MoE sublayer
-    "linear_bf16_outfp32", "biased_grouped_topk",
-    "moe_align_block_size_alloc", "moe_grouped_gemm",
-    "silu_and_mul", "moe_sum_reduce",
+    # dense FFN sublayer
+    "linear_bf16", "silu_and_mul",
 )
 
 
 def _run_stage(args) -> Optional[bool]:
     print("\n" + "=" * 60)
-    print(f"Stage: DSA-transformer block ({args.config})  seqlen={args.seqlen}")
+    print(f"Stage: DSA-attn + Dense block ({args.config})  seqlen={args.seqlen}")
     print("=" * 60)
 
     torch.manual_seed(args.seed)
-    block = Glm5NextDsaBlock(args.config, seed=args.seed)
+    block = Glm5NextDsaAttnDenseBlock(args.config, seed=args.seed)
     cfg = block.mhc_cfg
     B = args.num_tokens
     H, N = cfg.H, cfg.N
@@ -221,7 +220,7 @@ def _run_stage(args) -> Optional[bool]:
     print(f"  cfg: H={H} N={N} (mHC streams)  "
           f"attn[Nh={attn_cfg.Nh} Rq={attn_cfg.Rq} Rkv={attn_cfg.Rkv} "
           f"I={attn_cfg.I} Di={attn_cfg.Di} Ktop={attn_cfg.Ktop}]  "
-          f"moe[E={block.moe_cfg.E} mI={block.moe_cfg.mI} top_k={block.moe_cfg.top_k}]")
+          f"ffn[I={block.ffn_cfg.I}]")
 
     # bf16 residual, scale 0.05 与各 sublayer dev script 一致
     residual_flat = (
@@ -285,17 +284,19 @@ def _run_stage(args) -> Optional[bool]:
                       f"{[round(v,4) for v in z_out_cpu[0,:4].float().tolist()]}")
 
                 if ref_out is not None:
-                    # 复合误差预算 (mHC 5e-3 + DSA 5e-2 + MoE 5e-2). DSA chain
+                    # 复合误差预算 (mHC 5e-3 + DSA 5e-2). DSA chain
                     # 比 linear-attn 长 (11 颗算子), 且 top-K 选择对 fp8 量化误差
-                    # 敏感 (排名翻转可能让下游选到不同 slot); MoE routing 同样可能
-                    # 跨 topk boundary. mid 在 mlp 块之前, 误差小; out 在最终累积最大.
+                    # 敏感 (排名翻转可能让下游选到不同 slot).
+                    # mid 在 mlp 块之前, 误差小; out 在最终累积最大.
                     mid_ok = compare_tensors(
                         f"block.{args.config}.mid", ref_mid, z_mid_cpu,
                         atol=1.5e-1, rtol=5e-2,
                     )
                     out_ok = compare_tensors(
                         f"block.{args.config}.out", ref_out, z_out_cpu,
-                        atol=5.0, rtol=2e-1,
+                        # dense 无 topk 非确定性 (rtol 1e-1 比 moe block 的 2e-1 紧);
+                        # abs 预算留余量防 knife-edge (深链 bf16 累积).
+                        atol=5.0, rtol=1e-1,
                     )
                     zeus_ok = mid_ok and out_ok and finite and shape_ok and z_diverged
                 else:
@@ -321,16 +322,16 @@ def _run_stage(args) -> Optional[bool]:
 
 def main():
     parser = make_argparser(
-        "dev_dsa_attn_block",
+        "dev_dsa_attn_dense_block",
         description="GLM5-Next DSA-transformer decoder block dev test "
-                    "(mHC + DSA-attn + MoE)",
+                    "(mHC + DSA-attn + Dense FFN)",
     )
     parser.add_argument("--seqlen", type=int, default=64,
                         help="DSA decode 的历史长度 (KV cache 长度, 不含 new step)")
     args = parser.parse_args()
-    print_header("GLM5-Next DSA-transformer block (mHC + DSA + MoE)", args)
+    print_header("GLM5-Next DSA-transformer block (mHC + DSA + Dense FFN)", args)
     ok = _run_stage(args)
-    print_summary(f"glm5next_dsa_block ({args.config})", ok)
+    print_summary(f"glm5next_dsa_attn_dense_block ({args.config})", ok)
 
 
 if __name__ == "__main__":

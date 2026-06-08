@@ -240,37 +240,40 @@ class Glm5NextDsaAttn:
         if ZEUS_IMPORT_ERROR is not None:
             raise RuntimeError(f"Zeus runtime unavailable: {ZEUS_IMPORT_ERROR}")
 
+        skz = sgl_kernel_zeus
         cfg = self.cfg
         w = self.weights
-
-        def _lmem(t: torch.Tensor) -> torch.Tensor:
-            return torch.zeus.local_memory.from_tensor(
-                t.to("zeus"), kind="weight", Tr=1, Tc=1,
-            )
 
         # fused_qkv_a [Rq+Rkv, H] 在 host 切成 q_a [Rq, H] / kv_a [Rkv, H] 两块
         q_a_w  = w["fused_qkv_a"][:cfg.Rq].contiguous()
         kv_a_w = w["fused_qkv_a"][cfg.Rq:].contiguous()
 
-        # LocalMem-packed weights (#1/#2/#3/#5 算子的 GEMM weight)
+        # 每个 op 的权重交给该 op 自己的 .pack 准备 —— 布局是 kernel 的契约
+        # (见 sgl_kernel_zeus.glm5next_dsa 里各 op 的 .pack;同 embedding.pack 范式)。
+        # 注意 hadamard_Di 被 #4 (plain) 与 #5 (LocalMem) 分别按各自需要打包。
+        q_b_z,  w_kc_z          = skz.dsa_q_main_absorb.pack(w["q_b_proj"], w["w_kc"])              # #3
+        wk_z,   h_di_lmem       = skz.dsa_indexer_k_prep_store_dual_core.pack(                       # #5
+            w["wk_idx"], w["hadamard_Di"])
+
+        # LocalMem-packed weights (#1/#2/#3/#5)
         self._w_lmem = {
-            "q_a":    _lmem(q_a_w),                   # #1 dsa_q_a_proj_norm
-            "kv_a":   _lmem(kv_a_w),                  # #2 dsa_kv_a_proj_norm_store
-            "q_b":    _lmem(w["q_b_proj"]),           # #3 dsa_q_main_absorb (q upproject)
-            "w_kc":   _lmem(w["w_kc"]),               # #3 dsa_q_main_absorb (absorb)
-            "wk_idx": _lmem(w["wk_idx"]),             # #5 dsa_indexer_k_prep_store_dual_core
-            "h_di":   _lmem(w["hadamard_Di"]),        # #5 dsa_indexer_k_prep_store_dual_core (Hadamard)
+            "q_a":    skz.dsa_q_a_proj_norm.pack(q_a_w),          # #1 dsa_q_a_proj_norm
+            "kv_a":   skz.dsa_kv_a_proj_norm_store.pack(kv_a_w),  # #2 dsa_kv_a_proj_norm_store
+            "q_b":    q_b_z,                                      # #3 dsa_q_main_absorb (q upproject)
+            "w_kc":   w_kc_z,                                     # #3 dsa_q_main_absorb (absorb)
+            "wk_idx": wk_z,                                       # #5 dsa_indexer_k_prep_store_dual_core
+            "h_di":   h_di_lmem,                                  # #5 (Hadamard, LocalMem)
         }
-        # Plain Zeus tensors (kernel 不要求 LocalMem 的: norm / bias / non-LocalMem GEMM)
+        # 非 LocalMem 的 op 权重(plain Zeus) + norm/bias(不进 .pack)
         self._w_z = {
             "q_a_norm":      w["q_a_norm"].to("zeus"),
             "kv_a_norm":     w["kv_a_norm"].to("zeus"),
-            "wq_b":          w["wq_b"].to("zeus"),               # #4 dsa_indexer_q_weights
-            "h_di_z":        w["hadamard_Di"].to("zeus"),        # #4 (plain Zeus)
-            "weights_proj": w["weights_proj"].to("zeus"),        # #4
-            "k_norm_weight": w["k_norm_weight"].to("zeus"),      # #5
-            "k_norm_bias":   w["k_norm_bias"].to("zeus"),        # #5
-            "w_vc":          w["w_vc"].to("zeus"),               # #11 dsa_post_o_proj_no_cp
+            "wq_b":          w["wq_b"].to("zeus"),               # #4 (plain)
+            "h_di_z":        w["hadamard_Di"].to("zeus"),        # #4 (plain Hadamard)
+            "weights_proj":  w["weights_proj"].to("zeus"),       # #4
+            "k_norm_weight": w["k_norm_weight"].to("zeus"),      # #5 norm
+            "k_norm_bias":   w["k_norm_bias"].to("zeus"),        # #5 bias
+            "w_vc":          w["w_vc"].to("zeus"),               # #11 (plain)
             "o_proj":        w["o_proj"].to("zeus"),             # #11
         }
         self._zeus_packed = True
@@ -684,6 +687,99 @@ def _run_stage(args) -> bool | None:
     return True if zeus_ok is None else zeus_ok
 
 
+def _combine_status(a: bool | None, b: bool | None) -> bool | None:
+    """合并两段子检查的 PASS/FAIL/SKIP: None=SKIP 不左右另一段, 有 False 即 False。"""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a and b
+
+
+def run_geometry_selfcheck(args) -> bool | None:
+    """``init_paged_state`` 的 dual-core small-page 分页几何自检。
+
+    主 stage 的 Zeus 路径用退化几何 (page_size=seqlen+1 → 每 seq 单 logical
+    page, 全落 core0), 不触发多页 dual-core 切分; 这里专门用 page_size<seqlen
+    的小页几何, 覆盖主 stage 没碰的分配路径:
+      ① 偶数 pages_per_seq: 物理页唯一分配 + per-core bank / 共享 pool 形状;
+      ② 奇数 pages_per_seq 且 per-core 容量不足: 必须报错, 而非静默页冲突;
+      ③ 奇数 pages_per_seq 且容量充足: 分配无物理页冲突。
+    ``init_paged_state`` 会把 state 搬上 zeus device, 故需 Zeus runtime;
+    不可用则 SKIP。
+    """
+    print("\n" + "=" * 60)
+    print(f"Self-check: dual-core paged geometry ({args.config})")
+    print("=" * 60)
+    if ZEUS_IMPORT_ERROR is not None:
+        print(f"  GEOMETRY: SKIP (Zeus runtime unavailable: {ZEUS_IMPORT_ERROR})")
+        return None
+
+    attn = Glm5NextDsaAttn(args.config, seed=args.seed)
+    cfg = attn.cfg
+    ok = True
+
+    def _pages_unique(bt, B: int, pages_per_seq: int, P: int) -> bool:
+        seen: set[int] = set()
+        for b in range(B):
+            for lp in range(pages_per_seq):
+                pp = int(bt[b, lp])
+                if not (0 <= pp < P) or pp in seen:
+                    return False
+                seen.add(pp)
+        return True
+
+    # ① 偶数 pages_per_seq: 唯一分配 + 形状
+    B, seqlen, page_size, P = 2, 1024, 512, 4
+    history = attn.init_state(B, seqlen, seed=args.seed + 1)[0]
+    st = attn.init_paged_state(history, page_size=page_size, num_physical_pages=P)
+    pages_per_seq = -(-seqlen // page_size)            # ceil
+    geo_checks = {
+        "P even": P % 2 == 0,
+        "page_size": st["page_size"] == page_size,
+        "num_physical_pages": st["num_physical_pages"] == P,
+        "body_cache_c0 shape": st["body_cache_c0"].shape == (P // 2, page_size, cfg.Di),
+        "body_cache_c1 shape": st["body_cache_c1"].shape == (P // 2, page_size, cfg.Di),
+        "scale_cache shape": st["scale_cache"].shape == (P * page_size,),
+        "pages_per_seq>=2": pages_per_seq >= 2,
+        "block_table cols": st["block_table_host"].shape[1] >= pages_per_seq,
+        "physical pages unique": _pages_unique(st["block_table_host"], B, pages_per_seq, P),
+        "gather buffers present": all(
+            k in st for k in ("k_local_c0", "k_local_c1", "k_local_t_c0", "k_local_t_c1")
+        ),
+    }
+    passed = sum(1 for v in geo_checks.values() if v)
+    for name, cond in geo_checks.items():
+        if not cond:
+            print(f"  [FAIL] even-page geometry: {name}")
+            ok = False
+    print(f"  [{'OK' if passed == len(geo_checks) else 'FAIL'}] "
+          f"even pages_per_seq={pages_per_seq}: {passed}/{len(geo_checks)} checks")
+
+    # ② 奇数 pages_per_seq 且 per-core 容量不足 → 必须报错 (core0 需 4 > P/2=3)
+    B, seqlen, page_size, P = 2, 1100, 512, 6
+    history = attn.init_state(B, seqlen, seed=args.seed + 1)[0]
+    try:
+        attn.init_paged_state(history, page_size=page_size, num_physical_pages=P)
+        print("  [FAIL] underprovisioned odd pages did NOT raise")
+        ok = False
+    except AssertionError:
+        print("  [OK] underprovisioned odd pages rejected (AssertionError)")
+
+    # ③ 奇数 pages_per_seq 容量充足 → 无物理页冲突 (core0 需 4 <= P/2=4)
+    B, seqlen, page_size, P = 2, 1100, 512, 8
+    history = attn.init_state(B, seqlen, seed=args.seed + 1)[0]
+    st = attn.init_paged_state(history, page_size=page_size, num_physical_pages=P)
+    pages_per_seq = -(-seqlen // page_size)
+    if _pages_unique(st["block_table_host"], B, pages_per_seq, P):
+        print(f"  [OK] odd pages_per_seq={pages_per_seq} no collision")
+    else:
+        print(f"  [FAIL] odd pages_per_seq={pages_per_seq} collision")
+        ok = False
+
+    return ok
+
+
 def main():
     parser = make_argparser(
         "dev_dsa_attn",
@@ -694,6 +790,9 @@ def main():
     args = parser.parse_args()
     print_header("GLM5-Next DSA decode sublayer", args)
     ok = _run_stage(args)
+    # dual-core 分页几何自检 (需 Zeus runtime, 与主 stage 的退化几何互补)
+    if args.mode in ("zeus", "both"):
+        ok = _combine_status(ok, run_geometry_selfcheck(args))
     print_summary(f"glm5next_dsa_attn ({args.config})", ok)
 
 

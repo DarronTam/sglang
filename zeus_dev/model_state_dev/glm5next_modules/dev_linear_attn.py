@@ -149,6 +149,13 @@ class Glm5NextLinearAttn:
 
     def __init__(self, cfg: Glm5NextLinearAttnConfig, seed: int = 0):
         self.cfg = cfg
+        # gate/o reshape (REF forward L241, forward_zeus gproj_z.reshape) 假设
+        # head_v_dim == head_k_dim: gproj/g_b 实际按 Dk 切, 却 reshape 成 [.., Hh, Dv].
+        # 异构 head dim 会静默 mis-shape, 此处一次性硬校验.
+        assert cfg.head_v_dim == cfg.head_k_dim, (
+            f"gate/o reshape 假设 head_v_dim == head_k_dim, got "
+            f"Dv={cfg.head_v_dim} Dk={cfg.head_k_dim}; 异构 head dim 需重写 gate reshape"
+        )
         g = torch.Generator().manual_seed(seed)
 
         def rn(*shape, scale: float = 0.02, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
@@ -253,19 +260,14 @@ class Glm5NextLinearAttn:
         if ZEUS_IMPORT_ERROR is not None:
             raise RuntimeError(f"Zeus runtime unavailable: {ZEUS_IMPORT_ERROR}")
 
-        def _lmem_pack(t: torch.Tensor):
-            return torch.zeus.local_memory.from_tensor(
-                t.to("zeus"), kind="weight", Tr=1, Tc=1,
-            )
-
         self._w_lmem = {
-            "qkv_proj": _lmem_pack(self.qkv_proj),
-            "b_proj":   _lmem_pack(self.b_proj),
-            "f_a":      _lmem_pack(self.f_a),
-            "f_b":      _lmem_pack(self.f_b),
-            "g_a":      _lmem_pack(self.g_a),
-            "g_b":      _lmem_pack(self.g_b),
-            "o_proj":   _lmem_pack(self.o_proj),
+            "qkv_proj": sgl_kernel_zeus.linear_bf16.pack(self.qkv_proj),
+            "b_proj":   sgl_kernel_zeus.linear_bf16_outfp32_sigmoid.pack(self.b_proj),
+            "f_a":      sgl_kernel_zeus.linear_bf16.pack(self.f_a),
+            "f_b":      sgl_kernel_zeus.linear_bf16.pack(self.f_b),
+            "g_a":      sgl_kernel_zeus.linear_bf16.pack(self.g_a),
+            "g_b":      sgl_kernel_zeus.linear_bf16.pack(self.g_b),
+            "o_proj":   sgl_kernel_zeus.linear_bf16.pack(self.o_proj),
             # plain Zeus tensors (非 weight 矩阵)
             "conv_w_z":  self.conv_w.to(torch.bfloat16).to("zeus"),
             "conv_b_z":  self.conv_b.to(torch.bfloat16).to("zeus"),
@@ -306,6 +308,11 @@ class Glm5NextLinearAttn:
         B = hidden_z.shape[0]
         H, Hh, Dk, Dv, P = cfg.H, cfg.num_heads, cfg.head_k_dim, cfg.head_v_dim, cfg.proj_size
 
+        # ── host/setup 准备 (集中在 device chain 之前, 对齐 DSA 链路标准) ──
+        # cu_seqlens = [0,1,..,B] 只依赖 B, pooled per-B; hoist 到链外, 让下面
+        # #1→#13 是一串纯 kernel 调用, 中途无 device alloc.
+        cu_seqlens_z = self._get_cu_seqlens_z(B)
+
         # 1-7. 6 颗 linear_bf16 + 1 颗 linear_bf16_outfp32_sigmoid (b_proj
         #      走 fp32+sigmoid 融合直出，消除原本 `linear_bf16(b_proj) +
         #      .float().sigmoid()` 中的 cast + sigmoid host fallback)
@@ -340,7 +347,6 @@ class Glm5NextLinearAttn:
         q_4d = q_z.view(B, Hh, Dk)
         k_4d = k_z.view(B, Hh, Dk)
         v_4d = v_z.view(B, Hh, Dv)
-        cu_seqlens_z = self._get_cu_seqlens_z(B)   # pooled per-B
         o_z, _ = sgl_kernel_zeus.fused_recurrent_kda_Sdecay(
             q=q_4d, k=k_4d, v=v_4d,
             g=g_gate_z, beta=beta_fp32,
@@ -353,9 +359,12 @@ class Glm5NextLinearAttn:
         )  # [B, Hh, Dv] bf16
 
         # 12. rms_norm_gated (sigmoid 门控；o_norm=ones 是 implicit weight=1)
-        gate_for_rms = gproj_z.reshape(B, Hh, Dv)  # Dv == Dk per head (本配置)
+        # gproj_z[B,P]→[B,Hh,Dv] 拆末尾维 (P=Hh*Dv); normed_z[B,Hh,Dv]→[B,P] 合末尾维.
+        # 均在 contiguous kernel 输出上零拷贝, 用 .view 让零拷贝不变量 load-bearing
+        # (非 contiguous 时 .view 报错而非静默拷贝).
+        gate_for_rms = gproj_z.view(B, Hh, Dv)  # Dv == Dk per head (本配置)
         normed_z = sgl_kernel_zeus.rms_norm_gated(o_z, gate_for_rms, eps=cfg.rms_norm_eps)
-        normed_flat = normed_z.reshape(B, P)
+        normed_flat = normed_z.view(B, P)
 
         # 13. o_proj
         return sgl_kernel_zeus.linear_bf16(normed_flat, w["o_proj"])         # [B, H]
@@ -447,12 +456,141 @@ def _run_stage(args) -> Optional[bool]:
     return True if zeus_ok is None else zeus_ok
 
 
+def _combine_status(a: Optional[bool], b: Optional[bool]) -> Optional[bool]:
+    """合并两段 stage 的 PASS/FAIL/SKIP: None=SKIP 不左右另一段, 有 False 即 False。"""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a and b
+
+
+# ── Indexed conv-state probe helpers (生产方向 pooled cache) ─────
+def _make_cache_indices(batch: int, pool_size: int, seed: int) -> torch.Tensor:
+    if pool_size < batch:
+        raise ValueError(f"pool_size ({pool_size}) must be >= batch ({batch})")
+    g = torch.Generator().manual_seed(seed)
+    return torch.randperm(pool_size, generator=g, dtype=torch.int64)[:batch].to(torch.int32)
+
+
+def _make_step_inputs(batch: int, channels: int, kernel_width: int, pool_size: int,
+                      *, has_bias: bool, seed: int):
+    g = torch.Generator().manual_seed(seed)
+    x = (torch.randn(batch, channels, generator=g, dtype=torch.float32) * 0.05).to(torch.bfloat16)
+    weight = (torch.randn(channels, kernel_width, generator=g, dtype=torch.float32) * 0.03).to(torch.bfloat16)
+    bias = None
+    if has_bias:
+        bias = (torch.randn(channels, generator=g, dtype=torch.float32) * 0.01).to(torch.bfloat16)
+    pool = (torch.randn(pool_size, channels, kernel_width - 1, generator=g, dtype=torch.float32) * 0.05).to(torch.bfloat16)
+    return x, weight, bias, pool
+
+
+def _compare_exact_or_report(name: str, ref: torch.Tensor, got: torch.Tensor) -> bool:
+    if torch.equal(ref, got):
+        print(f"  [OK] {name}: bit-exact")
+        return True
+    return compare_tensors(name, ref, got, atol=0.0, rtol=0.0)
+
+
+def run_indexed_conv_parity(args) -> Optional[bool]:
+    """生产方向探针: pooled cache ``[N_pool, 3P, K-1]`` 的 indexed conv-state 对拍。
+
+    主 stage 用 ``causal_conv1d_update_split`` (非 indexed, 连续 conv_state);
+    这条校验迁往生产 paged/pooled cache 的 indexed 变体, 验两件事:
+
+      causal_conv1d_update_indexed(...).split([P,P,P]) == causal_conv1d_update_split_indexed(...)
+
+    且 cache pool 经 ``cache_indices`` 索引更新、不碰 untouched slot。Zeus-only,
+    需要两个 indexed op; 不可用则 SKIP。
+    """
+    required = ("causal_conv1d_update_indexed", "causal_conv1d_update_split_indexed")
+    print("\n" + "=" * 60)
+    print(f"Stage: indexed conv-state parity ({args.config})")
+    print("=" * 60)
+    if not zeus_chain_available(*required):
+        print(f"  INDEXED: SKIP (ops unavailable: {ZEUS_IMPORT_ERROR})")
+        return None
+
+    cfg = load_cfg(args.config)
+    batch = args.num_tokens
+    pool_size = args.pool_size or max(16, batch * 4)
+    p = cfg.proj_size
+    channels = 3 * p
+    kernel_width = cfg.conv_size
+    has_bias = not args.no_bias
+
+    print(f"  B={batch}  N_pool={pool_size}  P={p}  C=3P={channels}  "
+          f"K={kernel_width}  steps={args.steps}  bias={has_bias}")
+
+    x0, weight, bias, pool0 = _make_step_inputs(
+        batch, channels, kernel_width, pool_size, has_bias=has_bias, seed=args.seed,
+    )
+    cache_indices = _make_cache_indices(batch, pool_size, seed=args.seed + 97)
+    untouched = sorted(set(range(pool_size)) - set(cache_indices.tolist()))
+    print(f"  cache_indices={cache_indices.tolist()}")
+
+    pool_indexed = pool0.clone().to("zeus")
+    pool_split_indexed = pool0.clone().to("zeus")
+    weight_z = weight.to("zeus")
+    bias_z = bias.to("zeus") if bias is not None else None
+    cache_indices_z = cache_indices.to("zeus")
+
+    ok = True
+    for step in range(args.steps):
+        if step == 0:
+            x = x0
+        else:
+            g = torch.Generator().manual_seed(args.seed + 1000 + step)
+            x = (torch.randn(batch, channels, generator=g, dtype=torch.float32) * 0.05).to(torch.bfloat16)
+        x_z = x.to("zeus")
+
+        qkv = sgl_kernel_zeus.causal_conv1d_update_indexed(
+            x_z, pool_indexed, cache_indices_z, weight_z, bias_z, activation="silu",
+        )
+        q_ref, k_ref, v_ref = qkv.split([p, p, p], dim=-1)
+        q, k, v = sgl_kernel_zeus.causal_conv1d_update_split_indexed(
+            x_z, pool_split_indexed, cache_indices_z, weight_z, bias_z, activation="silu",
+        )
+
+        print(f"\n  step={step}")
+        ok &= _compare_exact_or_report("q", q_ref.cpu(), q.cpu())
+        ok &= _compare_exact_or_report("k", k_ref.cpu(), k.cpu())
+        ok &= _compare_exact_or_report("v", v_ref.cpu(), v.cpu())
+        ok &= _compare_exact_or_report("pool", pool_indexed.cpu(), pool_split_indexed.cpu())
+        print(f"  output_contiguous: q={q.is_contiguous()} "
+              f"k={k.is_contiguous()} v={v.is_contiguous()}")
+        ok &= q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+
+    pool_final = pool_split_indexed.cpu()
+    for slot in untouched:
+        if not torch.equal(pool_final[slot], pool0[slot]):
+            print(f"  [FAIL] untouched pool slot modified: {slot}")
+            ok = False
+            break
+    if untouched:
+        print(f"\n  untouched slots checked: {len(untouched)}")
+
+    return ok
+
+
 def main():
+    def _extra(parser):
+        parser.add_argument("--steps", type=int, default=3,
+                            help="indexed conv-state 探针的 decode 步数")
+        parser.add_argument("--pool-size", type=int, default=None,
+                            help="indexed conv-state pool 槽位数 (默认 max(16, 4*B))")
+        parser.add_argument("--no-bias", action="store_true",
+                            help="indexed conv-state 探针不加 conv bias")
+
     parser = make_argparser("dev_linear_attn",
-                            description="GLM5-Next Linear-attention (KDA) sublayer dev test")
+                            description="GLM5-Next Linear-attention (KDA) sublayer dev test",
+                            extra_setup=_extra)
     args = parser.parse_args()
     print_header("GLM5-Next Linear-attention (KDA) sublayer", args)
     ok = _run_stage(args)
+    # 生产方向 indexed conv-state 探针 (Zeus-only, 自带 op gate)
+    if args.mode in ("zeus", "both"):
+        ok = _combine_status(ok, run_indexed_conv_parity(args))
     print_summary(f"glm5next_linear_attn ({args.config})", ok)
 
 

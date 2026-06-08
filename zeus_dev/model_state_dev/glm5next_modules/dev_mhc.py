@@ -6,7 +6,7 @@ GLM5-Next mHC (HyperConnection) wrapper 独立模块 + REF↔Zeus 对拍.
 本身是否引入奇怪的 host↔device cast / 非 contig view / fallback / 反复
 LocalMem repack 等隐藏操作.
 
-mHC chain (与 dev_glm5next_block_decode_test / dev_linear_attn_block 一致):
+mHC chain (与 dev_glm5next_block_decode_test / dev_linear_attn_moe_block 一致):
   residual[T, N*H]
     │ pre  (K1 mhc_pre_norm_split + K2 mhc_sinkhorn + K3 mhc_pre_apply_mix)
     │    → layer_input[T, H] bf16, h_res[T, N*N] fp32, h_post[T, N] fp32
@@ -105,9 +105,7 @@ class Glm5NextMhc:
         # tiled pack. K1 (mhc_pre_norm_split) 期望 weight=fn_effective(bf16) LocalMem.
         fn_eff_fp32 = p.fn if p.norm_weight is None else p.fn * p.norm_weight
         fn_eff_bf16 = fn_eff_fp32.to(torch.bfloat16)
-        self._fn_lmem = torch.zeus.local_memory.from_tensor(
-            fn_eff_bf16.to("zeus"), kind="weight", Tr=1, Tc=1,
-        )
+        self._fn_lmem = sgl_kernel_zeus.mhc_pre_norm_split.pack(fn_eff_bf16)
         self._base_z = p.base.to("zeus")
         # NOTE: p.scale (shape [3] fp32) — K1 kernel 直接接 CPU fp32 tensor, 无需
         # 搬到 device (见 dev_glm5next_mhc_test.zeus_mhc_pre 的实现).
@@ -145,8 +143,11 @@ class Glm5NextMhc:
         layer_input = sgl_kernel_zeus.mhc_pre_apply_mix(
             residual_flat_z, pre, n=n,
         )
-        h_res = comb.reshape(s, n * n)
-        h_post = post.reshape(s, n)
+        # comb[s,n,n]→[s,n*n] 合并末尾连续维; post[s,n,1]→[s,n] 去末尾 size-1 维.
+        # 二者在 contiguous kernel 输出上恒为零拷贝, 用 .view (而非 .reshape) 让这条
+        # 不变量 load-bearing —— 将来 kernel 输出若变非 contiguous 直接报错, 不静默拷贝.
+        h_res = comb.view(s, n * n)
+        h_post = post.view(s, n)
         return layer_input, residual_flat_z, h_res, h_post
 
     def forward_post_zeus(self, x_z: torch.Tensor, residual_z: torch.Tensor,
