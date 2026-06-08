@@ -292,6 +292,9 @@ class Glm5NextMoE:
             routed_scaling_factor=cfg.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=True,
         )
+        assert w_z.dtype == torch.bfloat16, w_z.dtype
+        assert ids_z.dtype == torch.float32, ids_z.dtype
+        assert ids_z.is_contiguous(), "ids_z must be contiguous"
         sorted_ids_z, expert_ids_z, num_post_z = (
             sgl_kernel_zeus.moe_align_block_size_alloc(ids_z, block_size, E)
         )
@@ -390,6 +393,9 @@ class Glm5NextMoE:
             routed_scaling_factor=cfg.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=True,
         )
+        assert w_z.dtype == torch.bfloat16, w_z.dtype
+        assert ids_z.dtype == torch.float32, ids_z.dtype
+        assert ids_z.is_contiguous(), "ids_z must be contiguous"
         
         sorted_ids_z, expert_ids_z, num_post_z = sgl_kernel_zeus_triton.moe_align_block_size_alloc(
             ids_z,
