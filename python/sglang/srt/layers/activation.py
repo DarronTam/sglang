@@ -82,7 +82,11 @@ class SiluAndMul(MultiPlatformOp):
     def forward_zeus(self, x: torch.Tensor) -> torch.Tensor:
         from sgl_kernel_zeus import silu_and_mul as zeus_silu_and_mul
 
-        return zeus_silu_and_mul(x)
+        # The Zeus kernel is strict 2-D [num_tokens, 2*dim]; flatten any leading
+        # dims here (the wrapper does no in-kernel reshape) and restore after.
+        d = x.shape[-1] // 2
+        out = zeus_silu_and_mul(x.reshape(-1, x.shape[-1]))
+        return out.reshape(*x.shape[:-1], d)
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         if _is_cpu_amx_available:
